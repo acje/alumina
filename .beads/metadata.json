@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "alumina",
+  "project_id": "73807f58-34af-4c35-a092-0c10f9e58bb7"
+}
