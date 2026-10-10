@@ -12,6 +12,7 @@ pub mod gate;
 pub mod inventory;
 pub mod preflight;
 pub mod resolver;
+pub mod runtime;
 pub mod schedule;
 pub mod serve;
 pub mod serving;

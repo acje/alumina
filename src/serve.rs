@@ -11,7 +11,9 @@ use crate::cache::{Cache, CacheError, EntryState, Family, NameIndex};
 use crate::config::Config;
 use crate::connect::ConnectRequest;
 use crate::schedule::Schedules;
-use crate::startup_dns::{STARTUP_WINDOW_SECS, StartupDns, StartupDnsError, StartupReport};
+use crate::startup_dns::{
+    STARTUP_WINDOW_SECS, StartupDns, StartupDnsError, StartupReport, TurnResult,
+};
 use crate::worker::{
     AdmissionError, AttemptCounts, ConnectPhase, Deadline, DecideError, SlotIndex, TunnelIndex,
     Worker, WorkerClock, WorkerView,
@@ -177,6 +179,64 @@ impl ServeStorage {
     /// The retained DNS transport with its fixed response workspace.
     pub fn dns(&self) -> &StartupDns {
         &self.dns
+    }
+
+    /// The retained DNS transport, mutable so the shared-readiness owner can
+    /// run cooperative refresh turns on the single retained source.
+    pub(crate) fn dns_mut(&mut self) -> &mut StartupDns {
+        &mut self.dns
+    }
+
+    /// One cooperative DNS turn on the single retained transport: advances the
+    /// outstanding exchange to its next phase when the shared owner has
+    /// observed freshness or its deadline, folding the cache and refresh
+    /// schedules into the existing subscription. Returns `None` while no
+    /// exchange is in progress, so an idle owner treats it as no work rather
+    /// than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying fatal DNS exchange or transport error.
+    pub(crate) fn advance_dns(&mut self) -> Result<Option<TurnResult>, StartupDnsError> {
+        let Some(ordinal) = self.dns.active_ordinal() else {
+            return Ok(None);
+        };
+        let fqdn = self
+            .config
+            .allowlist()
+            .get(ordinal)
+            .ok_or(StartupDnsError::Cache(CacheError::NameOutOfRange))?;
+        let result = self
+            .dns
+            .advance_exchange(fqdn, &mut self.cache, &mut self.schedules)?;
+        Ok(Some(result))
+    }
+
+    /// Starts a cooperative DNS exchange on the retained transport for the
+    /// named allowlist entry, repointing the shared owner's peer first. The
+    /// exchange draws a fresh transaction id and records its deadline without
+    /// waiting for network readiness; subsequent [`Self::advance_dns`] turns
+    /// conclude it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExchangeActive` when an exchange is already in progress and
+    /// `Cache` when the ordinal is outside the allowlist.
+    #[allow(dead_code)]
+    pub(crate) fn start_dns_exchange(
+        &mut self,
+        nameserver: SocketAddr,
+        ordinal: usize,
+        family: Family,
+        deadline: Instant,
+    ) -> Result<(), StartupDnsError> {
+        self.dns.set_peer(nameserver);
+        let fqdn = self
+            .config
+            .allowlist()
+            .get(ordinal)
+            .ok_or(StartupDnsError::Cache(CacheError::NameOutOfRange))?;
+        self.dns.start_exchange(fqdn, family, ordinal, deadline)
     }
 
     /// Admits a new actual connection into a retained slot at the accept

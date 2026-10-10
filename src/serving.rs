@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Registry, Token};
 
 use crate::client_hello::{self, ChInspector, Inspect};
 use crate::config::FixedHostname;
@@ -44,6 +44,7 @@ use crate::connect::{ConnectParser, Feed};
 use crate::eligibility::NumericAddr;
 use crate::gate::{Activity, TunnelGate, UpstreamWrite, ValidatedHello};
 use crate::serve::ServeStorage;
+use crate::startup_dns::StartupDnsError;
 use crate::worker::{AttemptCounts, ConnectPhase, MAX_TUNNELS, SlotIndex, TunnelIndex};
 
 /// The listener registration token.
@@ -86,6 +87,13 @@ const CHUNK: usize = 4096;
 /// Client sockets occupy tokens `1..=MAX_TUNNELS`; each upstream socket uses a
 /// disjoint token at `UPSTREAM_BASE + index` so no two registrations collide.
 const UPSTREAM_BASE: usize = MAX_TUNNELS + 1;
+
+/// The external DNS refresh source token: the first local id past the
+/// listener (0), client (1..=MAX_TUNNELS) and upstream (`UPSTREAM_BASE..`)
+/// ranges, so a single poll carrying the attached DNS transport can never
+/// collide with a connection token. Dispatched as a benign readiness flag,
+/// never a slot.
+const DNS_LOCAL: usize = UPSTREAM_BASE + MAX_TUNNELS;
 
 /// Token layout: low 9 bits = local id (1..=MAX_TUNNELS client,
 /// `UPSTREAM_BASE..` upstream, 0 = listener), high bits = slot generation so a
@@ -316,6 +324,18 @@ impl From<io::Error> for ServeError {
     }
 }
 
+impl From<StartupDnsError> for ServeError {
+    fn from(err: StartupDnsError) -> ServeError {
+        let kind = match err {
+            StartupDnsError::Transport { kind, .. } | StartupDnsError::Exchange { kind, .. } => {
+                kind
+            }
+            _ => io::ErrorKind::Other,
+        };
+        ServeError { kind }
+    }
+}
+
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "serving error: {}", self.kind)
@@ -331,6 +351,7 @@ pub struct Serving {
     slots: Vec<SlotWorkspace>,
     events: Events,
     listener_pause_until: Option<Instant>,
+    dns_event: bool,
 }
 
 impl Serving {
@@ -353,12 +374,68 @@ impl Serving {
             slots,
             events: Events::with_capacity(MAX_OPS * 4),
             listener_pause_until: None,
+            dns_event: false,
         })
     }
 
     /// The retained storage, for host tests inspecting slot occupancy.
     pub fn storage(&self) -> &ServeStorage {
         &self.storage
+    }
+
+    /// The retained storage, mutable so the owner drives shared DNS turns.
+    pub(crate) fn storage_mut(&mut self) -> &mut ServeStorage {
+        &mut self.storage
+    }
+
+    /// The single poll registry, exposed so the retained DNS transport is
+    /// attached to the same readiness wait as the listener and connections.
+    pub fn registry(&self) -> &Registry {
+        self.poll.registry()
+    }
+
+    /// The fixed token the retained DNS source is attached under on this
+    /// registry.
+    pub const fn dns_token() -> Token {
+        Token(DNS_LOCAL)
+    }
+
+    /// Whether a DNS freshness event was observed since the last query, so the
+    /// shared owner decides when to advance the cooperative exchange.
+    pub fn take_dns_event(&mut self) -> bool {
+        let seen = self.dns_event;
+        self.dns_event = false;
+        seen
+    }
+
+    /// Attaches the retained DNS transport to this poll's registry so DNS
+    /// freshness joins traffic readiness under the single wait. No-op at
+    /// construction (no transport open yet); the owner re-attaches after a
+    /// refresh opens a fresh transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the external registration fails.
+    pub(crate) fn attach_dns_shared(&mut self) -> Result<(), ServeError> {
+        let registry = self.poll.registry();
+        self.storage
+            .dns_mut()
+            .attach_shared(registry, Self::dns_token())
+            .map_err(ServeError::from)
+    }
+
+    /// Re-aligns the shared DNS registration to the current exchange phase
+    /// after cooperative turns moved it. No-op while idle or unattached.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the external re-registration fails.
+    pub(crate) fn sync_dns_shared(&mut self) -> Result<(), ServeError> {
+        let registry = self.poll.registry();
+        self.storage
+            .dns_mut()
+            .sync_shared(registry)
+            .map_err(ServeError::from)
     }
 
     /// Runs one poll iteration, dispatching every ready event and enforcing
@@ -414,11 +491,15 @@ impl Serving {
 
     fn dispatch_readiness(&mut self, token: Token, ready: Readiness) -> Result<(), ServeError> {
         let raw = token.0;
+        let local = raw & LOCAL_MASK;
         if raw == 0 {
             return self.accept_all();
         }
+        if local == DNS_LOCAL {
+            self.dns_event = true;
+            return Ok(());
+        }
         let event_gen = (raw >> GEN_SHIFT) as u64;
-        let local = raw & LOCAL_MASK;
         let upstream = local >= UPSTREAM_BASE;
         let index = if upstream {
             local - UPSTREAM_BASE
@@ -1275,6 +1356,11 @@ impl Serving {
             {
                 earliest = Some(c);
             }
+        }
+        if let Some(dns) = self.storage.dns().exchange_deadline()
+            && earliest.is_none_or(|e| dns < e)
+        {
+            earliest = Some(dns);
         }
         let deadline = earliest?;
         let now = Instant::now();

@@ -24,7 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mio::net::TcpStream;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Registry, Token};
 
 use crate::cache::{Cache, CacheError, Family};
 use crate::config::{ALLOWLIST_MAX, Config, Fqdn};
@@ -71,6 +71,11 @@ pub enum StartupDnsError {
     /// outstanding exchange, its schedule accounting, and its connection are
     /// preserved untouched rather than silently replaced.
     ExchangeActive,
+    /// The retained transport was asked to join the shared owner's registry
+    /// while it still holds an open connection bound to the DNS-private poll.
+    /// Attach only a transport with no open connection; a source can belong to
+    /// exactly one registry.
+    SharedAttachConflict,
 }
 
 impl fmt::Display for StartupDnsError {
@@ -98,6 +103,9 @@ impl fmt::Display for StartupDnsError {
             }
             StartupDnsError::ExchangeActive => {
                 write!(f, "startup DNS exchange already in progress")
+            }
+            StartupDnsError::SharedAttachConflict => {
+                write!(f, "startup DNS transport holds a private-poll connection")
             }
         }
     }
@@ -151,7 +159,7 @@ struct ActiveExchange {
 /// cooperative turn by [`StartupDns::advance_exchange`]. Turns never wait for
 /// readiness (alumina.md:146); the owner decides when to advance again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExchangeStep {
+pub(crate) enum ExchangeStep {
     /// A nonblocking connect is in progress toward the exchange deadline; the
     /// query is not written until the socket is verifiably connected.
     Connecting,
@@ -234,6 +242,22 @@ enum WriteForce {
     Partial(usize),
 }
 
+/// Whether the retained transport belongs to this transport's own private poll
+/// or to the shared owner's single serving poll. A source has exactly one
+/// registry (mio rejects a second); the variants make the two owners
+/// mutually exclusive, and `armed` records the interest currently registered
+/// for the shared registry's stream: `Some(interest)` while registered,
+/// `None` while the stream is fresh or closed. Only `Private` ever touches the
+/// DNS-private poll.
+#[derive(Debug)]
+enum Registration {
+    Private,
+    Shared {
+        token: Token,
+        armed: Option<Interest>,
+    },
+}
+
 /// A boot-owned reusable DNS transport. Constructed once before the
 /// startup-window phase so the exchange loop performs no heap allocation or
 /// deallocation: the poll registry, fixed query/recv buffers, and the response
@@ -253,6 +277,7 @@ pub struct StartupDns {
     addr: SocketAddr,
     watch: Token,
     token_gen: usize,
+    registration: Registration,
     active: Option<ActiveExchange>,
     #[cfg(test)]
     poll_ticks: u64,
@@ -287,6 +312,7 @@ impl StartupDns {
             addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             watch: Token(0),
             token_gen: 0,
+            registration: Registration::Private,
             active: None,
             #[cfg(test)]
             poll_ticks: 0,
@@ -313,19 +339,32 @@ impl StartupDns {
         self.start
     }
 
-    /// Closes the transport connection exactly once: deregisters the source,
-    /// drops the socket, and resets the read/write message state. A `NotFound`
-    /// deregister is the benign already-closed case; any other deregister
-    /// failure is surfaced as a lifecycle `Transport` error because it leaks a
-    /// registry registration.
+    /// Closes the transport connection exactly once. In private mode the
+    /// source is deregistered against the DNS-private poll; a `NotFound`
+    /// deregister is the benign already-closed case, any other failure is
+    /// surfaced as a lifecycle `Transport` error because it leaks a registry
+    /// registration. In shared mode the socket belongs to the owner's registry:
+    /// dropping it is the deregistration at the kernel layer (closing the fd
+    /// removes it from any poll set, and mio keeps no token-keyed table), so
+    /// the same token is reusable on a fresh source and `armed` clears to keep
+    /// the registration state consistent with the closed stream.
     fn close_connection(&mut self) -> Result<(), StartupDnsError> {
         let deregister_error = if let Some(mut stream) = self.stream.take() {
-            match self.poll.registry().deregister(&mut stream) {
-                Ok(()) => None,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => Some(e.kind()),
+            match &mut self.registration {
+                Registration::Private => match self.poll.registry().deregister(&mut stream) {
+                    Ok(()) => None,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => Some(e.kind()),
+                },
+                Registration::Shared { armed, .. } => {
+                    *armed = None;
+                    None
+                }
             }
         } else {
+            if let Registration::Shared { armed, .. } = &mut self.registration {
+                *armed = None;
+            }
             None
         };
         self.filled = 0;
@@ -348,6 +387,17 @@ impl StartupDns {
         Ok(Token(self.token_gen))
     }
 
+    /// Closes the transport when the shared owner drove this exchange, so a
+    /// concluded exchange never leaves an idle socket registered with (or
+    /// retained under) the serving poll. Private mode keeps the connection
+    /// warm for reuse within the startup window.
+    fn conclude_shared_transport(&mut self) -> Result<(), StartupDnsError> {
+        if matches!(self.registration, Registration::Shared { .. }) {
+            self.close_connection()?;
+        }
+        Ok(())
+    }
+
     /// Performs the nonblocking connect and registers the source, leaving the
     /// connection to be completed by [`Self::step_connect`] turns. A
     /// synchronous connect error is returned so the caller can defer it to the
@@ -363,17 +413,24 @@ impl StartupDns {
             Err(e) => return Ok(Some(e.kind())),
         };
         self.watch = watch;
-        self.poll
-            .registry()
-            .register(
-                &mut stream,
-                watch,
-                Interest::READABLE.add(Interest::WRITABLE),
-            )
-            .map_err(|e| StartupDnsError::Transport {
-                kind: e.kind(),
-                detail: "register",
-            })?;
+        match &mut self.registration {
+            Registration::Private => {
+                self.poll
+                    .registry()
+                    .register(
+                        &mut stream,
+                        watch,
+                        Interest::READABLE.add(Interest::WRITABLE),
+                    )
+                    .map_err(|e| StartupDnsError::Transport {
+                        kind: e.kind(),
+                        detail: "register",
+                    })?;
+            }
+            Registration::Shared { armed, .. } => {
+                *armed = None;
+            }
+        }
         self.stream = Some(stream);
         Ok(None)
     }
@@ -385,6 +442,9 @@ impl StartupDns {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(());
         };
+        if matches!(self.registration, Registration::Shared { .. }) {
+            return Ok(());
+        }
         self.poll
             .registry()
             .reregister(stream, self.watch, Interest::READABLE)
@@ -404,6 +464,9 @@ impl StartupDns {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(());
         };
+        if matches!(self.registration, Registration::Shared { .. }) {
+            return Ok(());
+        }
         self.poll
             .registry()
             .reregister(stream, self.watch, Interest::WRITABLE)
@@ -418,6 +481,130 @@ impl StartupDns {
     /// earliest-deadline wait.
     pub(crate) fn exchange_deadline(&self) -> Option<Instant> {
         self.active.as_ref().map(|ex| ex.deadline)
+    }
+
+    /// Whether an exchange is currently in progress, so a shared owner can
+    /// decide whether DNS work is due without treating idle as an error.
+    pub(crate) fn has_active_exchange(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// The allowlist ordinal of the outstanding exchange, for the owner to
+    /// recover the query name from the configuration and cache.
+    pub(crate) fn active_ordinal(&self) -> Option<usize> {
+        self.active.as_ref().map(|ex| ex.ordinal)
+    }
+
+    /// The stage of the outstanding exchange, for the shared owner to observe
+    /// progress (e.g. that a query has been fully written and the exchange
+    /// awaits a response).
+    #[allow(dead_code)]
+    pub(crate) fn exchange_step(&self) -> Option<ExchangeStep> {
+        self.active.as_ref().map(|ex| ex.step)
+    }
+
+    /// Repoints the retained transport peer. Startup configures it through
+    /// resolution; a refresh owner repoints it by policy before starting an
+    /// exchange.
+    #[allow(dead_code)]
+    pub(crate) fn set_peer(&mut self, addr: SocketAddr) {
+        self.addr = addr;
+    }
+
+    /// Registers the retained transport with an external single-poll owner so
+    /// DNS freshness joins traffic readiness in one wait. The private poll is
+    /// bypassed from here on: the shared registry is the source's only
+    /// registry. The transport must hold no open connection (the startup path
+    /// closes before transfer); attaching one still bound to the private poll
+    /// is refused as [`StartupDnsError::SharedAttachConflict`] rather than
+    /// double-registering a source.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SharedAttachConflict` when the transport holds an open
+    /// connection, and `Transport` when the external registration fails.
+    pub(crate) fn attach_shared(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+    ) -> Result<(), StartupDnsError> {
+        if matches!(self.registration, Registration::Shared { .. }) {
+            return Ok(());
+        }
+        if self.stream.is_some() {
+            return Err(StartupDnsError::SharedAttachConflict);
+        }
+        self.registration = Registration::Shared { token, armed: None };
+        self.sync_shared(registry)
+    }
+
+    /// Re-aligns the shared registration to the current exchange phase: it
+    /// registers the transport the first time it is observed, re-registers it
+    /// only when the phase's desired interest changes, and deregisters
+    /// (or no-ops after a close) when the exchange is idle. Calling every
+    /// turn is cheap: an unchanged interest performs no syscall, so an idle or
+    /// quiet owner never spins a permanently-ready socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Transport` when the external registration, re-registration, or
+    /// deregistration fails.
+    pub(crate) fn sync_shared(&mut self, registry: &Registry) -> Result<(), StartupDnsError> {
+        if !matches!(self.registration, Registration::Shared { .. }) {
+            return Ok(());
+        }
+        let desired = self.shared_desired_interest();
+        let (token, armed) = match &mut self.registration {
+            Registration::Shared { token, armed } => (*token, armed),
+            Registration::Private => return Ok(()),
+        };
+        let Some(stream) = self.stream.as_mut() else {
+            *armed = None;
+            return Ok(());
+        };
+        if *armed == desired {
+            return Ok(());
+        }
+        let was_armed = *armed;
+        match desired {
+            Some(interest) => {
+                let result = if was_armed.is_some() {
+                    registry.reregister(stream, token, interest)
+                } else {
+                    registry.register(stream, token, interest)
+                };
+                result.map_err(|e| StartupDnsError::Transport {
+                    kind: e.kind(),
+                    detail: "shared",
+                })?;
+            }
+            None => {
+                registry
+                    .deregister(stream)
+                    .map_err(|e| StartupDnsError::Transport {
+                        kind: e.kind(),
+                        detail: "deregister",
+                    })?;
+            }
+        }
+        *armed = desired;
+        Ok(())
+    }
+
+    /// The interest the shared registry must currently arm for the exchange
+    /// phase: `None` while idle so an owner never waits on a retained socket,
+    /// the writable edge while connecting or backpressured, the readable edge
+    /// while awaiting a response, and both while the next write can proceed on
+    /// its own.
+    fn shared_desired_interest(&self) -> Option<Interest> {
+        match self.active.as_ref().map(|ex| ex.step) {
+            Some(ExchangeStep::Connecting | ExchangeStep::AwaitWritable) => {
+                Some(Interest::WRITABLE)
+            }
+            Some(ExchangeStep::Receiving) => Some(Interest::READABLE),
+            Some(ExchangeStep::SendReady) => Some(Interest::READABLE | Interest::WRITABLE),
+            None => None,
+        }
     }
 
     #[cfg(test)]
@@ -438,7 +625,7 @@ impl StartupDns {
     /// instead of blocking on a stale edge; a would-block observed there
     /// transitions the exchange to AwaitWritable and arms this wait rather
     /// than spinning on an assumed write window.
-    fn needs_wait(&self) -> bool {
+    pub(crate) fn needs_wait(&self) -> bool {
         let Some(ex) = self.active.as_ref() else {
             return false;
         };
@@ -963,6 +1150,7 @@ impl StartupDns {
                 }
                 RecvStep::Published => {
                     self.active = None;
+                    self.conclude_shared_transport()?;
                     return Ok(TurnResult::Published);
                 }
             },
