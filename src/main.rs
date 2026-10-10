@@ -1,14 +1,16 @@
-//! Alumina phase-1 binary: fixed documented config/resolver inputs, no CLI or
+//! Alumina binary: fixed documented config/resolver inputs, no CLI or
 //! environment policy overrides. Runs the boot harness (privilege check,
-//! config + resolver reads, 128 MiB storage init), the boot-owned startup DNS
-//! window, then applies the canonical readiness rule: the listener opens for a
-//! serving decision, and an unresolved count beyond the allowance exits
-//! EX_TEMPFAIL (75). A boot or startup failure exits EX_CONFIG (78) with a
-//! diagnostic naming the field/source. The serving loop is not yet wired, so
-//! a serving decision still exits EX_SOFTWARE (70) rather than claiming the
-//! process is in service.
+//! config + resolver reads, 128 MiB traffic store + serving workspaces), then
+//! continues the same owner into the shared-readiness runtime: the serving
+//! workspaces are preallocated before the boot-owned startup DNS window, the
+//! canonical readiness rule runs (the listener opens for a serving decision;
+//! an unresolved count beyond the allowance exits EX_TEMPFAIL 75), and a
+//! serving decision attaches the startup listener and enters the serving loop
+//! for the process lifetime. A boot or startup failure exits EX_CONFIG (78)
+//! with a diagnostic naming the field/source.
 
 use alumina::boot::{EX_CONFIG, run_boot};
+use alumina::runtime::Preallocated;
 use alumina::serve::{ServeStorage, StartupDecision};
 
 /// Fixed documented input paths, relative to the working directory. No CLI
@@ -26,23 +28,33 @@ fn main() {
     emit_kernel_facts();
     match run_boot(CONFIG_PATH, RESOLVER_PATH) {
         Ok(report) => {
-            let mut serving = match ServeStorage::boot(&report.config) {
+            let storage = match ServeStorage::boot(&report.config) {
                 Ok(storage) => storage,
                 Err(err) => {
                     eprintln!("alumina: serving storage: {err}");
                     std::process::exit(EX_CONFIG);
                 }
             };
+            let mut owner = match Preallocated::preallocate(storage, report.storage) {
+                Ok(owner) => owner,
+                Err(err) => {
+                    eprintln!("alumina: serving workspace: {err}");
+                    std::process::exit(EX_CONFIG);
+                }
+            };
             println!(
-                "inventory retained initialized traffic-storage bytes: {}",
-                report.storage.len()
+                "inventory named fixed buffers (lower bound): {} (traffic {} + serving workspace {} + dns named buffers {})",
+                report.inventory.named_fixed_buffer_bytes(),
+                report.inventory.traffic_storage_bytes(),
+                report.inventory.serving_workspace_bytes(),
+                report.inventory.dns_named_buffer_bytes(),
             );
             println!(
                 "inventory transient scratch (config doc buffer, not retained): {}",
                 report.inventory.transient_scratch_bytes()
             );
             println!(
-                "inventory reserved-future (not initialized in phase 1): {}",
+                "inventory reserved-future (log queue, deferred): {}",
                 report.inventory.reserved_future_bytes()
             );
             println!(
@@ -57,32 +69,39 @@ fn main() {
                 report.config.listen().ip(),
                 report.config.listen().port()
             );
-            println!(
-                "serving storage retained: cache names: {} schedules: {}",
-                serving.cache().name_count(),
-                serving.schedules().name_count()
-            );
             let nameserver =
                 std::net::SocketAddr::new(report.nameserver.addr(), report.nameserver.port());
-            match serving.run_startup(nameserver, PROCESS_EPOCH_SECS) {
+            match owner.run_startup(nameserver, PROCESS_EPOCH_SECS) {
                 Ok(outcome) => match outcome.decision {
                     StartupDecision::Serve(mode) => {
-                        let bound = outcome
-                            .listener
-                            .as_ref()
-                            .and_then(|listener| listener.local_addr().ok())
+                        let Some(listener) = outcome.listener else {
+                            eprintln!("alumina: serving decision without a bound listener");
+                            std::process::exit(EX_SOFTWARE);
+                        };
+                        let bound = listener
+                            .local_addr()
                             .map(|addr| addr.to_string())
-                            .unwrap_or_else(|| "unavailable".to_string());
+                            .unwrap_or_else(|_| "unavailable".to_string());
                         println!(
                             "startup-decision: {mode:?} listener {bound} exchanges {} failed {} resolved {}",
                             outcome.report.exchanges,
                             outcome.report.failed,
                             outcome.report.resolved_names,
                         );
-                        eprintln!(
-                            "alumina: serving loop not implemented in phase 1; scaffold exits EX_SOFTWARE"
-                        );
-                        std::process::exit(EX_SOFTWARE);
+                        let runtime = match owner.attach(listener) {
+                            Ok(runtime) => runtime,
+                            Err(err) => {
+                                eprintln!("alumina: serving: {err}");
+                                std::process::exit(EX_SOFTWARE);
+                            }
+                        };
+                        match runtime.serve() {
+                            Err(err) => {
+                                eprintln!("alumina: serving: {err}");
+                                std::process::exit(EX_SOFTWARE);
+                            }
+                            Ok(never) => match never {},
+                        }
                     }
                     StartupDecision::Exit75 { unresolved } => {
                         println!(

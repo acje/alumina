@@ -348,23 +348,25 @@ pub struct Serving {
 }
 
 impl Serving {
-    /// Builds the loop over an already-bound listener, boot-completed storage,
-    /// and the boot-owned traffic store, registering the listener and moving
-    /// the retained per-slot buffer pairs into the fixed slot workspaces
-    /// without a second traffic allocation.
+    /// Builds the loop's retained serving workspaces over boot-completed
+    /// storage and the boot-owned traffic store, moving the retained per-slot
+    /// buffer pairs into the fixed slot workspaces without a second traffic
+    /// allocation and without registering the startup listener yet.
+    ///
+    /// This is the storage-init phase: the poll, the 128 slot workspaces
+    /// (CONNECT parser, ClientHello inspector, gate, cursors) and the event
+    /// buffer all exist here, so main can call it before the startup DNS
+    /// window opens ([`Self::attach_listener`] registers the listener that
+    /// later opens).
     ///
     /// # Errors
     ///
-    /// Returns a serve error when the poll registry or listener registration
-    /// fails.
-    pub fn new(
+    /// Returns a serve error when the poll cannot be created.
+    pub(crate) fn preallocate(
         storage: ServeStorage,
-        mut listener: TcpListener,
         traffic: crate::inventory::TrafficStorage,
     ) -> Result<Serving, ServeError> {
         let poll = Poll::new()?;
-        poll.registry()
-            .register(&mut listener, LISTENER, Interest::READABLE)?;
         let slots = traffic
             .into_slots()
             .into_iter()
@@ -376,12 +378,46 @@ impl Serving {
         Ok(Serving {
             poll,
             storage,
-            listener: Some(listener),
+            listener: None,
             slots,
             events: Events::with_capacity(MAX_OPS * 4),
             listener_pause_until: None,
             dns_event: false,
         })
+    }
+
+    /// Registers the startup-bound listener on the serving poll, completing
+    /// the loop after the startup window opened it for a serving decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the listener registration fails.
+    pub(crate) fn attach_listener(&mut self, listener: TcpListener) -> Result<(), ServeError> {
+        let mut listener = listener;
+        self.poll
+            .registry()
+            .register(&mut listener, LISTENER, Interest::READABLE)?;
+        self.listener = Some(listener);
+        Ok(())
+    }
+
+    /// Builds the loop over an already-bound listener, boot-completed storage,
+    /// and the boot-owned traffic store: preallocates the retained serving
+    /// workspaces, then registers the listener. Host/test convenience over the
+    /// two-phase [`Self::preallocate`] + [`Self::attach_listener`] owner seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the poll registry or listener registration
+    /// fails.
+    pub fn new(
+        storage: ServeStorage,
+        listener: TcpListener,
+        traffic: crate::inventory::TrafficStorage,
+    ) -> Result<Serving, ServeError> {
+        let mut serving = Self::preallocate(storage, traffic)?;
+        serving.attach_listener(listener)?;
+        Ok(serving)
     }
 
     /// The retained storage, for host tests inspecting slot occupancy.

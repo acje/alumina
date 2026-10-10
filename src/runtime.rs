@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use mio::Token;
 use mio::net::TcpListener;
 
-use crate::serve::ServeStorage;
+use crate::serve::{ServeStorage, StartupError, StartupOutcome};
 use crate::serving::{ServeError, Serving};
 use crate::startup_dns::TurnResult;
 
@@ -21,33 +21,126 @@ use crate::startup_dns::TurnResult;
 /// so a chatty or stalled peer can never starve traffic within a turn.
 const DNS_ADVANCE_BOUND: usize = 8;
 
-/// The shared-readiness owner: one process owner whose single wait sees both
-/// DNS freshness and traffic readiness, and whose turn policy decides when DNS
-/// work is due (a freshness event, a send that can proceed without waiting, or
-/// the exchange deadline).
+/// The pre-attach owner: the retained serving workspaces are preallocated over
+/// boot-completed storage, and the startup window runs over that complete
+/// owner, exactly as main wires it. It carries no serving loop: [`Self::turn`]
+/// and an entry loop only exist on the attached [`Runtime`] returned by the
+/// consuming [`Self::attach`], so serving without a listener is
+/// unrepresentable (a preallocated owner cannot be turned or served; a second
+/// attach is excluded because [`Self::attach`] consumes `self`).
+///
+/// ```compile_fail,E0599
+/// use alumina::runtime::Preallocated;
+/// fn probe(owner: Preallocated) {
+///     owner.serve();
+/// }
+/// ```
+pub struct Preallocated {
+    serving: Serving,
+    dns_token: Token,
+}
+
+impl Preallocated {
+    /// Builds the owner's retained serving workspaces over boot-completed
+    /// storage and the boot-owned traffic store, before the startup DNS
+    /// window runs. The owner is complete except for the startup-opened
+    /// listener and the shared DNS registration, which [`Self::attach`] adds
+    /// once a serving decision is taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the serving poll cannot be created.
+    pub fn preallocate(
+        storage: ServeStorage,
+        traffic: crate::inventory::TrafficStorage,
+    ) -> Result<Preallocated, ServeError> {
+        let dns_token = Serving::dns_token();
+        let serving = Serving::preallocate(storage, traffic)?;
+        Ok(Preallocated { serving, dns_token })
+    }
+
+    /// Runs the canonical startup DNS window and readiness decision over the
+    /// retained storage, exactly as main wires it. The listener opens inside,
+    /// at the moment a serving decision is taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying fatal DNS/readiness error, or `Listener` when
+    /// the configured listen socket cannot be bound.
+    pub fn run_startup(
+        &mut self,
+        nameserver: std::net::SocketAddr,
+        now0: u64,
+    ) -> Result<StartupOutcome, StartupError> {
+        self.serving.storage_mut().run_startup(nameserver, now0)
+    }
+
+    /// The shortened-window startup core for the loopback test seam.
+    #[cfg(test)]
+    pub(crate) fn run_startup_within(
+        &mut self,
+        nameserver: std::net::SocketAddr,
+        now0: u64,
+        window: std::time::Duration,
+    ) -> Result<StartupOutcome, StartupError> {
+        self.serving
+            .storage_mut()
+            .run_startup_within(nameserver, now0, window)
+    }
+
+    /// Completes the owner after the startup window opened the listener,
+    /// returning the attached owner that owns the serving loop: the listener
+    /// is registered and the retained DNS transport attaches to the single
+    /// serving poll so one wait observes both DNS freshness and traffic
+    /// readiness. Consumes `self`, so the same owner cannot be attached twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the listener registration or the shared DNS
+    /// registration fails.
+    pub fn attach(mut self, listener: TcpListener) -> Result<Runtime, ServeError> {
+        self.serving.attach_listener(listener)?;
+        self.serving.attach_dns_shared()?;
+        Ok(Runtime {
+            serving: self.serving,
+            dns_token: self.dns_token,
+        })
+    }
+
+    /// The serving engine, for host observation of pre-attach readiness state.
+    pub fn serving(&self) -> &Serving {
+        &self.serving
+    }
+}
+
+/// The attached shared-readiness owner: one process owner whose single wait
+/// sees both DNS freshness and traffic readiness, and whose turn policy
+/// decides when DNS work is due (a freshness event, a send that can proceed
+/// without waiting, or the exchange deadline). Constructed only by the
+/// consuming [`Preallocated::attach`] or the equivalent [`Runtime::new`], so
+/// it always owns an attached listener and all `sized` serving workspaces:
+/// the serve loop and per-turn dispatch are reachable only here.
 pub struct Runtime {
     serving: Serving,
     dns_token: Token,
 }
 
 impl Runtime {
-    /// Builds the owner over boot-completed storage, the boot-owned traffic
-    /// store, and an already-bound listener, attaching the retained DNS
-    /// transport to the single serving poll.
+    /// Builds the attached owner over boot-completed storage, the boot-owned
+    /// traffic store, and an already-bound listener, attaching the retained
+    /// DNS transport to the single serving poll. Equivalent to
+    /// [`Preallocated::preallocate`] then [`Preallocated::attach`].
     ///
     /// # Errors
     ///
-    /// Returns a serve error when the serving poll or the shared DNS
-    /// registration fails.
+    /// Returns a serve error when the serving poll, the listener registration,
+    /// or the shared DNS registration fails.
     pub fn new(
         storage: ServeStorage,
         listener: TcpListener,
         traffic: crate::inventory::TrafficStorage,
     ) -> Result<Runtime, ServeError> {
-        let dns_token = Serving::dns_token();
-        let mut serving = Serving::new(storage, listener, traffic)?;
-        serving.attach_dns_shared()?;
-        Ok(Runtime { serving, dns_token })
+        Preallocated::preallocate(storage, traffic)?.attach(listener)
     }
 
     /// The serving engine, for host observation.
@@ -80,6 +173,22 @@ impl Runtime {
             self.cooperative_dns_turn()?;
         }
         self.serving.sync_dns_shared()
+    }
+
+    /// Enter the serving loop for the process lifetime: the attached listener
+    /// keeps the owner taking single waits over DNS freshness and traffic
+    /// readiness and dispatching bounded turns. The owner is always attached
+    /// by construction ([`Preallocated::attach`] or [`Runtime::new`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when a poll or cooperative DNS turn fails. The
+    /// loop never yields `Ok`: [`std::convert::Infallible`] is uninhabited,
+    /// so a caller cannot mistake a returned `Ok` for a clean serving exit.
+    pub fn serve(mut self) -> Result<std::convert::Infallible, ServeError> {
+        loop {
+            self.turn(None)?;
+        }
     }
 
     /// DNS work is due without a freshness event when the outstanding exchange
@@ -464,6 +573,61 @@ mod tests {
         assert!(
             second,
             "a reconnect after the peer closed must publish through a fresh connection"
+        );
+    }
+
+    use crate::serve::{ServingMode, StartupDecision};
+
+    #[test]
+    fn preallocate_then_startup_then_attach_accepts_in_main_order() {
+        let t = thread::Builder::new()
+            .name("runtime-main-wiring".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(main_wiring_body)
+            .expect("spawn main-wiring falsifier");
+        t.join().expect("main-wiring falsifier thread");
+    }
+
+    /// Mirrors main.rs exactly: the retained serving workspaces are preallocated
+    /// BEFORE any DNS exchange, the startup window then runs over that complete
+    /// owner, and the serving decision's listener is attached for traffic.
+    fn main_wiring_body() {
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut owner =
+            Preallocated::preallocate(storage, traffic).expect("preallocate serving workspaces");
+        assert!(
+            !owner.serving().storage().dns().has_active_exchange(),
+            "the retained DNS transport must not start an exchange before the window"
+        );
+
+        let (responder_addr, responder) = spawn_responder_keep_alive();
+        let outcome = owner
+            .run_startup_within(responder_addr, 1000, Duration::from_secs(2))
+            .expect("startup window");
+        assert_eq!(outcome.decision, StartupDecision::Serve(ServingMode::Full));
+        let listener = outcome
+            .listener
+            .expect("a serving decision binds the connect listener");
+        let mut runtime = owner.attach(listener).expect("attach listener + dns");
+
+        let client = connect(port);
+        let mut accepted = false;
+        for _ in 0..200 {
+            runtime
+                .turn(Some(Duration::from_millis(2)))
+                .expect("owner turn");
+            if runtime.serving().storage().occupied() > 0 {
+                accepted = true;
+                break;
+            }
+        }
+        drop(client);
+        drop(responder);
+        assert!(
+            accepted,
+            "the wired owner must accept the client on the startup-bound listener"
         );
     }
 }

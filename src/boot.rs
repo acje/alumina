@@ -137,8 +137,10 @@ mod tests {
         assert_eq!(report.nameserver.addr().to_string(), "1.1.1.1");
         assert_eq!(report.storage.len(), inventory::TRAFFIC_STORAGE_BYTES);
         assert_eq!(
-            report.inventory.retained_initialized_bytes(),
+            report.inventory.named_fixed_buffer_bytes(),
             inventory::TRAFFIC_STORAGE_BYTES
+                + inventory::SERVING_WORKSPACE_BYTES
+                + inventory::DNS_NAMED_BUFFER_BYTES
         );
     }
 

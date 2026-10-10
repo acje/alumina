@@ -1,10 +1,36 @@
 use std::fmt;
+use std::mem::size_of;
+
+use crate::client_hello::MAX_CLIENT_HELLO;
+use crate::connect::CONNECT_LIMIT;
+use crate::dns::ResponseWorkspace;
+use crate::startup_dns::{QUERY_BUF_LEN, RECV_BUF_LEN};
 
 pub const TUNNEL_SLOTS: usize = 128;
 pub const BUFFERS_PER_SLOT: usize = 2;
 pub const BUFFER_BYTES: usize = 512 * 1024;
 pub const TRAFFIC_STORAGE_BYTES: usize = TUNNEL_SLOTS * BUFFERS_PER_SLOT * BUFFER_BYTES;
 pub const CONFIG_DOC_BUFFER_BYTES: usize = 4096;
+
+/// The retained per-slot serving metadata: the fixed CONNECT parser head and
+/// the two 64 KiB ClientHello inspector buffers, allocated once per tunnel
+/// slot for the process lifetime and reused across connections.
+pub const SLOT_WORKSPACE_BYTES: usize = CONNECT_LIMIT + (MAX_CLIENT_HELLO * 2);
+
+/// The total retained serving-workspace bytes across all 128 slots.
+pub const SERVING_WORKSPACE_BYTES: usize = TUNNEL_SLOTS * SLOT_WORKSPACE_BYTES;
+
+/// The retained DNS transport named buffers (lower bound): the fixed 512-byte
+/// query buffer plus the fixed `DNS_MSG_LIMIT + 2` response buffer that the
+/// startup DNS transport pre-allocates, and the reusable response parse
+/// workspace (fixed owners table). These are the named buffers retained for
+/// the process lifetime; the DNS response message bound is their constituent.
+pub const DNS_NAMED_BUFFER_BYTES: usize =
+    QUERY_BUF_LEN + RECV_BUF_LEN + size_of::<ResponseWorkspace>();
+
+/// The reserved best-effort log queue (256 records x 8 KiB), not yet
+/// initialized in the serving candidate.
+pub const LOG_QUEUE_BYTES: usize = 256 * (8 * 1024);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageUnavailable;
@@ -103,49 +129,47 @@ fn buffer_bytes() -> Result<Box<[u8]>, StorageUnavailable> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReservedFuture {
-    connect_parse_bytes: usize,
-    tls_pre_auth_bytes: usize,
-    dns_message_bytes: usize,
-    log_queue_bytes: usize,
-}
-
-impl ReservedFuture {
-    fn new() -> ReservedFuture {
-        ReservedFuture {
-            connect_parse_bytes: 8 * 1024,
-            tls_pre_auth_bytes: 64 * 1024,
-            dns_message_bytes: 16 * 1024,
-            log_queue_bytes: 256 * (8 * 1024),
-        }
-    }
-
-    pub fn total(&self) -> usize {
-        self.connect_parse_bytes
-            .saturating_add(self.tls_pre_auth_bytes)
-            .saturating_add(self.dns_message_bytes)
-            .saturating_add(self.log_queue_bytes)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootInventory {
     traffic_storage_bytes: usize,
+    serving_workspace_bytes: usize,
+    dns_named_buffer_bytes: usize,
     transient_config_buffer_bytes: usize,
-    reserved: ReservedFuture,
+    reserved_log_queue_bytes: usize,
 }
 
 impl BootInventory {
     pub fn phase1() -> BootInventory {
         BootInventory {
             traffic_storage_bytes: TRAFFIC_STORAGE_BYTES,
+            serving_workspace_bytes: SERVING_WORKSPACE_BYTES,
+            dns_named_buffer_bytes: DNS_NAMED_BUFFER_BYTES,
             transient_config_buffer_bytes: CONFIG_DOC_BUFFER_BYTES,
-            reserved: ReservedFuture::new(),
+            reserved_log_queue_bytes: LOG_QUEUE_BYTES,
         }
     }
 
-    pub fn retained_initialized_bytes(&self) -> usize {
+    /// The fixed named buffers the process is planned to retain for its
+    /// lifetime (lower bound over named constants and `size_of` of the
+    /// retained DNS workspace). Constant-derived plan, not an observation:
+    /// the traffic store initializes at boot, the serving workspaces at
+    /// [`Preallocated::preallocate`](crate::runtime::Preallocated::preallocate),
+    /// and the DNS buffers at the DNS transport's own construction.
+    pub fn named_fixed_buffer_bytes(&self) -> usize {
         self.traffic_storage_bytes
+            .saturating_add(self.serving_workspace_bytes)
+            .saturating_add(self.dns_named_buffer_bytes)
+    }
+
+    pub fn traffic_storage_bytes(&self) -> usize {
+        self.traffic_storage_bytes
+    }
+
+    pub fn serving_workspace_bytes(&self) -> usize {
+        self.serving_workspace_bytes
+    }
+
+    pub fn dns_named_buffer_bytes(&self) -> usize {
+        self.dns_named_buffer_bytes
     }
 
     pub fn transient_scratch_bytes(&self) -> usize {
@@ -153,7 +177,7 @@ impl BootInventory {
     }
 
     pub fn reserved_future_bytes(&self) -> usize {
-        self.reserved.total()
+        self.reserved_log_queue_bytes
     }
 }
 

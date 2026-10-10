@@ -634,37 +634,62 @@ fn inventory_actually_initializes_full_traffic_storage() {
     assert!(!storage.is_empty());
     let inv = BootInventory::phase1();
     assert_eq!(
-        inv.retained_initialized_bytes(),
-        inventory::TRAFFIC_STORAGE_BYTES,
-        "retained = 128 MiB traffic storage"
+        inv.named_fixed_buffer_bytes(),
+        inventory::TRAFFIC_STORAGE_BYTES
+            + inventory::SERVING_WORKSPACE_BYTES
+            + inventory::DNS_NAMED_BUFFER_BYTES,
+        "named-fixed lower bound = traffic 128 MiB + per-slot serving workspaces + DNS named buffers"
+    );
+    assert_eq!(
+        inv.traffic_storage_bytes(),
+        inventory::TRAFFIC_STORAGE_BYTES
+    );
+    assert_eq!(
+        inv.serving_workspace_bytes(),
+        inventory::SERVING_WORKSPACE_BYTES
+    );
+    assert_eq!(
+        inv.dns_named_buffer_bytes(),
+        inventory::DNS_NAMED_BUFFER_BYTES
     );
     assert_eq!(
         inv.transient_scratch_bytes(),
         inventory::CONFIG_DOC_BUFFER_BYTES
     );
     assert!(inv.reserved_future_bytes() > 0);
-    assert_ne!(
-        inv.retained_initialized_bytes(),
-        inv.reserved_future_bytes()
-    );
+    assert_ne!(inv.named_fixed_buffer_bytes(), inv.reserved_future_bytes());
 }
 
 #[test]
 fn inventory_reports_retained_vs_transient_vs_reserved_honestly() {
     let inv = BootInventory::phase1();
     assert_eq!(
-        inv.retained_initialized_bytes(),
-        134_217_728,
-        "only the retained traffic storage is initialized"
+        inv.named_fixed_buffer_bytes(),
+        inventory::TRAFFIC_STORAGE_BYTES
+            + inventory::SERVING_WORKSPACE_BYTES
+            + inventory::DNS_NAMED_BUFFER_BYTES,
+        "named-fixed lower bound = traffic 128 MiB + per-slot serving workspaces + DNS named buffers"
+    );
+    assert_eq!(
+        inv.traffic_storage_bytes(),
+        inventory::TRAFFIC_STORAGE_BYTES
+    );
+    assert_eq!(
+        inv.serving_workspace_bytes(),
+        inventory::SERVING_WORKSPACE_BYTES
+    );
+    assert_eq!(
+        inv.dns_named_buffer_bytes(),
+        inventory::DNS_NAMED_BUFFER_BYTES
     );
     assert_eq!(
         inv.transient_scratch_bytes(),
-        4096,
-        "config parse buffer is transient scratch, not retained"
+        inventory::CONFIG_DOC_BUFFER_BYTES
     );
     assert!(inv.reserved_future_bytes() > 0);
-    assert_ne!(
-        inv.retained_initialized_bytes(),
-        inv.reserved_future_bytes()
+    assert_ne!(inv.named_fixed_buffer_bytes(), inv.reserved_future_bytes());
+    assert!(
+        inv.dns_named_buffer_bytes() > 512 + 16 * 1024,
+        "DNS named buffers must cover the query buffer plus the message-limit response buffer"
     );
 }

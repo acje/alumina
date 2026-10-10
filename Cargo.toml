@@ -14,6 +14,16 @@ path = "src/lib.rs"
 name = "alumina"
 path = "src/main.rs"
 
+# harness = false: this test supplies its own `main()`, which the kernel
+# enters on the true process main thread. It probes the main-order serving
+# path (preallocate -> accept -> reset) under the deployment stack rlimit,
+# evidence for M2: the inline serving workspaces must not overflow the
+# deployment main thread's RLIMIT_STACK (see docs/build-plan.md stack bound).
+[[test]]
+name = "main_thread_stack"
+path = "tests/main_thread_stack.rs"
+harness = false
+
 [dependencies]
 toml = { version = "=1.1.8", default-features = false, features = ["std", "parse", "serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
