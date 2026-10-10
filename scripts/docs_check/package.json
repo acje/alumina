@@ -1,0 +1,14 @@
+{
+  "name": "alumina-docs-check",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tool-only offline Markdown link/fragment validator for the alumina docs corpus (no runtime network, no shell evaluation of document bytes).",
+  "license": "MIT",
+  "scripts": {},
+  "dependencies": {
+    "github-slugger": "2.0.0",
+    "mdast-util-from-markdown": "2.1.0",
+    "mdast-util-to-string": "4.0.0"
+  }
+}

@@ -1,0 +1,37 @@
+[package]
+name = "alumina"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Alumina phase-1 foundations: F0 toolchain pin, F1/F2/F4 witness scaffolds"
+
+[lib]
+name = "alumina"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alumina"
+path = "src/main.rs"
+
+[dependencies]
+toml = { version = "=1.1.8", default-features = false, features = ["std", "parse", "serde"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+mio = { version = "=1.2.4", default-features = false, features = ["net", "os-poll"] }
+getrandom = { version = "=0.3.4" }
+
+[features]
+# F1 counting allocator is opt-in so normal production releases are never
+# instrumented; the foundation test harness enables it explicitly (README).
+default = []
+alloc-witness = []
+# Proof-only fixture diagnostic: the built binary prints its own kernel facts
+# to stderr at entry so fixtures can assert facts at the actual executable
+# entry. Never part of `default`; compile-time gated, no policy effect, no
+# privileged bypass, no runtime env/CLI override.
+fixture-facts = []
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1
