@@ -8,6 +8,14 @@
 //! oversized responses the connection is closed, nothing is published, and the
 //! exchange counts as failed. Startup readiness evaluation from the published
 //! cache remains a caller concern.
+//!
+//! Cooperative turns never wait: [`StartupDns::advance_exchange`] performs at
+//! most one nonblocking I/O attempt and returns [`TurnResult::Pending`] when
+//! more readiness is needed; the single process owner owns the wait.
+//! [`StartupDns::exchange_deadline`] and [`StartupDns::wait_dns_readiness`]
+//! export the deadline and a wakeup the owner folds into its one combined
+//! wait, so the shared reactor can observe traffic, log, and shutdown
+//! readiness without DNS-internal blocking (alumina.md:146).
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -20,7 +28,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::cache::{Cache, CacheError, Family};
 use crate::config::{ALLOWLIST_MAX, Config, Fqdn};
-use crate::dns::{self, DNS_MSG_LIMIT, DnsError, Outcome, ResponseWorkspace};
+use crate::dns::{self, DNS_MSG_LIMIT, DnsError, ResponseWorkspace};
 use crate::schedule::{ScheduleError, Schedules};
 
 pub const EXCHANGE_DEADLINE_SECS: u64 = 2;
@@ -56,6 +64,13 @@ pub enum StartupDnsError {
     /// The monotonic clock cannot represent the startup window deadline; the
     /// window is not extended, shortened, or clamped.
     DeadlineOverflow,
+    /// The cooperative driver was asked to advance an exchange that is not in
+    /// progress; start one first.
+    ExchangeInactive,
+    /// A start was requested while an exchange is already in progress; the
+    /// outstanding exchange, its schedule accounting, and its connection are
+    /// preserved untouched rather than silently replaced.
+    ExchangeActive,
 }
 
 impl fmt::Display for StartupDnsError {
@@ -78,6 +93,12 @@ impl fmt::Display for StartupDnsError {
                 f,
                 "startup DNS window deadline not representable on this clock"
             ),
+            StartupDnsError::ExchangeInactive => {
+                write!(f, "startup DNS exchange not in progress")
+            }
+            StartupDnsError::ExchangeActive => {
+                write!(f, "startup DNS exchange already in progress")
+            }
         }
     }
 }
@@ -106,37 +127,91 @@ enum ExchangeResult {
     Failed,
 }
 
-/// Terminal classification of one exchange at the resolve-loop boundary.
-/// `Network` is a counted per-exchange failure whose schedule backoff has
-/// already been advanced; `Fatal` aborts the whole resolve with a storage,
-/// entropy, lifecycle, poll, or token-exhaustion error.
-enum ExchangeError {
-    Network,
-    Fatal(StartupDnsError),
+/// The full legal context of one outstanding cooperative exchange, owned as a
+/// single value on [`StartupDns`] so that at most one exchange can exist. A
+/// transaction id, identity, deadline, per-stage state, and any deferred
+/// synchronous connect error travel together; `None` means no exchange is in
+/// progress. The step state advances by at most one stage per cooperative
+/// turn.
+#[derive(Debug)]
+struct ActiveExchange {
+    ordinal: usize,
+    family: Family,
+    deadline: Instant,
+    step: ExchangeStep,
+    /// `query_buf[..qlen]` is the length-prefixed query awaiting writes.
+    qlen: usize,
+    /// A synchronous connect error deferred to the first connecting turn so it
+    /// settles as the counted failure it is, never aborted.
+    connect_err: Option<io::ErrorKind>,
+    tid: u16,
 }
 
-impl From<StartupDnsError> for ExchangeError {
-    fn from(err: StartupDnsError) -> Self {
-        ExchangeError::Fatal(err)
-    }
+/// The stage of one outstanding exchange, advanced by at most one stage each
+/// cooperative turn by [`StartupDns::advance_exchange`]. Turns never wait for
+/// readiness (alumina.md:146); the owner decides when to advance again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeStep {
+    /// A nonblocking connect is in progress toward the exchange deadline; the
+    /// query is not written until the socket is verifiably connected.
+    Connecting,
+    /// The length-prefixed query is not yet fully written and the send can
+    /// proceed without waiting; the next turn attempts another nonblocking
+    /// write.
+    SendReady,
+    /// The last nonblocking write refused the socket (WouldBlock); the
+    /// backpressure is recorded in the type and the owner must wait for a
+    /// writable edge before another send attempt. No kernel or peer send-buffer
+    /// capacity is assumed.
+    AwaitWritable,
+    /// Awaiting or assembling a response within the exchange deadline.
+    Receiving,
 }
 
-impl From<DnsError> for ExchangeError {
-    fn from(err: DnsError) -> Self {
-        ExchangeError::Fatal(StartupDnsError::Dns(err))
-    }
+/// The outcome of one cooperative turn, returned by
+/// [`StartupDns::advance_exchange`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TurnResult {
+    /// The exchange needs another turn; the worker may do other bounded work
+    /// and then call [`StartupDns::advance_exchange`] again.
+    Pending,
+    /// A fully validated response was applied to the cache and schedule.
+    Published,
+    /// A counted per-exchange network failure; the connection is closed and
+    /// the schedule backoff has been advanced exactly once.
+    Failed,
 }
 
-impl From<CacheError> for ExchangeError {
-    fn from(err: CacheError) -> Self {
-        ExchangeError::Fatal(StartupDnsError::Cache(err))
-    }
+/// The progress of one nonblocking connect step.
+enum ConnectStep {
+    /// The connection is not yet established; the exchange stays in scope.
+    Waiting,
+    /// The socket is connected; advance moves to the sending stage next turn.
+    Transition,
+    /// A counted failure; the exchange has been settled and closed.
+    Failed,
 }
 
-impl From<ScheduleError> for ExchangeError {
-    fn from(err: ScheduleError) -> Self {
-        ExchangeError::Fatal(StartupDnsError::Schedule(err))
-    }
+/// The progress of one nonblocking query-write step.
+enum SendStep {
+    /// Some or all of the query remains unsent and the send can proceed without
+    /// waiting; the exchange stays able to retry next turn.
+    Waiting,
+    /// The socket refused the write (WouldBlock); the exchange is held in
+    /// AwaitWritable and the owner waits for a writable edge before retrying.
+    Blocked,
+    /// The query is fully written; advance moves to the receiving stage next
+    /// turn (the readiness interest switches to reads).
+    Transition,
+    /// A counted failure; the exchange has been settled and closed.
+    Failed,
+}
+
+/// The progress of one nonblocking response-read step.
+enum RecvStep {
+    Waiting,
+    Failed,
+    Published,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -146,6 +221,17 @@ pub struct StartupReport {
     pub cancelled: u32,
     pub not_attempted: u32,
     pub resolved_names: u32,
+}
+
+/// A tightly scoped test hook that substitutes the outcome of the next
+/// nonblocking send attempt, so a deterministically forced send backpressure
+/// (a real WouldBlock) can be exercised without depending on any kernel or
+/// peer send-buffer capacity.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum WriteForce {
+    WouldBlock,
+    Partial(usize),
 }
 
 /// A boot-owned reusable DNS transport. Constructed once before the
@@ -162,12 +248,16 @@ pub struct StartupDns {
     written: usize,
     filled: usize,
     msglen: Option<usize>,
-    tid: u16,
     now0: u64,
     start: Instant,
     addr: SocketAddr,
     watch: Token,
     token_gen: usize,
+    active: Option<ActiveExchange>,
+    #[cfg(test)]
+    poll_ticks: u64,
+    #[cfg(test)]
+    force_write: Option<WriteForce>,
 }
 
 impl StartupDns {
@@ -192,20 +282,23 @@ impl StartupDns {
             written: 0,
             filled: 0,
             msglen: None,
-            tid: 0,
             now0: 0,
             start: Instant::now(),
             addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             watch: Token(0),
             token_gen: 0,
+            active: None,
+            #[cfg(test)]
+            poll_ticks: 0,
+            #[cfg(test)]
+            force_write: None,
         })
     }
 
     fn fresh_tid(&mut self) -> Result<u16, StartupDnsError> {
         let mut bytes = [0u8; 2];
         getrandom::fill(&mut bytes).map_err(|_| StartupDnsError::Entropy)?;
-        self.tid = u16::from_be_bytes(bytes);
-        Ok(self.tid)
+        Ok(u16::from_be_bytes(bytes))
     }
 
     fn now_u64(&self) -> u64 {
@@ -255,12 +348,20 @@ impl StartupDns {
         Ok(Token(self.token_gen))
     }
 
-    fn open(&mut self, addr: SocketAddr, deadline: Instant) -> Result<(), StartupDnsError> {
+    /// Performs the nonblocking connect and registers the source, leaving the
+    /// connection to be completed by [`Self::step_connect`] turns. A
+    /// synchronous connect error is returned so the caller can defer it to the
+    /// first connecting turn, where it settles as the counted failure it is
+    /// rather than aborting.
+    fn begin_connect(
+        &mut self,
+        addr: SocketAddr,
+    ) -> Result<Option<io::ErrorKind>, StartupDnsError> {
         let watch = self.next_token()?;
-        let mut stream = TcpStream::connect(addr).map_err(|e| StartupDnsError::Exchange {
-            kind: e.kind(),
-            detail: "connect",
-        })?;
+        let mut stream = match TcpStream::connect(addr) {
+            Ok(stream) => stream,
+            Err(e) => return Ok(Some(e.kind())),
+        };
         self.watch = watch;
         self.poll
             .registry()
@@ -274,58 +375,103 @@ impl StartupDns {
                 detail: "register",
             })?;
         self.stream = Some(stream);
-        self.wait_connected(deadline)
+        Ok(None)
     }
 
-    fn wait_connected(&mut self, deadline: Instant) -> Result<(), StartupDnsError> {
-        loop {
-            if let Some(stream) = self.stream.as_mut() {
-                if let Ok(Some(err)) = stream.take_error() {
-                    self.close_connection()?;
-                    return Err(StartupDnsError::Exchange {
-                        kind: err.kind(),
-                        detail: "socket",
-                    });
-                }
-                if stream.peer_addr().is_ok() {
-                    return Ok(());
-                }
-            }
-            let (_, writable, error, closed) = self.poll_once(deadline)?;
-            if error || closed {
-                self.close_connection()?;
-                return Err(StartupDnsError::Exchange {
-                    kind: io::ErrorKind::ConnectionAborted,
-                    detail: "connect failed",
-                });
-            }
-            if writable
-                && self
-                    .stream
-                    .as_ref()
-                    .is_some_and(|stream| stream.peer_addr().is_ok())
-            {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                self.close_connection()?;
-                return Err(StartupDnsError::Exchange {
-                    kind: io::ErrorKind::TimedOut,
-                    detail: "connect deadline expired",
-                });
-            }
+    /// Restricts the registered interest to reads, so the owner's single wait
+    /// wakes only for response data (or EOF), never on the always-ready
+    /// writable edge once the query is fully sent.
+    fn set_stream_interest_readable(&mut self) -> Result<(), StartupDnsError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(());
+        };
+        self.poll
+            .registry()
+            .reregister(stream, self.watch, Interest::READABLE)
+            .map_err(|e| StartupDnsError::Transport {
+                kind: e.kind(),
+                detail: "reregister",
+            })
+    }
+
+    /// Re-arms the writable interest when a would-block send moves the
+    /// exchange to AwaitWritable. Re-arming after `EAGAIN` is the standard
+    /// event-loop idiom: it makes the owner's subsequent poll deterministically
+    /// wait on the writable edge even if an earlier writable event was consumed
+    /// by the completed connect. Drops the readable interest because no
+    /// response can arrive before the query is fully written.
+    fn set_stream_interest_writable(&mut self) -> Result<(), StartupDnsError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(());
+        };
+        self.poll
+            .registry()
+            .reregister(stream, self.watch, Interest::WRITABLE)
+            .map_err(|e| StartupDnsError::Transport {
+                kind: e.kind(),
+                detail: "reregister",
+            })
+    }
+
+    /// The absolute deadline of the outstanding exchange, or `None` when idle.
+    /// An owner that waits on more than one source folds this into its single
+    /// earliest-deadline wait.
+    pub(crate) fn exchange_deadline(&self) -> Option<Instant> {
+        self.active.as_ref().map(|ex| ex.deadline)
+    }
+
+    #[cfg(test)]
+    fn arm_write(&mut self, force: WriteForce) {
+        self.force_write = Some(force);
+    }
+
+    #[cfg(test)]
+    fn active_step(&self) -> Option<ExchangeStep> {
+        self.active.as_ref().map(|ex| ex.step)
+    }
+
+    /// Whether the owner must wait for network readiness before advancing the
+    /// exchange again. Connecting needs the connect-completion edge;
+    /// AwaitWritable needs a writable edge after a real would-block send;
+    /// Receiving needs response data. SendReady never does — the next turn's
+    /// nonblocking write attempt proceeds on its own, so the owner yields
+    /// instead of blocking on a stale edge; a would-block observed there
+    /// transitions the exchange to AwaitWritable and arms this wait rather
+    /// than spinning on an assumed write window.
+    fn needs_wait(&self) -> bool {
+        let Some(ex) = self.active.as_ref() else {
+            return false;
+        };
+        matches!(
+            ex.step,
+            ExchangeStep::Connecting | ExchangeStep::AwaitWritable | ExchangeStep::Receiving
+        )
+    }
+
+    /// The single owner-owned DNS wait: exactly one poll over the DNS-private
+    /// registry, with the timeout clipped to `until` and to the outstanding
+    /// exchange deadline so the wait never outlives the exchange. This is the
+    /// discourse between turns, not part of the turn API, and performs no DNS
+    /// work. Returns whether readiness for the DNS source was observed, so a
+    /// caller can re-advance immediately; a timeout means re-advance to settle
+    /// at the deadline. A turn that needs no readiness (a sendable exchange
+    /// whose next write proceeds on its own) yields the owner immediately
+    /// instead of blocking on a stale edge; a would-block send has moved the
+    /// exchange to AwaitWritable, so this wait polls for the writable edge.
+    pub(crate) fn wait_dns_readiness(&mut self, until: Instant) -> Result<bool, StartupDnsError> {
+        if !self.needs_wait() {
+            return Ok(false);
         }
-    }
-
-    fn poll_once(
-        &mut self,
-        deadline: Instant,
-    ) -> Result<(bool, bool, bool, bool), StartupDnsError> {
+        #[cfg(test)]
+        {
+            self.poll_ticks += 1;
+        }
+        let deadline = self.exchange_deadline().unwrap_or(until);
         let now = Instant::now();
-        let timeout = if now >= deadline {
+        let timeout = if now >= deadline || now >= until {
             Duration::ZERO
         } else {
-            deadline.duration_since(now)
+            deadline.min(until).saturating_duration_since(now)
         };
         self.poll
             .poll(&mut self.events, Some(timeout))
@@ -333,153 +479,215 @@ impl StartupDns {
                 kind: e.kind(),
                 detail: "poll",
             })?;
-        let mut readable = false;
-        let mut writable = false;
-        let mut error = false;
-        let mut closed = false;
-        for event in self.events.iter() {
-            if event.token() != self.watch {
-                continue;
-            }
-            readable |= event.is_readable();
-            writable |= event.is_writable();
-            error |= event.is_error();
-            closed |= event.is_read_closed() || event.is_write_closed();
-        }
-        Ok((readable, writable, error, closed))
+        Ok(self.events.iter().any(|event| event.token() == self.watch))
     }
 
-    fn send_query(&mut self, qlen: usize, deadline: Instant) -> Result<bool, StartupDnsError> {
-        loop {
-            if self.written < qlen {
-                if let Some(stream) = self.stream.as_mut() {
-                    match stream.write(&self.query_buf[self.written..qlen]) {
-                        Ok(0) => {
-                            self.close_connection()?;
-                            return Err(StartupDnsError::Exchange {
-                                kind: io::ErrorKind::WriteZero,
-                                detail: "write zero",
-                            });
-                        }
-                        Ok(n) => {
-                            self.written += n;
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            self.close_connection()?;
-                            return Err(StartupDnsError::Exchange {
-                                kind: e.kind(),
-                                detail: "write",
-                            });
+    /// One nonblocking connect step. The socket is deemed connected only once
+    /// `peer_addr` is resolvable (a completed nonblocking connect); the
+    /// exchange transitions to sending on the next turn, never in the same
+    /// turn that completes the connect.
+    fn step_connect(
+        &mut self,
+        ex: &mut ActiveExchange,
+        schedules: &mut Schedules,
+    ) -> Result<ConnectStep, StartupDnsError> {
+        if let Some(_kind) = ex.connect_err.take() {
+            self.close_connection()?;
+            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            return Ok(ConnectStep::Failed);
+        }
+        if let Some(stream) = self.stream.as_mut() {
+            if let Ok(Some(_err)) = stream.take_error() {
+                self.close_connection()?;
+                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                return Ok(ConnectStep::Failed);
+            }
+            if stream.peer_addr().is_ok() {
+                return Ok(ConnectStep::Transition);
+            }
+        }
+        if Instant::now() >= ex.deadline {
+            self.close_connection()?;
+            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            return Ok(ConnectStep::Failed);
+        }
+        Ok(ConnectStep::Waiting)
+    }
+
+    /// One nonblocking query-write step: at most one write attempt, then the
+    /// deadline is checked before yielding so a completed write is honoured
+    /// even at the boundary (faithful to the original `send_query` loop). A
+    /// would-block is reported as `Blocked` so the stage moves to
+    /// AwaitWritable; any other partial progress stays sendable.
+    fn step_send(
+        &mut self,
+        ex: &mut ActiveExchange,
+        schedules: &mut Schedules,
+    ) -> Result<SendStep, StartupDnsError> {
+        let mut blocked = false;
+        #[cfg(test)]
+        let mut forced_partial = 0usize;
+        #[cfg(test)]
+        {
+            if let Some(force) = self.force_write.take() {
+                blocked = true;
+                if let (Some(stream), WriteForce::Partial(n)) = (self.stream.as_mut(), force) {
+                    let end = (self.written + n).min(ex.qlen);
+                    if end > self.written {
+                        match stream.write(&self.query_buf[self.written..end]) {
+                            Ok(0) => {
+                                self.close_connection()?;
+                                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                                return Ok(SendStep::Failed);
+                            }
+                            Ok(w) => {
+                                self.written += w;
+                                forced_partial = w;
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(_) => {
+                                self.close_connection()?;
+                                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                                return Ok(SendStep::Failed);
+                            }
                         }
                     }
-                } else {
-                    self.close_connection()?;
-                    return Err(StartupDnsError::Exchange {
-                        kind: io::ErrorKind::NotConnected,
-                        detail: "write on closed stream",
-                    });
                 }
             }
-            if self.written >= qlen {
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                self.close_connection()?;
-                return Err(StartupDnsError::Exchange {
-                    kind: io::ErrorKind::TimedOut,
-                    detail: "write deadline expired",
-                });
-            }
-            let (_, _, error, closed) = self.poll_once(deadline)?;
-            if error || closed {
-                self.close_connection()?;
-                return Err(StartupDnsError::Exchange {
-                    kind: io::ErrorKind::ConnectionAborted,
-                    detail: "write failed",
-                });
-            }
         }
-    }
-
-    fn recv_message(
-        &mut self,
-        fqdn: &Fqdn,
-        family: Family,
-        deadline: Instant,
-    ) -> Result<Option<Outcome>, StartupDnsError> {
-        loop {
-            if self.stream.is_none() {
-                return Ok(None);
-            }
-            let want = match self.msglen {
-                Some(len) => len + 2,
-                None => 2,
-            };
-            if self.filled < want
-                && let Some(stream) = self.stream.as_mut()
-            {
-                match stream.read(&mut self.recv_buf[self.filled..]) {
+        if !blocked && self.written < ex.qlen {
+            if let Some(stream) = self.stream.as_mut() {
+                match stream.write(&self.query_buf[self.written..ex.qlen]) {
                     Ok(0) => {
                         self.close_connection()?;
-                        return Ok(None);
+                        self.note_failure(ex.ordinal, ex.family, schedules)?;
+                        return Ok(SendStep::Failed);
                     }
-                    Ok(n) => self.filled += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Ok(n) => {
+                        self.written += n;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        blocked = true;
+                    }
                     Err(_) => {
                         self.close_connection()?;
-                        return Ok(None);
+                        self.note_failure(ex.ordinal, ex.family, schedules)?;
+                        return Ok(SendStep::Failed);
                     }
                 }
+            } else {
+                self.close_connection()?;
+                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                return Ok(SendStep::Failed);
             }
-            if self.msglen.is_none() && self.filled >= 2 {
-                let len = usize::from(u16::from_be_bytes([self.recv_buf[0], self.recv_buf[1]]));
-                if len == 0 || len > DNS_MSG_LIMIT {
-                    self.close_connection()?;
-                    return Ok(None);
-                }
-                self.msglen = Some(len);
-            }
-            if let Some(len) = self.msglen
-                && self.filled >= len + 2
+        }
+        if self.written >= ex.qlen {
+            self.set_stream_interest_readable()?;
+            return Ok(SendStep::Transition);
+        }
+        if Instant::now() >= ex.deadline {
+            self.close_connection()?;
+            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            return Ok(SendStep::Failed);
+        }
+        if blocked {
+            #[cfg(test)]
             {
-                let message = &self.recv_buf[2..2 + len];
-                let outcome =
-                    dns::parse_response(&mut self.workspace, fqdn, family, self.tid, message);
-                self.msglen = None;
-                self.filled = 0;
-                match outcome {
-                    Ok(outcome) => return Ok(Some(outcome)),
-                    Err(_) => {
-                        self.close_connection()?;
-                        return Ok(None);
-                    }
+                if forced_partial > 0 {
+                    return Ok(SendStep::Waiting);
                 }
             }
-            if Instant::now() >= deadline {
-                self.close_connection()?;
-                return Ok(None);
-            }
-            let (_, _, error, closed) = self.poll_once(deadline)?;
-            if error {
-                self.close_connection()?;
-                return Ok(None);
-            }
-            if closed {
-                if let Some(stream) = self.stream.as_mut() {
-                    match stream.read(&mut self.recv_buf[self.filled..]) {
-                        Ok(n) if n > 0 => self.filled += n,
-                        _ => {
-                            self.close_connection()?;
-                            return Ok(None);
-                        }
-                    }
-                } else {
+            self.set_stream_interest_writable()?;
+            return Ok(SendStep::Blocked);
+        }
+        Ok(SendStep::Waiting)
+    }
+
+    /// One nonblocking response-read step: at most one read, then a complete
+    /// validated message is published; an API/EOF/deadline failure settles the
+    /// counted failure and closes the connection exactly once.
+    fn step_recv(
+        &mut self,
+        ex: &mut ActiveExchange,
+        fqdn: &Fqdn,
+        cache: &mut Cache,
+        schedules: &mut Schedules,
+    ) -> Result<RecvStep, StartupDnsError> {
+        if self.stream.is_none() {
+            self.close_connection()?;
+            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            return Ok(RecvStep::Failed);
+        }
+        let want = match self.msglen {
+            Some(len) => len + 2,
+            None => 2,
+        };
+        if self.filled < want
+            && let Some(stream) = self.stream.as_mut()
+        {
+            match stream.read(&mut self.recv_buf[self.filled..]) {
+                Ok(0) => {
                     self.close_connection()?;
-                    return Ok(None);
+                    self.note_failure(ex.ordinal, ex.family, schedules)?;
+                    return Ok(RecvStep::Failed);
+                }
+                Ok(n) => self.filled += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    self.close_connection()?;
+                    self.note_failure(ex.ordinal, ex.family, schedules)?;
+                    return Ok(RecvStep::Failed);
                 }
             }
         }
+        if self.msglen.is_none() && self.filled >= 2 {
+            let len = usize::from(u16::from_be_bytes([self.recv_buf[0], self.recv_buf[1]]));
+            if len == 0 || len > DNS_MSG_LIMIT {
+                self.close_connection()?;
+                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                return Ok(RecvStep::Failed);
+            }
+            self.msglen = Some(len);
+        }
+        if let Some(len) = self.msglen
+            && self.filled >= len + 2
+        {
+            let message = &self.recv_buf[2..2 + len];
+            let outcome =
+                dns::parse_response(&mut self.workspace, fqdn, ex.family, ex.tid, message);
+            self.msglen = None;
+            self.filled = 0;
+            match outcome {
+                Ok(outcome) => {
+                    let name_index = cache
+                        .name_index(ex.ordinal)
+                        .ok_or(StartupDnsError::Cache(CacheError::NameOutOfRange))?;
+                    let generation = cache.entry(name_index, ex.family)?.generation();
+                    let receipt = self.now_u64();
+                    dns::apply_outcome(
+                        cache,
+                        schedules,
+                        ex.ordinal,
+                        generation,
+                        receipt,
+                        self.now_u64(),
+                        outcome,
+                    )?;
+                    return Ok(RecvStep::Published);
+                }
+                Err(_) => {
+                    self.close_connection()?;
+                    self.note_failure(ex.ordinal, ex.family, schedules)?;
+                    return Ok(RecvStep::Failed);
+                }
+            }
+        }
+        if Instant::now() >= ex.deadline {
+            self.close_connection()?;
+            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            return Ok(RecvStep::Failed);
+        }
+        Ok(RecvStep::Waiting)
     }
 
     /// Single-pass test-support resolution: visits each admitted name and
@@ -536,8 +744,7 @@ impl StartupDns {
                         resolved[ordinal] |= has;
                     }
                     Ok(ExchangeResult::Failed) => report.failed += 1,
-                    Err(ExchangeError::Network) => report.failed += 1,
-                    Err(ExchangeError::Fatal(err)) => return Err(err),
+                    Err(err) => return Err(err),
                 }
             }
         }
@@ -624,8 +831,7 @@ impl StartupDns {
                             resolved[ordinal] |= has;
                         }
                         Ok(ExchangeResult::Failed) => report.failed += 1,
-                        Err(ExchangeError::Network) => report.failed += 1,
-                        Err(ExchangeError::Fatal(err)) => return Err(err),
+                        Err(err) => return Err(err),
                     }
                 }
                 Ok(None) => {
@@ -650,6 +856,130 @@ impl StartupDns {
         Ok((report, self.start.elapsed().as_secs()))
     }
 
+    /// Starts a cooperative DNS exchange without waiting for network
+    /// readiness: it opens-or-reuses the transport connection, draws a fresh
+    /// transaction id, builds the fixed query, and records the exchange
+    /// (name/family/absolute deadline) so subsequent
+    /// [`Self::advance_exchange`] turns can conclude it. Counted per-exchange
+    /// network failures never surface here; they terminate a later turn as
+    /// [`TurnResult::Failed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a fatal storage, entropy, lifecycle, poll, deadline, or
+    /// token-exhaustion error when the exchange cannot begin; a query build or
+    /// registry failure aborts rather than continuing with corrupt state.
+    /// Returns [`StartupDnsError::ExchangeActive`] when an exchange is already
+    /// in progress, leaving the outstanding exchange, its schedule accounting,
+    /// and its connection untouched.
+    pub(crate) fn start_exchange(
+        &mut self,
+        fqdn: &Fqdn,
+        family: Family,
+        ordinal: usize,
+        deadline: Instant,
+    ) -> Result<(), StartupDnsError> {
+        if self.active.is_some() {
+            return Err(StartupDnsError::ExchangeActive);
+        }
+        let connect_err = if self.stream.is_none() {
+            self.begin_connect(self.addr)?
+        } else {
+            None
+        };
+        let tid = self.fresh_tid()?;
+        let qlen = dns::build_query(fqdn, family, tid, &mut self.query_buf[2..])?;
+        let total = qlen + 2;
+        self.query_buf[0] = (qlen as u16 >> 8) as u8;
+        self.query_buf[1] = qlen as u8;
+        self.written = 0;
+        self.filled = 0;
+        self.msglen = None;
+        self.active = Some(ActiveExchange {
+            ordinal,
+            family,
+            deadline,
+            step: ExchangeStep::Connecting,
+            qlen: total,
+            connect_err,
+            tid,
+        });
+        Ok(())
+    }
+
+    /// Advances the in-progress cooperative exchange by one turn. A turn never
+    /// waits: it performs at most one nonblocking I/O attempt and at most one
+    /// stage transition, re-checks the absolute exchange deadline, and
+    /// otherwise returns [`TurnResult::Pending`] so the single owner keeps
+    /// control of all waiting (alumina.md:146).
+    ///
+    /// # Errors
+    ///
+    /// Returns a fatal storage, entropy, lifecycle, poll, deadline, or
+    /// token-exhaustion error. Counted per-exchange network failures return
+    /// [`TurnResult::Failed`] with the backoff already advanced; an exchange
+    /// that is not in progress is a fatal caller error.
+    pub(crate) fn advance_exchange(
+        &mut self,
+        fqdn: &Fqdn,
+        cache: &mut Cache,
+        schedules: &mut Schedules,
+    ) -> Result<TurnResult, StartupDnsError> {
+        let Some(mut ex) = self.active.take() else {
+            return Err(StartupDnsError::ExchangeInactive);
+        };
+        let next_step = match ex.step {
+            ExchangeStep::Connecting => match self.step_connect(&mut ex, schedules)? {
+                ConnectStep::Waiting => None,
+                ConnectStep::Transition => Some(ExchangeStep::SendReady),
+                ConnectStep::Failed => {
+                    self.active = None;
+                    return Ok(TurnResult::Failed);
+                }
+            },
+            ExchangeStep::SendReady => match self.step_send(&mut ex, schedules)? {
+                SendStep::Waiting => None,
+                SendStep::Blocked => Some(ExchangeStep::AwaitWritable),
+                SendStep::Transition => Some(ExchangeStep::Receiving),
+                SendStep::Failed => {
+                    self.active = None;
+                    return Ok(TurnResult::Failed);
+                }
+            },
+            ExchangeStep::AwaitWritable => match self.step_send(&mut ex, schedules)? {
+                SendStep::Waiting => Some(ExchangeStep::SendReady),
+                SendStep::Blocked => None,
+                SendStep::Transition => Some(ExchangeStep::Receiving),
+                SendStep::Failed => {
+                    self.active = None;
+                    return Ok(TurnResult::Failed);
+                }
+            },
+            ExchangeStep::Receiving => match self.step_recv(&mut ex, fqdn, cache, schedules)? {
+                RecvStep::Waiting => None,
+                RecvStep::Failed => {
+                    self.active = None;
+                    return Ok(TurnResult::Failed);
+                }
+                RecvStep::Published => {
+                    self.active = None;
+                    return Ok(TurnResult::Published);
+                }
+            },
+        };
+        if let Some(step) = next_step {
+            ex.step = step;
+        }
+        self.active = Some(ex);
+        Ok(TurnResult::Pending)
+    }
+
+    /// The startup-only blocking driver (nonserving): it starts the exchange
+    /// and then owns every wait itself via [`Self::wait_dns_readiness`],
+    /// polling the DNS registry once per turn until the exchange concludes
+    /// within its single clipped deadline. Any other owner replaces this
+    /// driver body with a fold of the DNS readiness and
+    /// [`Self::exchange_deadline`] into its own combined wait.
     fn exchange(
         &mut self,
         fqdn: &Fqdn,
@@ -658,66 +988,16 @@ impl StartupDns {
         cache: &mut Cache,
         schedules: &mut Schedules,
         deadline: Instant,
-    ) -> Result<ExchangeResult, ExchangeError> {
-        if self.stream.is_none()
-            && let Err(err) = self.open(self.addr, deadline)
-        {
-            return Err(self.settle_or_fatal(ordinal, family, schedules, err));
-        }
-        self.fresh_tid()?;
-        let qlen = dns::build_query(fqdn, family, self.tid, &mut self.query_buf[2..])?;
-        let total = qlen + 2;
-        self.query_buf[0] = (qlen as u16 >> 8) as u8;
-        self.query_buf[1] = qlen as u8;
-        self.written = 0;
-        self.filled = 0;
-        self.msglen = None;
-        if let Err(err) = self.send_query(total, deadline) {
-            return Err(self.settle_or_fatal(ordinal, family, schedules, err));
-        }
-        let received = match self.recv_message(fqdn, family, deadline) {
-            Ok(received) => received,
-            Err(err) => return Err(self.settle_or_fatal(ordinal, family, schedules, err)),
-        };
-        let Some(outcome) = received else {
-            self.note_failure(ordinal, family, schedules)?;
-            return Ok(ExchangeResult::Failed);
-        };
-        let name_index =
-            cache
-                .name_index(ordinal)
-                .ok_or(ExchangeError::Fatal(StartupDnsError::Cache(
-                    CacheError::NameOutOfRange,
-                )))?;
-        let generation = cache.entry(name_index, family)?.generation();
-        let receipt = self.now_u64();
-        dns::apply_outcome(
-            cache,
-            schedules,
-            ordinal,
-            generation,
-            receipt,
-            self.now_u64(),
-            outcome,
-        )?;
-        Ok(ExchangeResult::Published)
-    }
-
-    fn settle_or_fatal(
-        &mut self,
-        ordinal: usize,
-        family: Family,
-        schedules: &mut Schedules,
-        err: StartupDnsError,
-    ) -> ExchangeError {
-        match err {
-            StartupDnsError::Exchange { .. } => {
-                match self.note_failure(ordinal, family, schedules) {
-                    Ok(()) => ExchangeError::Network,
-                    Err(fatal) => ExchangeError::Fatal(fatal),
+    ) -> Result<ExchangeResult, StartupDnsError> {
+        self.start_exchange(fqdn, family, ordinal, deadline)?;
+        loop {
+            match self.advance_exchange(fqdn, cache, schedules)? {
+                TurnResult::Pending => {
+                    self.wait_dns_readiness(deadline)?;
                 }
+                TurnResult::Published => return Ok(ExchangeResult::Published),
+                TurnResult::Failed => return Ok(ExchangeResult::Failed),
             }
-            fatal => ExchangeError::Fatal(fatal),
         }
     }
 
@@ -1436,6 +1716,182 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cooperative_silent_peer_yields_pending_before_deadline() {
+        let cfg = config();
+        let responder =
+            spawn_responder(vec![vec![Step::Stall(Duration::from_secs(1)), Step::Close]]);
+        let mut cache = Cache::new(2).unwrap();
+        let mut schedules = Schedules::new(2).unwrap();
+        let mut transport = StartupDns::new().unwrap();
+        transport.addr = ns(responder.port());
+        transport.now0 = 1_000_000;
+        let fqdn = cfg.allowlist().get(0).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(400);
+        transport
+            .start_exchange(fqdn, Family::A, 0, deadline)
+            .unwrap();
+        let first = transport
+            .advance_exchange(fqdn, &mut cache, &mut schedules)
+            .unwrap();
+        assert!(
+            matches!(first, TurnResult::Pending),
+            "a turn with an unready peer must yield Pending without concluding, got {first:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the exchange must not conclude before its absolute deadline"
+        );
+        let mut failures = 0;
+        loop {
+            match transport
+                .advance_exchange(fqdn, &mut cache, &mut schedules)
+                .unwrap()
+            {
+                TurnResult::Pending => {
+                    let _ = transport.wait_dns_readiness(deadline).unwrap();
+                }
+                TurnResult::Failed => {
+                    failures += 1;
+                    break;
+                }
+                other => panic!("a silent peer must conclude as a counted failure, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            failures, 1,
+            "the exchange must settle its counted failure exactly once"
+        );
+        assert!(
+            schedules.due_time(0, Family::A).unwrap().is_some(),
+            "a silent-peer failure must still advance the schedule backoff"
+        );
+        assert!(
+            cache
+                .entry(cache.name_index(0).unwrap(), Family::A)
+                .unwrap()
+                .bindings()
+                .is_empty(),
+            "a silent-peer exchange must not publish"
+        );
+        assert!(
+            transport.stream.is_none(),
+            "a failed exchange must close the connection for the next attempt"
+        );
+        drop(responder);
+    }
+
+    #[test]
+    fn cooperative_advance_returns_control_to_worker_between_turns() {
+        let cfg = config();
+        let responder =
+            spawn_responder(vec![vec![Step::Stall(Duration::from_secs(1)), Step::Close]]);
+        let mut cache = Cache::new(2).unwrap();
+        let mut schedules = Schedules::new(2).unwrap();
+        let mut transport = StartupDns::new().unwrap();
+        transport.addr = ns(responder.port());
+        transport.now0 = 1_000_000;
+        let fqdn = cfg.allowlist().get(0).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(400);
+        transport
+            .start_exchange(fqdn, Family::A, 0, deadline)
+            .unwrap();
+        let mut worker_turns = 0u32;
+        let mut terminal = None;
+        for _ in 0..64 {
+            match transport
+                .advance_exchange(fqdn, &mut cache, &mut schedules)
+                .unwrap()
+            {
+                TurnResult::Pending => {
+                    worker_turns += 1;
+                    if transport
+                        .exchange_deadline()
+                        .is_some_and(|d| Instant::now() >= d)
+                    {
+                        continue;
+                    }
+                    let _ = transport.wait_dns_readiness(deadline).unwrap();
+                }
+                other => {
+                    terminal = Some(other);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            terminal,
+            Some(TurnResult::Failed),
+            "a silent peer must conclude as a counted failure"
+        );
+        assert!(
+            worker_turns >= 2,
+            "the worker must observe at least two bounded nonblocking turns before conclusion: {worker_turns}"
+        );
+        drop(responder);
+    }
+
+    #[test]
+    fn cooperative_exchange_publishes_on_valid_response() {
+        let cfg = config();
+        let responder = spawn_responder(vec![vec![
+            Step::PositiveA {
+                ttl: 120,
+                octets: [93, 184, 216, 34],
+            },
+            Step::Close,
+        ]]);
+        let mut cache = Cache::new(2).unwrap();
+        let mut schedules = Schedules::new(2).unwrap();
+        let mut transport = StartupDns::new().unwrap();
+        transport.addr = ns(responder.port());
+        transport.now0 = 1_000_000;
+        let fqdn = cfg.allowlist().get(0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(EXCHANGE_DEADLINE_SECS);
+        transport
+            .start_exchange(fqdn, Family::A, 0, deadline)
+            .unwrap();
+        let mut result = None;
+        for _ in 0..256 {
+            match transport
+                .advance_exchange(fqdn, &mut cache, &mut schedules)
+                .unwrap()
+            {
+                TurnResult::Pending => {
+                    if transport
+                        .exchange_deadline()
+                        .is_some_and(|d| Instant::now() >= d)
+                    {
+                        continue;
+                    }
+                    let _ = transport.wait_dns_readiness(deadline).unwrap();
+                }
+                term => {
+                    result = Some(term);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            result,
+            Some(TurnResult::Published),
+            "a valid response must publish at the primitive level"
+        );
+        assert_eq!(
+            bindings_of(&cache, 0, Family::A),
+            vec![crate::eligibility::NumericAddr::V4(
+                std::net::Ipv4Addr::new(93, 184, 216, 34)
+            )]
+        );
+        let due = schedules.due_time(0, Family::A).unwrap().expect("due");
+        let interval = due - 1_000_000;
+        assert!(
+            (120..=125).contains(&interval),
+            "refresh from receipt + min(300, max(30,120)): {interval}"
+        );
+        drop(responder);
+    }
+
     #[cfg(feature = "alloc-witness")]
     #[test]
     fn startup_dns_phase_is_allocation_free_including_reconnect() {
@@ -1531,5 +1987,226 @@ mod tests {
             "an unresolved name with no scheduled step must sleep toward the \
              window deadline, not break early: {wait:?}"
         );
+    }
+
+    #[test]
+    fn start_active_exchange_is_refused_and_first_survives() {
+        let cfg = config();
+        let fqdn0 = cfg.allowlist().get(0).unwrap();
+        let fqdn1 = cfg.allowlist().get(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(EXCHANGE_DEADLINE_SECS);
+        {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+            let dead_port = probe.local_addr().expect("probe addr").port();
+            drop(probe);
+            let mut transport = StartupDns::new().unwrap();
+            transport.addr = ns(dead_port);
+            transport.now0 = 1_000_000;
+            transport
+                .start_exchange(fqdn0, Family::A, 0, deadline)
+                .unwrap();
+            let err = transport
+                .start_exchange(fqdn1, Family::A, 1, deadline)
+                .expect_err(
+                    "a second start on an active exchange must be refused, never silently \
+                     replace the outstanding exchange",
+                );
+            assert_eq!(
+                err,
+                StartupDnsError::ExchangeActive,
+                "the refusal must be the typed ExchangeActive error"
+            );
+        }
+        {
+            let responder = spawn_responder(vec![vec![
+                Step::PositiveA {
+                    ttl: 120,
+                    octets: [93, 184, 216, 34],
+                },
+                Step::Close,
+            ]]);
+            let mut cache = Cache::new(2).unwrap();
+            let mut schedules = Schedules::new(2).unwrap();
+            let mut transport = StartupDns::new().unwrap();
+            transport.addr = ns(responder.port());
+            transport.now0 = 1_000_000;
+            transport
+                .start_exchange(fqdn0, Family::A, 0, deadline)
+                .unwrap();
+            let err = transport
+                .start_exchange(fqdn1, Family::A, 1, deadline)
+                .expect_err("a refused second start must not be absorbed or deferred; it is typed");
+            assert_eq!(err, StartupDnsError::ExchangeActive);
+            let mut result = None;
+            for _ in 0..200 {
+                match transport
+                    .advance_exchange(fqdn0, &mut cache, &mut schedules)
+                    .unwrap()
+                {
+                    TurnResult::Pending => {
+                        if transport
+                            .exchange_deadline()
+                            .is_some_and(|d| Instant::now() >= d)
+                        {
+                            continue;
+                        }
+                        let _ = transport.wait_dns_readiness(deadline).unwrap();
+                    }
+                    term => {
+                        result = Some(term);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                result,
+                Some(TurnResult::Published),
+                "the first exchange must still conclude despite the refused second start"
+            );
+            assert_eq!(
+                bindings_of(&cache, 0, Family::A),
+                vec![crate::eligibility::NumericAddr::V4(
+                    std::net::Ipv4Addr::new(93, 184, 216, 34)
+                )]
+            );
+            assert!(
+                bindings_of(&cache, 1, Family::A).is_empty(),
+                "the refused second start must publish nothing and not advance its schedule"
+            );
+            drop(responder);
+        }
+    }
+
+    #[test]
+    fn cooperative_turn_performs_zero_blocking_polls() {
+        let cfg = config();
+        let responder =
+            spawn_responder(vec![vec![Step::Stall(Duration::from_secs(1)), Step::Close]]);
+        let mut cache = Cache::new(2).unwrap();
+        let mut schedules = Schedules::new(2).unwrap();
+        let mut transport = StartupDns::new().unwrap();
+        transport.addr = ns(responder.port());
+        transport.now0 = 1_000_000;
+        let fqdn = cfg.allowlist().get(0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        transport
+            .start_exchange(fqdn, Family::A, 0, deadline)
+            .unwrap();
+        for _ in 0..32 {
+            let before = transport.poll_ticks;
+            let res = transport
+                .advance_exchange(fqdn, &mut cache, &mut schedules)
+                .unwrap();
+            assert_eq!(
+                transport.poll_ticks, before,
+                "advance_exchange must perform zero blocking polls per turn \
+                 (readiness waiting is the single owner's job), got turn {res:?}"
+            );
+        }
+        let before = transport.poll_ticks;
+        let _ready = transport
+            .wait_dns_readiness(Instant::now() + Duration::from_millis(10))
+            .unwrap();
+        assert!(
+            transport.poll_ticks > before,
+            "only the owner-owned wait_dns_readiness is the sanctioned poll site"
+        );
+        drop(responder);
+    }
+
+    #[test]
+    fn cooperative_send_wouldblock_makes_owner_wait_instead_of_busy_looping() {
+        let cfg = config();
+        let responder = spawn_responder(vec![vec![
+            Step::PositiveA {
+                ttl: 120,
+                octets: [93, 184, 216, 34],
+            },
+            Step::Close,
+        ]]);
+        let mut cache = Cache::new(2).unwrap();
+        let mut schedules = Schedules::new(2).unwrap();
+        let mut transport = StartupDns::new().unwrap();
+        transport.addr = ns(responder.port());
+        transport.now0 = 1_000_000;
+        let fqdn = cfg.allowlist().get(0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        transport
+            .start_exchange(fqdn, Family::A, 0, deadline)
+            .unwrap();
+        transport.arm_write(WriteForce::Partial(1));
+        let mut guard = 0;
+        loop {
+            match transport.active_step() {
+                Some(ExchangeStep::Connecting) => {
+                    assert!(matches!(
+                        transport
+                            .advance_exchange(fqdn, &mut cache, &mut schedules)
+                            .unwrap(),
+                        TurnResult::Pending
+                    ));
+                    let _ = transport.wait_dns_readiness(deadline).unwrap();
+                }
+                Some(ExchangeStep::SendReady) => break,
+                other => panic!("unexpected stage reaching the send path: {other:?}"),
+            }
+            guard += 1;
+            assert!(guard < 16, "exchange did not reach the sending stage");
+        }
+        assert!(matches!(
+            transport
+                .advance_exchange(fqdn, &mut cache, &mut schedules)
+                .unwrap(),
+            TurnResult::Pending
+        ));
+        let before = transport.poll_ticks;
+        let _ = transport.wait_dns_readiness(deadline).unwrap();
+        assert_eq!(
+            transport.poll_ticks, before,
+            "after send progress the owner must not wait; the first send has \
+             no wait and the next turn keeps pushing"
+        );
+        transport.arm_write(WriteForce::WouldBlock);
+        assert!(matches!(
+            transport
+                .advance_exchange(fqdn, &mut cache, &mut schedules)
+                .unwrap(),
+            TurnResult::Pending
+        ));
+        let before = transport.poll_ticks;
+        let _ = transport.wait_dns_readiness(deadline).unwrap();
+        assert!(
+            transport.poll_ticks > before,
+            "after an actual sending WouldBlock the owner wait must perform a \
+             real poll (awaiting-writable), not an instant-returning busy loop"
+        );
+        let mut result = None;
+        for _ in 0..200 {
+            match transport
+                .advance_exchange(fqdn, &mut cache, &mut schedules)
+                .unwrap()
+            {
+                TurnResult::Pending => {
+                    if transport
+                        .exchange_deadline()
+                        .is_some_and(|d| Instant::now() >= d)
+                    {
+                        continue;
+                    }
+                    let _ = transport.wait_dns_readiness(deadline).unwrap();
+                }
+                term => {
+                    result = Some(term);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            result,
+            Some(TurnResult::Published),
+            "a valid response must publish after an awaited would-block send"
+        );
+        assert!(!bindings_of(&cache, 0, Family::A).is_empty());
+        drop(responder);
     }
 }
