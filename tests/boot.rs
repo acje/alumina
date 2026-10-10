@@ -619,7 +619,19 @@ fn inventory_actually_initializes_full_traffic_storage() {
         inventory::TRAFFIC_STORAGE_BYTES,
         "full 128 MiB must be actually initialized"
     );
-    assert_eq!(storage.as_slice().len(), inventory::TRAFFIC_STORAGE_BYTES);
+    assert_eq!(
+        storage.slots().len(),
+        inventory::TUNNEL_SLOTS,
+        "the retained store holds one per-slot entry per tunnel"
+    );
+    let mut total = 0;
+    for slot in storage.slots() {
+        assert_eq!(slot.up.len(), inventory::BUFFER_BYTES);
+        assert_eq!(slot.down.len(), inventory::BUFFER_BYTES);
+        total += slot.up.len() + slot.down.len();
+    }
+    assert_eq!(total, inventory::TRAFFIC_STORAGE_BYTES);
+    assert!(!storage.is_empty());
     let inv = BootInventory::phase1();
     assert_eq!(
         inv.retained_initialized_bytes(),

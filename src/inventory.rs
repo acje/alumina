@@ -19,38 +19,87 @@ impl fmt::Display for StorageUnavailable {
     }
 }
 
+/// The two retained directional buffers for one tunnel slot, allocated once at
+/// boot and transferred by value into the serving slot they back.
+#[derive(Debug)]
+pub struct SlotTraffic {
+    pub up: Box<[u8]>,
+    pub down: Box<[u8]>,
+}
+
+impl SlotTraffic {
+    /// Splits the retained pair into its two buffer halves for transfer.
+    pub fn into_parts(self) -> (Box<[u8]>, Box<[u8]>) {
+        (self.up, self.down)
+    }
+}
+
+/// The boot-owned traffic store: one retained directional-buffer pair per
+/// tunnel slot, fully initialized before the first DNS exchange. Allocation is
+/// fallible and any failure surfaces as the typed OOM [`StorageUnavailable`];
+/// the store is transferred in whole to the serving owner, so no duplicate
+/// traffic blob exists and serving performs no buffer allocation.
 #[derive(Debug)]
 pub struct TrafficStorage {
-    bytes: Box<[u8]>,
+    slots: Box<[SlotTraffic]>,
 }
 
 impl TrafficStorage {
+    /// Allocates and zero-initializes the full 128 MiB traffic store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageUnavailable`] when any retained buffer cannot be
+    /// reserved; the partial store is dropped and boot fails with the typed
+    /// OOM variant.
     pub fn allocate() -> Result<TrafficStorage, StorageUnavailable> {
         #[cfg(test)]
         if alloc_fault::armed() {
             return Err(StorageUnavailable);
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(TRAFFIC_STORAGE_BYTES)
+        let mut slots: Vec<SlotTraffic> = Vec::new();
+        slots
+            .try_reserve_exact(TUNNEL_SLOTS)
             .map_err(|_| StorageUnavailable)?;
-        bytes.resize(TRAFFIC_STORAGE_BYTES, 0);
+        for _ in 0..TUNNEL_SLOTS {
+            slots.push(SlotTraffic {
+                up: buffer_bytes()?,
+                down: buffer_bytes()?,
+            });
+        }
         Ok(TrafficStorage {
-            bytes: bytes.into_boxed_slice(),
+            slots: slots.into_boxed_slice(),
         })
     }
 
+    /// The exact initialized traffic bytes: 128 slots x 2 directions x 512 KiB.
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.slots.len() * BUFFERS_PER_SLOT * BUFFER_BYTES
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.slots.is_empty()
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes
+    /// Read view of the retained per-slot pairs, for accounting and tests.
+    pub fn slots(&self) -> &[SlotTraffic] {
+        &self.slots
     }
+
+    /// Consumes the store, yielding the per-slot pairs for transfer into the
+    /// serving owner without a second allocation.
+    pub fn into_slots(self) -> Box<[SlotTraffic]> {
+        self.slots
+    }
+}
+
+fn buffer_bytes() -> Result<Box<[u8]>, StorageUnavailable> {
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes
+        .try_reserve_exact(BUFFER_BYTES)
+        .map_err(|_| StorageUnavailable)?;
+    bytes.resize(BUFFER_BYTES, 0);
+    Ok(bytes.into_boxed_slice())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

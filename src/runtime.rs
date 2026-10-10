@@ -31,17 +31,21 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Builds the owner over boot-completed storage and an already-bound
-    /// listener, attaching the retained DNS transport to the single serving
-    /// poll.
+    /// Builds the owner over boot-completed storage, the boot-owned traffic
+    /// store, and an already-bound listener, attaching the retained DNS
+    /// transport to the single serving poll.
     ///
     /// # Errors
     ///
     /// Returns a serve error when the serving poll or the shared DNS
     /// registration fails.
-    pub fn new(storage: ServeStorage, listener: TcpListener) -> Result<Runtime, ServeError> {
+    pub fn new(
+        storage: ServeStorage,
+        listener: TcpListener,
+        traffic: crate::inventory::TrafficStorage,
+    ) -> Result<Runtime, ServeError> {
         let dns_token = Serving::dns_token();
-        let mut serving = Serving::new(storage, listener)?;
+        let mut serving = Serving::new(storage, listener, traffic)?;
         serving.attach_dns_shared()?;
         Ok(Runtime { serving, dns_token })
     }
@@ -170,7 +174,8 @@ mod tests {
         let storage = ServeStorage::boot(&config(port)).expect("boot storage");
         let listener =
             TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).expect("bind listener");
-        let mut runtime = Runtime::new(storage, listener).expect("runtime");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut runtime = Runtime::new(storage, listener, traffic).expect("runtime");
         let (responder_addr, responder) = spawn_stall_responder();
 
         let exchange_deadline = Instant::now() + Duration::from_secs(10);
@@ -341,7 +346,8 @@ mod tests {
         let storage = ServeStorage::boot(&config(port)).expect("boot storage");
         let listener =
             TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).expect("bind listener");
-        let mut runtime = Runtime::new(storage, listener).expect("runtime");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut runtime = Runtime::new(storage, listener, traffic).expect("runtime");
         let (responder_addr, responder) = spawn_responder_keep_alive();
 
         let exchange_deadline = Instant::now() + Duration::from_secs(10);
@@ -405,7 +411,8 @@ mod tests {
         let storage = ServeStorage::boot(&config(port)).expect("boot storage");
         let listener =
             TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).expect("bind listener");
-        let mut runtime = Runtime::new(storage, listener).expect("runtime");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut runtime = Runtime::new(storage, listener, traffic).expect("runtime");
         let (responder_addr, responder) = spawn_responder_close_after_answer();
 
         runtime

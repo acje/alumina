@@ -56,11 +56,11 @@ const LISTENER: Token = Token(0);
 /// reused across connections. The mandated directional profile is two 512 KiB
 /// buffers per tunnel (alumina.md:161-164,:183; RF-008): 128 slots x 1 MiB =
 /// 128 MiB traffic storage, not total RSS.
-const HOLD_CAP: usize = 512 * 1024;
+const HOLD_CAP: usize = crate::inventory::BUFFER_BYTES;
 
 /// Boot-fixed per-slot upstream->client pending store (relay bytes and
 /// canonical response/refusal bodies), bounded at the 512 KiB direction cap.
-const DOWN_CAP: usize = 512 * 1024;
+const DOWN_CAP: usize = crate::inventory::BUFFER_BYTES;
 
 /// Idle deadline for an established tunnel once the gate has opened, reset on
 /// every successful tunnel-byte write (alumina.md:190,:147). Readiness alone
@@ -202,17 +202,10 @@ impl Readiness {
     }
 }
 
-/// The per-slot serving workspace, allocated once at boot and reused across
-/// connections. The byte stores, parser, inspector, and gate all live here;
-/// nothing per event is allocated, and every direction's pending bytes are
-/// conserved with explicit cursors.
-fn fixed_buffer<const CAP: usize>() -> Box<[u8; CAP]> {
-    vec![0u8; CAP]
-        .into_boxed_slice()
-        .try_into()
-        .expect("fixed buffer has exactly CAP bytes")
-}
-
+/// The per-slot serving workspace: the byte stores come from the boot-owned
+/// traffic store (transferred in by value), and the parser, inspector, gate,
+/// and cursors live here. Nothing per event is allocated, and every direction's
+/// pending bytes are conserved with explicit cursors.
 struct SlotWorkspace {
     handle: Option<SlotIndex>,
     tunnel: Option<TunnelIndex>,
@@ -224,7 +217,7 @@ struct SlotWorkspace {
     gate: TunnelGate,
     approved: Option<FixedHostname>,
     stage: Stage,
-    buf: Box<[u8; HOLD_CAP]>,
+    buf: Box<[u8]>,
     buf_base: usize,
     buf_len: usize,
     fwd: usize,
@@ -233,7 +226,7 @@ struct SlotWorkspace {
     head_len: usize,
     hello_end: Option<usize>,
     hello_consumed: usize,
-    down: Box<[u8; DOWN_CAP]>,
+    down: Box<[u8]>,
     down_len: usize,
     down_off: usize,
     directional: DirectionalEof,
@@ -244,7 +237,7 @@ struct SlotWorkspace {
 }
 
 impl SlotWorkspace {
-    fn new() -> SlotWorkspace {
+    fn with_traffic(up: Box<[u8]>, down: Box<[u8]>) -> SlotWorkspace {
         SlotWorkspace {
             handle: None,
             tunnel: None,
@@ -256,7 +249,7 @@ impl SlotWorkspace {
             gate: TunnelGate::new(),
             approved: None,
             stage: Stage::Idle,
-            buf: fixed_buffer::<HOLD_CAP>(),
+            buf: up,
             buf_base: 0,
             buf_len: 0,
             fwd: 0,
@@ -265,7 +258,7 @@ impl SlotWorkspace {
             head_len: 0,
             hello_end: None,
             hello_consumed: 0,
-            down: fixed_buffer::<DOWN_CAP>(),
+            down,
             down_len: 0,
             down_off: 0,
             directional: DirectionalEof::relay(),
@@ -355,18 +348,31 @@ pub struct Serving {
 }
 
 impl Serving {
-    /// Builds the loop over an already-bound listener and boot-completed
-    /// storage, registering the listener and allocating the fixed workspace.
+    /// Builds the loop over an already-bound listener, boot-completed storage,
+    /// and the boot-owned traffic store, registering the listener and moving
+    /// the retained per-slot buffer pairs into the fixed slot workspaces
+    /// without a second traffic allocation.
     ///
     /// # Errors
     ///
     /// Returns a serve error when the poll registry or listener registration
     /// fails.
-    pub fn new(storage: ServeStorage, mut listener: TcpListener) -> Result<Serving, ServeError> {
+    pub fn new(
+        storage: ServeStorage,
+        mut listener: TcpListener,
+        traffic: crate::inventory::TrafficStorage,
+    ) -> Result<Serving, ServeError> {
         let poll = Poll::new()?;
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
-        let slots = (0..MAX_TUNNELS).map(|_| SlotWorkspace::new()).collect();
+        let slots = traffic
+            .into_slots()
+            .into_iter()
+            .map(|slot| {
+                let (up, down) = slot.into_parts();
+                SlotWorkspace::with_traffic(up, down)
+            })
+            .collect();
         Ok(Serving {
             poll,
             storage,
@@ -1477,7 +1483,41 @@ mod tests {
         let storage = ServeStorage::boot(&config(port)).expect("boot storage");
         let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), port))
             .expect("bind listener");
-        Serving::new(storage, listener).expect("serving")
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        Serving::new(storage, listener, traffic).expect("serving")
+    }
+
+    #[test]
+    fn serving_consumes_boot_traffic_buffers_by_value_not_reallocation() {
+        std::thread::Builder::new()
+            .name("serving-transfer-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(transfer_body)
+            .expect("spawn transfer test")
+            .join()
+            .expect("transfer test thread");
+    }
+
+    fn transfer_body() {
+        use crate::inventory::TrafficStorage;
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), port))
+            .expect("bind listener");
+        let traffic = TrafficStorage::allocate().expect("boot traffic");
+        let first_up = traffic.slots()[0].up.as_ptr();
+        let last_down = traffic.slots()[MAX_TUNNELS - 1].down.as_ptr();
+        let serving = Serving::new(storage, listener, traffic).expect("serving");
+        assert_eq!(
+            serving.slots[0].buf.as_ptr(),
+            first_up,
+            "slot 0 hold buffer must transfer by value without a second allocation"
+        );
+        assert_eq!(
+            serving.slots[MAX_TUNNELS - 1].down.as_ptr(),
+            last_down,
+            "slot 127 down buffer must transfer by value without a second allocation"
+        );
     }
 
     fn pump(serving: &mut Serving, times: usize) {
