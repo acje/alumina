@@ -15,7 +15,7 @@ use mio::net::TcpListener;
 
 use crate::serve::{ServeStorage, StartupError, StartupOutcome};
 use crate::serving::{ServeError, Serving};
-use crate::startup_dns::TurnResult;
+use crate::startup_dns::{StartupDnsError, TurnResult};
 
 /// The bounded number of cooperative DNS advances a single owner turn may make,
 /// so a chatty or stalled peer can never starve traffic within a turn.
@@ -59,6 +59,25 @@ impl Preallocated {
         Ok(Preallocated { serving, dns_token })
     }
 
+    /// Arms the production stdout sink (fd 1 nonblocking) on the owner's
+    /// retained storage. The binary calls this once after boot, before any
+    /// serving stdout write; the library and tests never flip the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink preparation error when fd 1 cannot be made nonblocking.
+    pub fn prepare_stdout_log_sink(&mut self) -> Result<(), StartupDnsError> {
+        self.serving.storage_mut().prepare_stdout_log_sink()
+    }
+
+    /// Emits one stdout-only fatal record and performs one bounded drain on
+    /// the owner's boot-owned log store, for the post-sink-switch fatal paths
+    /// in main that must not write to stderr (alumina.md:149, B1). The
+    /// message is formatted directly into the fixed slot (no heap String).
+    pub fn emit_fatal_and_drain(&mut self, args: std::fmt::Arguments<'_>) {
+        self.serving.storage_mut().emit_fatal_and_drain(args);
+    }
+
     /// Runs the canonical startup DNS window and readiness decision over the
     /// retained storage, exactly as main wires it. The listener opens inside,
     /// at the moment a serving decision is taken.
@@ -99,8 +118,18 @@ impl Preallocated {
     /// Returns a serve error when the listener registration or the shared DNS
     /// registration fails.
     pub fn attach(mut self, listener: TcpListener) -> Result<Runtime, ServeError> {
-        self.serving.attach_listener(listener)?;
-        self.serving.attach_dns_shared()?;
+        if let Err(err) = self.serving.attach_listener(listener) {
+            self.serving
+                .storage_mut()
+                .emit_fatal_and_drain(format_args!("attach listener failed: {err}"));
+            return Err(err);
+        }
+        if let Err(err) = self.serving.attach_dns_shared() {
+            self.serving
+                .storage_mut()
+                .emit_fatal_and_drain(format_args!("attach dns failed: {err}"));
+            return Err(err);
+        }
         Ok(Runtime {
             serving: self.serving,
             dns_token: self.dns_token,
@@ -172,7 +201,9 @@ impl Runtime {
         if event_seen || sendable || deadline_due {
             self.cooperative_dns_turn()?;
         }
-        self.serving.sync_dns_shared()
+        self.serving.sync_dns_shared()?;
+        self.serving.storage_mut().logs_mut().drain_sink();
+        Ok(())
     }
 
     /// Enter the serving loop for the process lifetime: the attached listener
@@ -187,7 +218,12 @@ impl Runtime {
     /// so a caller cannot mistake a returned `Ok` for a clean serving exit.
     pub fn serve(mut self) -> Result<std::convert::Infallible, ServeError> {
         loop {
-            self.turn(None)?;
+            if let Err(err) = self.turn(None) {
+                self.serving
+                    .storage_mut()
+                    .emit_fatal_and_drain(format_args!("serving failed: {err}"));
+                return Err(err);
+            }
         }
     }
 

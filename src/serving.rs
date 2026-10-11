@@ -43,6 +43,7 @@ use crate::config::FixedHostname;
 use crate::connect::{ConnectParser, Feed};
 use crate::eligibility::NumericAddr;
 use crate::gate::{Activity, TunnelGate, UpstreamWrite, ValidatedHello};
+use crate::log::{ActivityKind, RejectReason};
 use crate::serve::ServeStorage;
 use crate::startup_dns::StartupDnsError;
 use crate::worker::{AttemptCounts, ConnectPhase, MAX_TUNNELS, SlotIndex, TunnelIndex};
@@ -107,6 +108,38 @@ const BODY_403: &[u8] = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n";
 const BODY_502: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n";
 const BODY_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
 const BODY_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\ncontent-length: 0\r\n\r\n";
+
+/// A typed refusal to serve a connection: the single source of truth mapping
+/// forward to both the fixed HTTP body and the fixed `RejectReason` log
+/// vocabulary. The refuse path never reverse-infers a reason from a byte
+/// match, so a new refusal class cannot silently default to BadRequest.
+#[derive(Clone, Copy)]
+enum Refusal {
+    BadRequest,
+    Forbidden,
+    DialFailed,
+    SetupTimeout,
+}
+
+impl Refusal {
+    fn body(self) -> &'static [u8] {
+        match self {
+            Refusal::BadRequest => BODY_400,
+            Refusal::Forbidden => BODY_403,
+            Refusal::DialFailed => BODY_502,
+            Refusal::SetupTimeout => BODY_504,
+        }
+    }
+
+    fn reason(self) -> RejectReason {
+        match self {
+            Refusal::BadRequest => RejectReason::BadRequest,
+            Refusal::Forbidden => RejectReason::Forbidden,
+            Refusal::DialFailed => RejectReason::DialFailed,
+            Refusal::SetupTimeout => RejectReason::SetupTimeout,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReadOutcome {
@@ -560,7 +593,7 @@ impl Serving {
                 match self.upstream_connectedness(index) {
                     ConnectState::Pending => return Ok(()),
                     ConnectState::Failed => {
-                        self.refuse(index, BODY_502);
+                        self.refuse(index, Refusal::DialFailed);
                         return Ok(());
                     }
                     ConnectState::Connected => return self.upstream_writable(index),
@@ -613,8 +646,14 @@ impl Serving {
         let now = Instant::now();
         match self.storage.accept(now) {
             Err(_) => {
+                let client = stream.peer_addr().ok();
+                let secs = self.storage.cache_secs(now);
                 let mut s = stream;
                 write_all_bounded(&mut s, BODY_503);
+                self.storage
+                    .logs_mut()
+                    .reject(secs, RejectReason::Capacity, client, None);
+                self.note_occupancy(now);
                 Ok(())
             }
             Ok(slot) => {
@@ -627,9 +666,21 @@ impl Serving {
                 if self.register_client(index).is_err() {
                     self.close_slot(index);
                 }
+                self.note_occupancy(now);
                 Ok(())
             }
         }
+    }
+
+    /// Evaluates the slot/setup capacity thresholds after an occupancy
+    /// transition at `now`.
+    fn note_occupancy(&mut self, now: Instant) {
+        let secs = self.storage.cache_secs(now);
+        let occupied = self.storage.occupied();
+        let pending = self.storage.pending();
+        self.storage
+            .logs_mut()
+            .note_capacity(secs, occupied, pending);
     }
 
     fn register_client(&mut self, index: usize) -> Result<(), ServeError> {
@@ -724,7 +775,7 @@ impl Serving {
             }
             if self.buf_room(index) < CHUNK {
                 match self.slots[index].stage {
-                    Stage::ReadingConnect => self.refuse(index, BODY_400),
+                    Stage::ReadingConnect => self.refuse(index, Refusal::BadRequest),
                     Stage::ValidatingHello => self.reject_hello(index)?,
                     _ => {}
                 }
@@ -816,7 +867,7 @@ impl Serving {
             }
             Ok(Feed::Incomplete) => Ok(()),
             Err(_) => {
-                self.refuse(index, BODY_400);
+                self.refuse(index, Refusal::BadRequest);
                 Ok(())
             }
         }
@@ -832,7 +883,7 @@ impl Serving {
             .copied()
             .and_then(Result::ok)
         else {
-            self.refuse(index, BODY_400);
+            self.refuse(index, Refusal::BadRequest);
             return Ok(());
         };
         let now = Instant::now();
@@ -841,19 +892,19 @@ impl Serving {
             .decide(slot, &request, now, AttemptCounts::new(), None);
         match phase {
             Err(_) => {
-                self.refuse(index, BODY_502);
+                self.refuse(index, Refusal::DialFailed);
                 Ok(())
             }
             Ok(ConnectPhase::Forbidden) => {
-                self.refuse(index, BODY_403);
+                self.refuse(index, Refusal::Forbidden);
                 Ok(())
             }
             Ok(ConnectPhase::NoBinding) | Ok(ConnectPhase::CandidatesExhausted) => {
-                self.refuse(index, BODY_502);
+                self.refuse(index, Refusal::DialFailed);
                 Ok(())
             }
             Ok(ConnectPhase::DeadlineExhausted) => {
-                self.refuse(index, BODY_504);
+                self.refuse(index, Refusal::SetupTimeout);
                 Ok(())
             }
             Ok(ConnectPhase::Peer { addr, .. }) => {
@@ -881,7 +932,7 @@ impl Serving {
                 Ok(())
             }
             Err(_) => {
-                self.refuse(index, BODY_502);
+                self.refuse(index, Refusal::DialFailed);
                 Ok(())
             }
         }
@@ -892,7 +943,7 @@ impl Serving {
             Stage::Dialing => match self.upstream_connectedness(index) {
                 ConnectState::Pending => Ok(()),
                 ConnectState::Failed => {
-                    self.refuse(index, BODY_502);
+                    self.refuse(index, Refusal::DialFailed);
                     Ok(())
                 }
                 ConnectState::Connected => {
@@ -940,7 +991,7 @@ impl Serving {
             Stage::Dialing => match self.upstream_connectedness(index) {
                 ConnectState::Pending => Ok(()),
                 ConnectState::Failed => {
-                    self.refuse(index, BODY_502);
+                    self.refuse(index, Refusal::DialFailed);
                     Ok(())
                 }
                 ConnectState::Connected => self.observe_upstream_read(index),
@@ -974,12 +1025,24 @@ impl Serving {
                 ReadOutcome::Activity(activity) => {
                     let ws = &mut self.slots[index];
                     ws.gate.observe_upstream_activity(activity);
+                    let activity_kind = match activity {
+                        Activity::Data => ActivityKind::Data,
+                        Activity::Eof => ActivityKind::Eof,
+                        Activity::Reset => ActivityKind::Reset,
+                    };
+                    let approved = ws.approved;
+                    let peer = ws.upstream.as_ref().and_then(|u| u.peer_addr().ok());
+                    let secs = self.storage.cache_secs(Instant::now());
+                    let hostname = approved.as_ref().map(|h| h.as_str());
+                    self.storage
+                        .logs_mut()
+                        .early_activity(secs, hostname, peer, activity_kind);
                     self.close_slot(index);
                     return Ok(());
                 }
                 ReadOutcome::Failed => {
                     if self.slots[index].stage == Stage::Dialing {
-                        self.refuse(index, BODY_502);
+                        self.refuse(index, Refusal::DialFailed);
                         return Ok(());
                     }
                     self.close_slot(index);
@@ -1132,6 +1195,7 @@ impl Serving {
                 if let Some(slot) = slot {
                     let tunnel = self.storage.finish_setup(slot);
                     self.slots[index].tunnel = Some(tunnel);
+                    self.note_occupancy(Instant::now());
                 }
             }
             self.slots[index].stage = Stage::Relay;
@@ -1234,7 +1298,9 @@ impl Serving {
         }
     }
 
-    fn refuse(&mut self, index: usize, body: &'static [u8]) {
+    fn refuse(&mut self, index: usize, refusal: Refusal) {
+        let body = refusal.body();
+        self.emit_reject(index, refusal.reason());
         let ws = &mut self.slots[index];
         ws.down_off = 0;
         ws.down[..body.len()].copy_from_slice(body);
@@ -1244,6 +1310,20 @@ impl Serving {
         if self.slots[index].down_len == 0 {
             self.close_slot(index);
         }
+    }
+
+    /// Emits one warn-reject record for the rejected slot: the client address
+    /// when readable and the approved hostname when a fixed one was set.
+    fn emit_reject(&mut self, index: usize, reason: RejectReason) {
+        let secs = self.storage.cache_secs(Instant::now());
+        let client = self.slots[index]
+            .client
+            .as_ref()
+            .and_then(|c| c.peer_addr().ok());
+        let hostname = self.slots[index].approved.as_ref().map(|h| h.as_str());
+        self.storage
+            .logs_mut()
+            .reject(secs, reason, client, hostname);
     }
 
     fn client_writable(&mut self, index: usize) -> Result<(), ServeError> {
@@ -1371,11 +1451,13 @@ impl Serving {
 
     fn reject_hello(&mut self, index: usize) -> Result<(), ServeError> {
         self.slots[index].gate.on_hello_rejected();
+        self.emit_reject(index, RejectReason::TlsValidation);
         self.close_slot(index);
         Ok(())
     }
 
     fn close_slot(&mut self, index: usize) {
+        let now = Instant::now();
         let ws = &mut self.slots[index];
         ws.stage = Stage::Closing;
         let slot = ws.handle.take();
@@ -1388,6 +1470,7 @@ impl Serving {
         } else if let Some(slot) = slot {
             self.storage.release(slot);
         }
+        self.note_occupancy(now);
     }
 
     fn poll_timeout(&self) -> Option<Duration> {
@@ -1415,8 +1498,13 @@ impl Serving {
         {
             earliest = Some(dns);
         }
-        let deadline = earliest?;
         let now = Instant::now();
+        if let Some(log_wake) = self.storage.logs().next_drain(now)
+            && earliest.is_none_or(|e| log_wake < e)
+        {
+            earliest = Some(log_wake);
+        }
+        let deadline = earliest?;
         if deadline <= now {
             Some(Duration::ZERO)
         } else {
@@ -1456,7 +1544,7 @@ impl Serving {
     fn expire_setup(&mut self, i: usize) {
         match self.slots[i].stage {
             Stage::ReadingConnect | Stage::RunningDecision | Stage::Dialing => {
-                self.refuse(i, BODY_504);
+                self.refuse(i, Refusal::SetupTimeout);
             }
             Stage::SendingConnected | Stage::ValidatingHello | Stage::WritingHello => {
                 self.flush_down(i);
@@ -1532,6 +1620,27 @@ mod tests {
             .expect("bind listener");
         let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
         Serving::new(storage, listener, traffic).expect("serving")
+    }
+
+    #[test]
+    fn serving_poll_timeout_folds_queued_log_drain_into_earliest_wait() {
+        with_serving_stack(ephemeral_port(), |serving| {
+            assert_eq!(
+                serving.poll_timeout(),
+                None,
+                "no slots, no dns deadline, empty log queue: idle serving has no wait"
+            );
+            serving.storage_mut().logs_mut().startup_warning(
+                1,
+                "sub.example.org",
+                crate::cache::Family::A,
+            );
+            assert_eq!(
+                serving.poll_timeout(),
+                Some(Duration::ZERO),
+                "a queued runnable log folds to an immediate wake with no traffic (T3)"
+            );
+        });
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod fault;
 pub mod fuzz;
 pub mod gate;
 pub mod inventory;
+pub mod log;
 pub mod preflight;
 pub mod resolver;
 pub mod runtime;

@@ -29,6 +29,7 @@ use mio::{Events, Interest, Poll, Registry, Token};
 use crate::cache::{Cache, CacheError, Family};
 use crate::config::{ALLOWLIST_MAX, Config, Fqdn};
 use crate::dns::{self, DNS_MSG_LIMIT, DnsError, ResponseWorkspace};
+use crate::log;
 use crate::schedule::{ScheduleError, Schedules};
 
 pub const EXCHANGE_DEADLINE_SECS: u64 = 2;
@@ -57,6 +58,8 @@ pub enum StartupDnsError {
         kind: io::ErrorKind,
         detail: &'static str,
     },
+    /// The boot-owned log queue or its stdout sink could not be prepared.
+    LogStore(log::LogStoreError),
     /// The OS entropy source failed while drawing a transaction id.
     Entropy,
     /// The monotonic poll-token generation is exhausted; no token is reused.
@@ -107,7 +110,14 @@ impl fmt::Display for StartupDnsError {
             StartupDnsError::SharedAttachConflict => {
                 write!(f, "startup DNS transport holds a private-poll connection")
             }
+            StartupDnsError::LogStore(err) => write!(f, "startup log store: {err:?}"),
         }
+    }
+}
+
+impl From<log::LogStoreError> for StartupDnsError {
+    fn from(err: log::LogStoreError) -> Self {
+        StartupDnsError::LogStore(err)
     }
 }
 
@@ -129,10 +139,24 @@ impl From<ScheduleError> for StartupDnsError {
     }
 }
 
+/// What a fully validated published exchange left in the cache, so the
+/// startup report can tell a validated negative from an attempted positive
+/// with no eligible bindings instead of collapsing both into one catch-all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishedKind {
+    /// A positive answer published at least one eligible binding.
+    ResolvedPositive,
+    /// A positive answer whose candidates were all ineligible; nothing was
+    /// published.
+    NoEligible,
+    /// A validated NXDOMAIN or NODATA answer was applied.
+    Negative,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeResult {
-    Published,
-    Failed,
+    Published(PublishedKind),
+    Failed(FailureReason),
 }
 
 /// The full legal context of one outstanding cooperative exchange, owned as a
@@ -222,6 +246,108 @@ enum RecvStep {
     Published,
 }
 
+/// The reason a startup exchange failed, captured at the step where the
+/// failure was first observable (connect, send, recv, or deadline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureReason {
+    Connect,
+    Send,
+    Receive,
+    Timeout,
+}
+
+impl FailureReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FailureReason::Connect => "connect",
+            FailureReason::Send => "send",
+            FailureReason::Receive => "receive",
+            FailureReason::Timeout => "timeout",
+        }
+    }
+}
+
+/// The reason a name was never attempted inside the startup window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAttemptedReason {
+    /// The fixed startup window closed before any exchange for the name was
+    /// attempted (the only not-attempted state the window produces).
+    WindowClosed,
+}
+
+impl NotAttemptedReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            NotAttemptedReason::WindowClosed => "window_closed",
+        }
+    }
+}
+
+/// The per-name terminal outcome of a single exchanged result, as the resolve
+/// loops track it: `Resolved` is terminal (a usable name is never re-attempted),
+/// otherwise the latest concluded exchange's outcome or reason is kept (704q:
+/// capture where still known, never infer at formatting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Latest {
+    Unattempted,
+    Failed(FailureReason),
+    NoEligible,
+    Negative,
+    Resolved,
+}
+
+impl Latest {
+    fn merge(&mut self, result: ExchangeResult) {
+        if *self == Latest::Resolved {
+            return;
+        }
+        *self = match result {
+            ExchangeResult::Published(PublishedKind::ResolvedPositive) => Latest::Resolved,
+            ExchangeResult::Published(PublishedKind::Negative) => Latest::Negative,
+            ExchangeResult::Published(PublishedKind::NoEligible) => Latest::NoEligible,
+            ExchangeResult::Failed(reason) => Latest::Failed(reason),
+        };
+    }
+
+    fn to_outcome(self) -> NameOutcome {
+        match self {
+            Latest::Resolved => NameOutcome::Resolved,
+            Latest::Negative => NameOutcome::Negative,
+            Latest::NoEligible => NameOutcome::NoEligible,
+            Latest::Failed(reason) => NameOutcome::Failed(reason),
+            Latest::Unattempted => NameOutcome::NotAttempted(NotAttemptedReason::WindowClosed),
+        }
+    }
+}
+
+/// The per-name terminal outcome of the startup window, carried inline by the
+/// single final startup record. A name is reported from its actual latest
+/// exchange results: a validated negative (NXDOMAIN or empty NODATA answer)
+/// stays distinct from an attempted positive with no eligible bindings and
+/// from an exchange failure with its reason, so the final entry never collapses
+/// distinct outcome classes into one catch-all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameOutcome {
+    /// At least one family holds an eligible non-retired positive binding.
+    Resolved,
+    /// The latest published outcome for the name was a validated negative
+    /// (NXDOMAIN, or an NODATA answer with no eligible bindings).
+    Negative,
+    /// The latest published outcome was a positive answer whose candidates
+    /// were all ineligible, so no binding was published.
+    NoEligible,
+    /// The latest concluded exchange for the name failed with this reason.
+    Failed(FailureReason),
+    /// No exchange for the name concluded inside the window.
+    NotAttempted(NotAttemptedReason),
+}
+
+impl Default for NameOutcome {
+    fn default() -> Self {
+        NameOutcome::NotAttempted(NotAttemptedReason::WindowClosed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StartupReport {
     pub exchanges: u32,
@@ -229,6 +355,20 @@ pub struct StartupReport {
     pub cancelled: u32,
     pub not_attempted: u32,
     pub resolved_names: u32,
+    /// One entry per configured name in allowlist ordinal order.
+    pub outcomes: [NameOutcome; ALLOWLIST_MAX],
+    /// The first counted exchange failure: name ordinal plus address family.
+    pub first_failure: Option<(u16, Family)>,
+}
+
+impl StartupReport {
+    /// Records the first counted exchange failure (name ordinal + family) if
+    /// none has been captured yet.
+    pub(crate) fn record_first_failure(&mut self, ordinal: usize, family: Family) {
+        if self.first_failure.is_none() {
+            self.first_failure = Some((ordinal as u16, family));
+        }
+    }
 }
 
 /// A tightly scoped test hook that substitutes the outcome of the next
@@ -279,10 +419,32 @@ pub struct StartupDns {
     token_gen: usize,
     registration: Registration,
     active: Option<ActiveExchange>,
+    /// The classification of the most recently published outcome, read out by
+    /// the blocking driver when the exchange concludes (never inferred from
+    /// the cache afterwards, where negative and no-eligible are ambiguous).
+    last_published: Option<PublishedKind>,
+    /// The failure reason of the most recently failed step, read out by the
+    /// blocking driver when the exchange concludes.
+    last_failed: Option<FailureReason>,
     #[cfg(test)]
     poll_ticks: u64,
     #[cfg(test)]
     force_write: Option<WriteForce>,
+}
+
+/// The borrowed startup-window resolution context fed to
+/// [`StartupDns::resolve_window`]: the config, cache, schedules, nameserver,
+/// process-relative second anchor, and window duration are the single startup
+/// input set, bundled so the resolve seam stays within the clippy argument
+/// budget (L1). The boot-owned log store stays a separate per-run parameter
+/// because the witness hoists a pre-reserved store into the measured window.
+pub(crate) struct WindowInputs<'a> {
+    pub(crate) config: &'a Config,
+    pub(crate) cache: &'a mut Cache,
+    pub(crate) schedules: &'a mut Schedules,
+    pub(crate) nameserver: SocketAddr,
+    pub(crate) now0: u64,
+    pub(crate) window: Duration,
 }
 
 impl StartupDns {
@@ -314,6 +476,8 @@ impl StartupDns {
             token_gen: 0,
             registration: Registration::Private,
             active: None,
+            last_published: None,
+            last_failed: None,
             #[cfg(test)]
             poll_ticks: 0,
             #[cfg(test)]
@@ -680,13 +844,13 @@ impl StartupDns {
     ) -> Result<ConnectStep, StartupDnsError> {
         if let Some(_kind) = ex.connect_err.take() {
             self.close_connection()?;
-            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Connect)?;
             return Ok(ConnectStep::Failed);
         }
         if let Some(stream) = self.stream.as_mut() {
             if let Ok(Some(_err)) = stream.take_error() {
                 self.close_connection()?;
-                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Connect)?;
                 return Ok(ConnectStep::Failed);
             }
             if stream.peer_addr().is_ok() {
@@ -695,7 +859,7 @@ impl StartupDns {
         }
         if Instant::now() >= ex.deadline {
             self.close_connection()?;
-            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Timeout)?;
             return Ok(ConnectStep::Failed);
         }
         Ok(ConnectStep::Waiting)
@@ -724,7 +888,12 @@ impl StartupDns {
                         match stream.write(&self.query_buf[self.written..end]) {
                             Ok(0) => {
                                 self.close_connection()?;
-                                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                                self.note_failure(
+                                    ex.ordinal,
+                                    ex.family,
+                                    schedules,
+                                    FailureReason::Send,
+                                )?;
                                 return Ok(SendStep::Failed);
                             }
                             Ok(w) => {
@@ -734,7 +903,12 @@ impl StartupDns {
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                             Err(_) => {
                                 self.close_connection()?;
-                                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                                self.note_failure(
+                                    ex.ordinal,
+                                    ex.family,
+                                    schedules,
+                                    FailureReason::Send,
+                                )?;
                                 return Ok(SendStep::Failed);
                             }
                         }
@@ -747,7 +921,7 @@ impl StartupDns {
                 match stream.write(&self.query_buf[self.written..ex.qlen]) {
                     Ok(0) => {
                         self.close_connection()?;
-                        self.note_failure(ex.ordinal, ex.family, schedules)?;
+                        self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Send)?;
                         return Ok(SendStep::Failed);
                     }
                     Ok(n) => {
@@ -758,13 +932,13 @@ impl StartupDns {
                     }
                     Err(_) => {
                         self.close_connection()?;
-                        self.note_failure(ex.ordinal, ex.family, schedules)?;
+                        self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Send)?;
                         return Ok(SendStep::Failed);
                     }
                 }
             } else {
                 self.close_connection()?;
-                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Send)?;
                 return Ok(SendStep::Failed);
             }
         }
@@ -774,7 +948,7 @@ impl StartupDns {
         }
         if Instant::now() >= ex.deadline {
             self.close_connection()?;
-            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Timeout)?;
             return Ok(SendStep::Failed);
         }
         if blocked {
@@ -802,7 +976,7 @@ impl StartupDns {
     ) -> Result<RecvStep, StartupDnsError> {
         if self.stream.is_none() {
             self.close_connection()?;
-            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Receive)?;
             return Ok(RecvStep::Failed);
         }
         let want = match self.msglen {
@@ -815,14 +989,14 @@ impl StartupDns {
             match stream.read(&mut self.recv_buf[self.filled..]) {
                 Ok(0) => {
                     self.close_connection()?;
-                    self.note_failure(ex.ordinal, ex.family, schedules)?;
+                    self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Receive)?;
                     return Ok(RecvStep::Failed);
                 }
                 Ok(n) => self.filled += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     self.close_connection()?;
-                    self.note_failure(ex.ordinal, ex.family, schedules)?;
+                    self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Receive)?;
                     return Ok(RecvStep::Failed);
                 }
             }
@@ -831,7 +1005,7 @@ impl StartupDns {
             let len = usize::from(u16::from_be_bytes([self.recv_buf[0], self.recv_buf[1]]));
             if len == 0 || len > DNS_MSG_LIMIT {
                 self.close_connection()?;
-                self.note_failure(ex.ordinal, ex.family, schedules)?;
+                self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Receive)?;
                 return Ok(RecvStep::Failed);
             }
             self.msglen = Some(len);
@@ -846,6 +1020,15 @@ impl StartupDns {
             self.filled = 0;
             match outcome {
                 Ok(outcome) => {
+                    self.last_published = Some(match &outcome {
+                        dns::Outcome::Positive { bindings, .. } if !bindings.is_empty() => {
+                            PublishedKind::ResolvedPositive
+                        }
+                        dns::Outcome::Positive { .. } => PublishedKind::NoEligible,
+                        dns::Outcome::NxDomain { .. } | dns::Outcome::NoData { .. } => {
+                            PublishedKind::Negative
+                        }
+                    });
                     let name_index = cache
                         .name_index(ex.ordinal)
                         .ok_or(StartupDnsError::Cache(CacheError::NameOutOfRange))?;
@@ -864,14 +1047,14 @@ impl StartupDns {
                 }
                 Err(_) => {
                     self.close_connection()?;
-                    self.note_failure(ex.ordinal, ex.family, schedules)?;
+                    self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Receive)?;
                     return Ok(RecvStep::Failed);
                 }
             }
         }
         if Instant::now() >= ex.deadline {
             self.close_connection()?;
-            self.note_failure(ex.ordinal, ex.family, schedules)?;
+            self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Timeout)?;
             return Ok(RecvStep::Failed);
         }
         Ok(RecvStep::Waiting)
@@ -900,6 +1083,32 @@ impl StartupDns {
         nameserver: SocketAddr,
         now0: u64,
     ) -> Result<StartupReport, StartupDnsError> {
+        use std::os::fd::AsRawFd;
+        let null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .map_err(|_| StartupDnsError::Transport {
+                kind: std::io::ErrorKind::Other,
+                detail: "test null sink",
+            })?;
+        let mut logs = log::LogStore::with_fd(null.as_raw_fd()).expect("null sink store");
+        self.resolve_body(config, cache, schedules, nameserver, now0, &mut logs)
+    }
+
+    /// The shared test driver body used by [`Self::resolve`], parameterised over
+    /// an already-constructed log store so an alloc-witness caller can hoist
+    /// the one-time queue reservation (a boot cost, not a per-exchange cost)
+    /// outside the measured phase.
+    #[cfg(test)]
+    fn resolve_body(
+        &mut self,
+        config: &Config,
+        cache: &mut Cache,
+        schedules: &mut Schedules,
+        nameserver: SocketAddr,
+        now0: u64,
+        logs: &mut log::LogStore,
+    ) -> Result<StartupReport, StartupDnsError> {
         self.now0 = now0;
         self.start = Instant::now();
         let window_deadline = self
@@ -911,6 +1120,7 @@ impl StartupDns {
         let names = allowlist.len();
         let mut report = StartupReport::default();
         let mut resolved = [false; ALLOWLIST_MAX];
+        let mut latest = [Latest::Unattempted; ALLOWLIST_MAX];
 
         for (ordinal, name) in allowlist.iter().enumerate() {
             for family in Family::ALL {
@@ -924,18 +1134,38 @@ impl StartupDns {
                 let remaining = window_deadline.duration_since(Instant::now());
                 let exchange_deadline =
                     Instant::now() + Duration::from_secs(EXCHANGE_DEADLINE_SECS).min(remaining);
-                match self.exchange(name, family, ordinal, cache, schedules, exchange_deadline) {
-                    Ok(ExchangeResult::Published) => {
+                match self.exchange(
+                    name,
+                    family,
+                    ordinal,
+                    cache,
+                    schedules,
+                    exchange_deadline,
+                    logs,
+                ) {
+                    Ok(ExchangeResult::Published(kind)) => {
                         report.exchanges += 1;
                         let has = !cache.entry(name_index, family)?.bindings().is_empty();
                         resolved[ordinal] |= has;
+                        latest[ordinal].merge(ExchangeResult::Published(kind));
                     }
-                    Ok(ExchangeResult::Failed) => report.failed += 1,
+                    Ok(ExchangeResult::Failed(reason)) => {
+                        report.failed += 1;
+                        report.record_first_failure(ordinal, family);
+                        latest[ordinal].merge(ExchangeResult::Failed(reason));
+                    }
                     Err(err) => return Err(err),
                 }
             }
         }
         report.resolved_names = resolved[..names].iter().filter(|&&r| r).count() as u32;
+        for ordinal in 0..names {
+            report.outcomes[ordinal] = if resolved[ordinal] {
+                NameOutcome::Resolved
+            } else {
+                latest[ordinal].to_outcome()
+            };
+        }
         self.close_connection()?;
         Ok(report)
     }
@@ -958,13 +1188,17 @@ impl StartupDns {
     /// carried by the report.
     pub(crate) fn resolve_window(
         &mut self,
-        config: &Config,
-        cache: &mut Cache,
-        schedules: &mut Schedules,
-        nameserver: SocketAddr,
-        now0: u64,
-        window: Duration,
+        inputs: WindowInputs<'_>,
+        logs: &mut log::LogStore,
     ) -> Result<(StartupReport, u64), StartupDnsError> {
+        let WindowInputs {
+            config,
+            cache,
+            schedules,
+            nameserver,
+            now0,
+            window,
+        } = inputs;
         self.now0 = now0;
         self.start = Instant::now();
         let window_deadline = self
@@ -977,6 +1211,7 @@ impl StartupDns {
         let mut report = StartupReport::default();
         let mut resolved = [false; ALLOWLIST_MAX];
         let mut attempted = [false; ALLOWLIST_MAX * 2];
+        let mut latest = [Latest::Unattempted; ALLOWLIST_MAX];
 
         for ordinal in 0..names {
             for family in Family::ALL {
@@ -1010,14 +1245,30 @@ impl StartupDns {
                         .name_index(ordinal)
                         .ok_or(CacheError::NameOutOfRange)?;
                     attempted[ordinal * 2 + family_index(family)] = true;
-                    match self.exchange(name, family, ordinal, cache, schedules, exchange_deadline)
-                    {
-                        Ok(ExchangeResult::Published) => {
+                    match self.exchange(
+                        name,
+                        family,
+                        ordinal,
+                        cache,
+                        schedules,
+                        exchange_deadline,
+                        logs,
+                    ) {
+                        Ok(ExchangeResult::Published(kind)) => {
                             report.exchanges += 1;
                             let has = !cache.entry(name_index, family)?.bindings().is_empty();
                             resolved[ordinal] |= has;
+                            latest[ordinal].merge(ExchangeResult::Published(kind));
                         }
-                        Ok(ExchangeResult::Failed) => report.failed += 1,
+                        Ok(ExchangeResult::Failed(reason)) => {
+                            report.failed += 1;
+                            let first = report.first_failure.is_none();
+                            report.record_first_failure(ordinal, family);
+                            if first {
+                                logs.startup_warning(now, name.as_str(), family);
+                            }
+                            latest[ordinal].merge(ExchangeResult::Failed(reason));
+                        }
                         Err(err) => return Err(err),
                     }
                 }
@@ -1026,10 +1277,19 @@ impl StartupDns {
                     if remaining.is_zero() {
                         break;
                     }
-                    let wait =
+                    logs.drain_sink();
+                    let dns_wait =
                         wait_until_next_step(self, schedules, names, &resolved)?.min(remaining);
+                    let now_i = Instant::now();
+                    let log_wait = logs
+                        .next_drain(now_i)
+                        .map(|retry| retry.saturating_duration_since(now_i));
+                    let wait = match log_wait {
+                        Some(log_wait) => dns_wait.min(log_wait),
+                        None => dns_wait,
+                    };
                     if wait.is_zero() {
-                        break;
+                        continue;
                     }
                     thread::sleep(wait);
                 }
@@ -1040,6 +1300,13 @@ impl StartupDns {
         let attempted_count = attempted[..names * 2].iter().filter(|&&t| t).count() as u32;
         report.not_attempted = (names * 2) as u32 - attempted_count;
         report.resolved_names = resolved[..names].iter().filter(|&&r| r).count() as u32;
+        for ordinal in 0..names {
+            report.outcomes[ordinal] = if resolved[ordinal] {
+                NameOutcome::Resolved
+            } else {
+                latest[ordinal].to_outcome()
+            };
+        }
         Ok((report, self.start.elapsed().as_secs()))
     }
 
@@ -1165,9 +1432,12 @@ impl StartupDns {
     /// The startup-only blocking driver (nonserving): it starts the exchange
     /// and then owns every wait itself via [`Self::wait_dns_readiness`],
     /// polling the DNS registry once per turn until the exchange concludes
-    /// within its single clipped deadline. Any other owner replaces this
-    /// driver body with a fold of the DNS readiness and
-    /// [`Self::exchange_deadline`] into its own combined wait.
+    /// within its single clipped deadline. The boot-owned log store is passed
+    /// at this seam so logging steps and the log retry deadline participate in
+    /// the same wait without restarting the 90s or 2s deadlines (704q); any
+    /// other owner replaces this driver body with a fold of the DNS readiness
+    /// and [`Self::exchange_deadline`] into its own combined wait.
+    #[allow(clippy::too_many_arguments)]
     fn exchange(
         &mut self,
         fqdn: &Fqdn,
@@ -1176,15 +1446,32 @@ impl StartupDns {
         cache: &mut Cache,
         schedules: &mut Schedules,
         deadline: Instant,
+        logs: &mut log::LogStore,
     ) -> Result<ExchangeResult, StartupDnsError> {
         self.start_exchange(fqdn, family, ordinal, deadline)?;
         loop {
             match self.advance_exchange(fqdn, cache, schedules)? {
                 TurnResult::Pending => {
-                    self.wait_dns_readiness(deadline)?;
+                    logs.drain_sink();
+                    let now = Instant::now();
+                    let wake = match logs.next_drain(now) {
+                        Some(retry) => deadline.min(retry),
+                        None => deadline,
+                    };
+                    self.wait_dns_readiness(wake)?;
                 }
-                TurnResult::Published => return Ok(ExchangeResult::Published),
-                TurnResult::Failed => return Ok(ExchangeResult::Failed),
+                TurnResult::Published => {
+                    return Ok(ExchangeResult::Published(
+                        self.last_published
+                            .take()
+                            .unwrap_or(PublishedKind::ResolvedPositive),
+                    ));
+                }
+                TurnResult::Failed => {
+                    return Ok(ExchangeResult::Failed(
+                        self.last_failed.take().unwrap_or(FailureReason::Receive),
+                    ));
+                }
             }
         }
     }
@@ -1194,7 +1481,9 @@ impl StartupDns {
         ordinal: usize,
         family: Family,
         schedules: &mut Schedules,
+        reason: FailureReason,
     ) -> Result<(), StartupDnsError> {
+        self.last_failed = Some(reason);
         let now = self.now_u64();
         schedules.note_exchange_failure(ordinal, family, now)?;
         Ok(())
@@ -1252,6 +1541,8 @@ mod tests {
     use crate::config::parse_config_document;
     use std::io::{Read, Write};
     use std::net::{IpAddr, TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     enum Step {
@@ -1289,11 +1580,16 @@ mod tests {
     struct Responder {
         addr: SocketAddr,
         handle: Option<thread::JoinHandle<()>>,
+        connections: Arc<AtomicUsize>,
     }
 
     impl Responder {
         fn port(&self) -> u16 {
             self.addr.port()
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(Ordering::Relaxed)
         }
     }
 
@@ -1391,6 +1687,8 @@ mod tests {
     fn spawn_responder(conn_scripts: Vec<Vec<Step>>) -> Responder {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind responder");
         let addr = listener.local_addr().expect("responder addr");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connections_thread = Arc::clone(&connections);
         let handle = thread::spawn(move || {
             let scripts = conn_scripts.into_iter();
             for conn_steps in scripts {
@@ -1398,6 +1696,7 @@ mod tests {
                     Ok(x) => x,
                     Err(_) => break,
                 };
+                connections_thread.fetch_add(1, Ordering::Relaxed);
                 for step in conn_steps {
                     match step {
                         Step::Stall(d) => thread::sleep(d),
@@ -1471,6 +1770,7 @@ mod tests {
         Responder {
             addr,
             handle: Some(handle),
+            connections,
         }
     }
 
@@ -1831,6 +2131,85 @@ mod tests {
     }
 
     #[test]
+    fn startup_outcomes_report_latest_validated_negative_not_not_attempted() {
+        let cfg = config();
+        let responder = spawn_responder(vec![
+            vec![
+                Step::NxdomainWithSoa { ttl: 300, min: 60 },
+                Step::NodataWithSoa { ttl: 300, min: 60 },
+                Step::Stall(Duration::from_secs(3)),
+                Step::Close,
+            ],
+            vec![Step::NodataWithSoa { ttl: 300, min: 60 }],
+        ]);
+        let mut cache = Cache::new(2).unwrap();
+        let mut schedules = Schedules::new(2).unwrap();
+        let mut transport = StartupDns::new().unwrap();
+        let report = transport
+            .resolve(
+                &cfg,
+                &mut cache,
+                &mut schedules,
+                ns(responder.port()),
+                1_000_000,
+            )
+            .unwrap();
+        assert_eq!(report.exchanges, 3, "name0 A, name0 AAAA, name1 AAAA");
+        assert_eq!(
+            report.failed, 1,
+            "name1 A timed out on the stalled connection"
+        );
+        assert_eq!(
+            report.outcomes[0],
+            NameOutcome::Negative,
+            "a validated NXDOMAIN/NODATA pair is negative, never not_attempted (T1)"
+        );
+        assert_eq!(
+            report.outcomes[1],
+            NameOutcome::Negative,
+            "name1 AAAA NODATA is the latest concluded outcome, overriding the earlier timeout"
+        );
+    }
+
+    #[test]
+    fn startup_outcome_failed_carries_latest_failure_reason() {
+        let cfg = config();
+        let responder = spawn_responder(vec![
+            vec![
+                Step::NodataWithSoa { ttl: 300, min: 60 },
+                Step::NodataWithSoa { ttl: 300, min: 60 },
+                Step::Stall(Duration::from_secs(3)),
+                Step::Close,
+            ],
+            vec![Step::Stall(Duration::from_secs(3)), Step::Close],
+        ]);
+        let mut cache = Cache::new(2).unwrap();
+        let mut schedules = Schedules::new(2).unwrap();
+        let mut transport = StartupDns::new().unwrap();
+        let report = transport
+            .resolve(
+                &cfg,
+                &mut cache,
+                &mut schedules,
+                ns(responder.port()),
+                1_000_000,
+            )
+            .unwrap();
+        assert_eq!(report.exchanges, 2);
+        assert_eq!(report.failed, 2, "name1 A and AAAA both timed out");
+        assert_eq!(
+            report.outcomes[0],
+            NameOutcome::Negative,
+            "name0 stayed a validated negative"
+        );
+        assert_eq!(
+            report.outcomes[1],
+            NameOutcome::Failed(FailureReason::Timeout),
+            "a name whose latest concluded exchanges all timed out carries the failure reason (T1)"
+        );
+    }
+
+    #[test]
     fn malformed_response_fails_exchange_and_connection_is_reused_next() {
         let cfg = config();
         let responder = spawn_responder(vec![
@@ -1895,6 +2274,10 @@ mod tests {
             .unwrap();
         assert_eq!(report.exchanges, 3);
         assert_eq!(report.failed, 1);
+        assert!(
+            responder.connections() >= 2,
+            "a stalled-then-closed exchange must reconnect on a fresh connection"
+        );
         assert!(bindings_of(&cache, 0, Family::A).is_empty());
         assert_eq!(
             bindings_of(&cache, 1, Family::A),
@@ -2084,21 +2467,7 @@ mod tests {
     #[test]
     fn startup_dns_phase_is_allocation_free_including_reconnect() {
         use crate::alloc::{self, Phase};
-        let cfg = config();
-        let responder = spawn_responder(vec![
-            vec![Step::Malformed(vec![0xff, 0xff, 0xff, 0xff])],
-            vec![
-                Step::NodataWithSoa { ttl: 300, min: 60 },
-                Step::PositiveA {
-                    ttl: 90,
-                    octets: [1, 1, 1, 1],
-                },
-                Step::NodataWithSoa { ttl: 300, min: 60 },
-            ],
-        ]);
-        let mut cache = Cache::new(2).unwrap();
-        let mut schedules = Schedules::new(2).unwrap();
-        let mut transport = StartupDns::new().unwrap();
+        use crate::serve::{ServeStorage, StartupDecision};
 
         let (_, control) = alloc::run_phase(Phase::StartupDns, || {
             let bytes = Box::new([0u8; 64]);
@@ -2109,23 +2478,42 @@ mod tests {
             "counter must attribute a local alloc/dealloc: {control:?}"
         );
 
-        let (report, counts) = alloc::run_phase(Phase::StartupDns, || {
-            transport
-                .resolve(
-                    &cfg,
-                    &mut cache,
-                    &mut schedules,
-                    ns(responder.port()),
-                    1_000_000,
-                )
-                .unwrap()
+        let cfg = config();
+        let responder = spawn_responder(vec![
+            vec![Step::Malformed(vec![0xff, 0xff, 0xff, 0xff])],
+            vec![
+                Step::NodataWithSoa { ttl: 300, min: 60 },
+                Step::NodataWithSoa { ttl: 300, min: 60 },
+                Step::NodataWithSoa { ttl: 300, min: 60 },
+                Step::NodataWithSoa { ttl: 300, min: 60 },
+            ],
+        ]);
+        let mut storage =
+            ServeStorage::boot(&cfg).expect("boot storage outside the measured window");
+
+        let (outcome, counts) = alloc::run_phase(Phase::StartupDns, || {
+            storage
+                .run_startup_within(ns(responder.port()), 1_000_000, Duration::from_millis(700))
+                .expect("production startup window")
         });
         assert!(
             counts.all_zero(),
-            "startup DNS phase must be allocation-free including a reconnect: {counts:?}"
+            "the ACTUAL startup DNS window (resolve_window over booted storage, not the test driver resolve_body) must be allocation-free including a reconnect: {counts:?}"
         );
-        assert_eq!(report.exchanges, 3);
-        assert_eq!(report.failed, 1);
+        assert!(
+            matches!(outcome.decision, StartupDecision::Exit75 { .. }),
+            "both names unresolved under allowance 1 must exit 75 without binding a listener"
+        );
+        assert_eq!(outcome.report.resolved_names, 0);
+        assert!(
+            outcome.report.failed > 0,
+            "the malformed first exchange plus the negative responses must count failures"
+        );
+        assert!(
+            responder.connections() >= 2,
+            "the malformed response must force a transport reconnect inside the measured window"
+        );
+        drop(responder);
     }
 
     #[test]

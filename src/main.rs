@@ -28,20 +28,6 @@ fn main() {
     emit_kernel_facts();
     match run_boot(CONFIG_PATH, RESOLVER_PATH) {
         Ok(report) => {
-            let storage = match ServeStorage::boot(&report.config) {
-                Ok(storage) => storage,
-                Err(err) => {
-                    eprintln!("alumina: serving storage: {err}");
-                    std::process::exit(EX_CONFIG);
-                }
-            };
-            let mut owner = match Preallocated::preallocate(storage, report.storage) {
-                Ok(owner) => owner,
-                Err(err) => {
-                    eprintln!("alumina: serving workspace: {err}");
-                    std::process::exit(EX_CONFIG);
-                }
-            };
             println!(
                 "inventory named fixed buffers (lower bound): {} (traffic {} + serving workspace {} + dns named buffers {})",
                 report.inventory.named_fixed_buffer_bytes(),
@@ -69,58 +55,64 @@ fn main() {
                 report.config.listen().ip(),
                 report.config.listen().port()
             );
+            let storage = match ServeStorage::boot(&report.config) {
+                Ok(storage) => storage,
+                Err(err) => {
+                    write_stderr(format_args!("alumina: serving storage: {err}\n"));
+                    std::process::exit(EX_CONFIG);
+                }
+            };
+            let mut owner = match Preallocated::preallocate(storage, report.storage) {
+                Ok(owner) => owner,
+                Err(err) => {
+                    write_stderr(format_args!("alumina: serving workspace: {err}\n"));
+                    std::process::exit(EX_CONFIG);
+                }
+            };
+            if owner.prepare_stdout_log_sink().is_err() {
+                write_stderr(format_args!(
+                    "alumina: cannot prepare the stdout log sink\n"
+                ));
+                std::process::exit(EX_CONFIG);
+            }
             let nameserver =
                 std::net::SocketAddr::new(report.nameserver.addr(), report.nameserver.port());
             match owner.run_startup(nameserver, PROCESS_EPOCH_SECS) {
                 Ok(outcome) => match outcome.decision {
-                    StartupDecision::Serve(mode) => {
+                    StartupDecision::Serve(_mode) => {
                         let Some(listener) = outcome.listener else {
-                            eprintln!("alumina: serving decision without a bound listener");
+                            owner.emit_fatal_and_drain(format_args!(
+                                "alumina: serving decision without a bound listener",
+                            ));
                             std::process::exit(EX_SOFTWARE);
                         };
-                        let bound = listener
-                            .local_addr()
-                            .map(|addr| addr.to_string())
-                            .unwrap_or_else(|_| "unavailable".to_string());
-                        println!(
-                            "startup-decision: {mode:?} listener {bound} exchanges {} failed {} resolved {}",
-                            outcome.report.exchanges,
-                            outcome.report.failed,
-                            outcome.report.resolved_names,
-                        );
                         let runtime = match owner.attach(listener) {
                             Ok(runtime) => runtime,
-                            Err(err) => {
-                                eprintln!("alumina: serving: {err}");
-                                std::process::exit(EX_SOFTWARE);
-                            }
+                            Err(_) => std::process::exit(EX_SOFTWARE),
                         };
                         match runtime.serve() {
-                            Err(err) => {
-                                eprintln!("alumina: serving: {err}");
-                                std::process::exit(EX_SOFTWARE);
-                            }
+                            Err(_) => std::process::exit(EX_SOFTWARE),
                             Ok(never) => match never {},
                         }
                     }
-                    StartupDecision::Exit75 { unresolved } => {
-                        println!(
-                            "startup-failure: {unresolved} unresolved names exceed allowance; exiting 75"
-                        );
-                        std::process::exit(EX_TEMPFAIL);
-                    }
+                    StartupDecision::Exit75 { .. } => std::process::exit(EX_TEMPFAIL),
                 },
                 Err(err) => {
-                    eprintln!("alumina: startup: {err}");
+                    owner.emit_fatal_and_drain(format_args!("alumina: startup: {err}"));
                     std::process::exit(EX_CONFIG);
                 }
             }
         }
         Err(err) => {
-            eprintln!("alumina: {}", err);
+            write_stderr(format_args!("alumina: {err}\n"));
             std::process::exit(EX_CONFIG);
         }
     }
+}
+
+fn write_stderr(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_fmt(args);
 }
 
 #[cfg(feature = "fixture-facts")]

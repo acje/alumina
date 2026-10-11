@@ -24,11 +24,24 @@ name = "main_thread_stack"
 path = "tests/main_thread_stack.rs"
 harness = false
 
+# harness = false: this binary steals fd 1 onto an unconsumed pipe and proves
+# the native Linux serving loop keeps refusing connections (403) while the
+# log sink is stalled on a full stdout, with no panic and whole-record drops
+# bounded (R2 evidence for the nonblocking stdout sink).
+[[test]]
+name = "stdout_stall"
+path = "tests/stdout_stall.rs"
+harness = false
+
 [dependencies]
 toml = { version = "=1.1.8", default-features = false, features = ["std", "parse", "serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 mio = { version = "=1.2.4", default-features = false, features = ["net", "os-poll"] }
 getrandom = { version = "=0.3.4" }
+# Promoted from the already-resolved closure (mio/getrandom pull libc 0.2.190):
+# minimal nonblocking-stdout fcntl + write boundary for the log sink. Pinned to
+# the exact resolved version; no new closure node (contract intent 26l1.21.3).
+libc = "=0.2.190"
 
 [features]
 # F1 counting allocator is opt-in so normal production releases are never

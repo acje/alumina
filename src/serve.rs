@@ -10,6 +10,7 @@ use mio::net::TcpListener;
 use crate::cache::{Cache, CacheError, EntryState, Family, NameIndex};
 use crate::config::Config;
 use crate::connect::ConnectRequest;
+use crate::log::LogStore;
 use crate::schedule::Schedules;
 use crate::startup_dns::{
     STARTUP_WINDOW_SECS, StartupDns, StartupDnsError, StartupReport, TurnResult,
@@ -36,6 +37,7 @@ pub struct ServeStorage {
     worker: Worker,
     origin: Instant,
     now0: u64,
+    logs: LogStore,
 }
 
 /// How serving begins when the startup window closes.
@@ -122,6 +124,7 @@ impl ServeStorage {
     /// poll registry cannot be created.
     pub fn boot(config: &Config) -> Result<ServeStorage, StartupDnsError> {
         let name_count = config.allowlist().len();
+        let logs = LogStore::new().map_err(StartupDnsError::from)?;
         let cache = Cache::new(name_count).map_err(StartupDnsError::from)?;
         let schedules = Schedules::new(name_count).map_err(StartupDnsError::from)?;
         let dns = StartupDns::new()?;
@@ -135,6 +138,7 @@ impl ServeStorage {
             worker,
             origin,
             now0: 0,
+            logs,
         })
     }
 
@@ -185,6 +189,44 @@ impl ServeStorage {
     /// run cooperative refresh turns on the single retained source.
     pub(crate) fn dns_mut(&mut self) -> &mut StartupDns {
         &mut self.dns
+    }
+
+    /// The boot-owned log store, mutable for record emission and sink drains.
+    pub(crate) fn logs_mut(&mut self) -> &mut LogStore {
+        &mut self.logs
+    }
+
+    /// The boot-owned log store, shared for next-drain scheduling.
+    pub(crate) fn logs(&self) -> &LogStore {
+        &self.logs
+    }
+
+    /// Whole-record log drops so far, saturating at `u64::MAX`: the
+    /// documented dropped-record metric (alumina.md:193).
+    pub fn log_dropped(&self) -> u64 {
+        self.logs.dropped()
+    }
+
+    /// Arms the production stdout sink (fd 1 nonblocking). The binary calls
+    /// this once after boot, before any serving stdout write; the library and
+    /// tests never flip the descriptor (H2).
+    pub fn prepare_stdout_log_sink(&mut self) -> Result<(), StartupDnsError> {
+        self.logs.prepare_stdout().map_err(StartupDnsError::from)
+    }
+
+    /// Emits one stdout-only fatal record and performs one bounded drain, then
+    /// lets the process exit: the only post-sink-switch channel for a
+    /// process-fatal failure, so an attach/serve/listener failure never blocks
+    /// on a separate stalled stderr descriptor (alumina.md:149, B1). The
+    /// message is formatted directly into the fixed slot, so a fatal path
+    /// performs no heap allocation beyond what the slot itself already owns.
+    ///
+    /// The drain is best-effort under the per-turn sink budget; a stalled or
+    /// closed stdout never delays the exit verdict.
+    pub fn emit_fatal_and_drain(&mut self, args: std::fmt::Arguments<'_>) {
+        let secs = self.cache_secs(Instant::now());
+        self.logs.fatal(secs, args);
+        self.logs.drain_sink();
     }
 
     /// One cooperative DNS turn on the single retained transport: advances the
@@ -393,12 +435,15 @@ impl ServeStorage {
         window: Duration,
     ) -> Result<StartupOutcome, StartupError> {
         let (report, decision_seconds) = self.dns.resolve_window(
-            &self.config,
-            &mut self.cache,
-            &mut self.schedules,
-            nameserver,
-            now0,
-            window,
+            crate::startup_dns::WindowInputs {
+                config: &self.config,
+                cache: &mut self.cache,
+                schedules: &mut self.schedules,
+                nameserver,
+                now0,
+                window,
+            },
+            &mut self.logs,
         )?;
         self.mount_clock(self.dns.window_start(), now0);
         let decision = self.startup_decision(now0 + decision_seconds)?;
@@ -406,11 +451,69 @@ impl ServeStorage {
             StartupDecision::Serve(_) => Some(self.bind_listener()?),
             StartupDecision::Exit75 { .. } => None,
         };
+        self.emit_startup_records(now0 + decision_seconds, &report, decision);
         Ok(StartupOutcome {
             decision,
             report,
             listener,
         })
+    }
+
+    /// Emits the startup log records through the boot-owned log store and
+    /// drains it once. The single final result record carries every unresolved
+    /// name embedded inline (alumina.md:193); the final result is never fanned
+    /// out into per-name records (corrected T2). The first-failure warning is
+    /// NOT replayed here: the window seam (startup_dns.rs resolve_window)
+    /// enqueues exactly one warning at the first counted exchange failure
+    /// inside the window, so emitting again at end-of-window would duplicate it
+    /// (no end-window replay, alumina.md:67).
+    fn emit_startup_records(
+        &mut self,
+        secs: u64,
+        report: &StartupReport,
+        decision: StartupDecision,
+    ) {
+        use crate::config::ALLOWLIST_MAX;
+        use crate::log::{FinalCounts, StartupStatus, StartupUnresolved};
+        use crate::startup_dns::NameOutcome;
+        let allowlist = self.config.allowlist();
+        let names = allowlist.len() as u64;
+        let status = match decision {
+            StartupDecision::Serve(ServingMode::Full) => StartupStatus::Full,
+            StartupDecision::Serve(ServingMode::Degraded) => StartupStatus::Degraded,
+            StartupDecision::Exit75 { .. } => StartupStatus::Failed,
+        };
+        let mut embedded = [StartupUnresolved {
+            ordinal: 0,
+            name: "",
+            outcome: NameOutcome::default(),
+        }; ALLOWLIST_MAX];
+        let mut unresolved_count = 0usize;
+        for (ordinal, name) in allowlist.iter().enumerate() {
+            if report.outcomes[ordinal] != NameOutcome::Resolved {
+                embedded[unresolved_count] = StartupUnresolved {
+                    ordinal: ordinal as u32,
+                    name: name.as_str(),
+                    outcome: report.outcomes[ordinal],
+                };
+                unresolved_count += 1;
+            }
+        }
+        self.logs.startup_final(
+            secs,
+            status,
+            FinalCounts {
+                allowance: u64::from(self.config.startup_unresolved_allowance()),
+                usable: u64::from(report.resolved_names),
+                unresolved: names.saturating_sub(u64::from(report.resolved_names)),
+                exchanges: u64::from(report.exchanges),
+                failed: u64::from(report.failed),
+                not_attempted: u64::from(report.not_attempted),
+                dropped: self.logs.dropped(),
+            },
+            &embedded[..unresolved_count],
+        );
+        self.logs.drain_sink();
     }
 
     fn bind_listener(&mut self) -> Result<TcpListener, StartupError> {
