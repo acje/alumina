@@ -555,6 +555,17 @@ impl Serving {
             return Ok(());
         }
         if ready.error {
+            let connecting_dial = upstream && self.slots[index].stage == Stage::Dialing;
+            if connecting_dial {
+                match self.upstream_connectedness(index) {
+                    ConnectState::Pending => return Ok(()),
+                    ConnectState::Failed => {
+                        self.refuse(index, BODY_502);
+                        return Ok(());
+                    }
+                    ConnectState::Connected => return self.upstream_writable(index),
+                }
+            }
             self.close_slot(index);
             return Ok(());
         }
@@ -2320,6 +2331,57 @@ mod tests {
             assert!(
                 body.starts_with(b"HTTP/1.1 200"),
                 "the completed connect already sent 200 and the failure must not inject a 502, got {:?}",
+                body
+            );
+        });
+    }
+
+    #[test]
+    fn upstream_error_readiness_during_dialing_refuses_502_not_silent_close() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let mut client = connect(port);
+            client
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("client read timeout");
+            pump(serving, 40);
+            assert_eq!(
+                serving.storage().occupied(),
+                1,
+                "the connecting client must be admitted"
+            );
+
+            let index = 0;
+            let head_len = b"CONNECT sub.example.org:443 HTTP/1.1\r\n\r\n".len();
+            {
+                let ws = &mut serving.slots[index];
+                ws.approved = FixedHostname::normalize(b"sub.example.org");
+                ws.gate.on_connect_head(head_len);
+                ws.gate.on_authorized();
+                ws.stage = Stage::Dialing;
+            }
+            serving.register_upstream(index).expect("register upstream");
+
+            let token = upstream_token(serving.slots[index].slot_gen, index);
+            serving
+                .dispatch_readiness(
+                    token,
+                    Readiness {
+                        error: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("upstream error readiness");
+
+            assert_eq!(
+                serving.storage().occupied(),
+                0,
+                "a refused dial must release the admitted seat with a 502, not a silent close"
+            );
+            let body = read_until(&mut client, b"\r\n\r\n");
+            assert!(
+                body.starts_with(b"HTTP/1.1 502"),
+                "refused dialing upstream must refuse the pre-200 502, got {:?}",
                 body
             );
         });

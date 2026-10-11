@@ -113,9 +113,11 @@ same owner into the shared-readiness `Runtime` serving loop for the process
 lifetime; an unresolved count beyond the allowance exits `EX_TEMPFAIL` (75);
 any boot/startup failure exits `EX_CONFIG` (78) with a field/source
 diagnostic. The serving-loop runtime route is exercised by host integration
-tests (mirroring `main`'s exact preallocate -> startup -> attach order) and is
-a native-Linux production obligation, not yet runtime-exercised here as the
-actual static binary under the privilege profile.
+tests (mirroring `main`'s exact preallocate -> startup -> attach order) and natively
+by `sh scripts/verify.sh e2e relay`, which rebuilds the production binary from
+the exact candidate and runs an isolated real-IO CONNECT/SNI opaque-relay gate
+against the actual static binary under the privilege profile (see
+[Checkpoint status and limitations](#checkpoint-status-and-limitations)).
 
 ## Linux startup privileges
 
@@ -208,6 +210,10 @@ cleared on execve and is not a permitted-retention mechanism.
   clippy + whitespace):
   `sh scripts/verify.sh mid foundations`
   `sh scripts/verify.sh mid boot`
+- Native CONNECT/SNI opaque-relay E2E (rebuilds the production binary from the
+  exact candidate, then runs the isolated real-IO gate against it; hard exit 0,
+  guard-bite tested):
+  `sh scripts/verify.sh e2e relay`
 - Full phase-1 boundary (sole host owner: coordinates foreground Linux MID,
   boot fixtures, source identity, doc-link and audit/deny gates — every
   missing or failed child blocks completion and returns non-zero; no
@@ -267,6 +273,13 @@ does not duplicate the aliases.
   (see Provisional protocol-parser status); wired into `main` (via
   `ServeStorage::run_startup`).
 - `scripts/verify.sh` — repo-native verification gate owner.
+- `scripts/e2e_relay.sh` — native Linux real-IO CONNECT/SNI opaque-relay gate
+  runner: network-isolated (`--network none`) container from the pinned-base
+  harness image, NNP + uid-65534 drop, foreground supervisor that reaps the
+  binary/upstream processes with real waits.
+- `scripts/e2e_relay.py` — the driver inside that container: DNS-over-TCP
+  responder, raw-echo/TLS/counting upstream fixtures, real TCP/TLS clients and
+  full-stream byte-exact + upstream-effect + distinct-timeout assertions.
 - `scripts/fixture_metadata_probe.py` — authoritative Linux-xattr metadata probe
   (mode + `security.capability` absence + sha256) used by the boot fixtures.
 - `scripts/cargo_config_probe.py` — authoritative filesystem observation of
@@ -312,14 +325,18 @@ plus the native Linux dispatch (`sh scripts/verify.sh mid foundations` and
 
 **Known limitations / not implemented (honest inventory):**
 
-- **Serving loop wired; the production binary now serves on a Serve
-  decision.** `main` preallocates the retained serving workspaces before the
-  DNS window and enters the shared-readiness `Runtime` loop, which attaches
-  the startup-opened listener and relays CONNECT/ClientHello traffic. The
-  runtime route is host-tested in-process (mirroring `main`'s exact order);
-  the actual static binary executing under the Linux privilege profile and a
-  native CONNECT/SNI opaque-relay E2E remain the native-production
-  obligation, not yet discharged.
+- **Serving loop wired; the actual static binary relays a real native
+  CONNECT/SNI tunnel.** `main` preallocates the retained serving workspaces
+  before the DNS window and enters the shared-readiness `Runtime` loop, which
+  attaches the startup-opened listener and relays CONNECT/ClientHello
+  traffic. The native production route is proven by `sh scripts/verify.sh
+  e2e relay` (guard-bite tested): a freshly rebuilt static binary, dropped to
+  uid 65534 with empty caps and NNP, in a fully network-isolated
+  (`--network none`) container drives an authentic TLS 1.3 reverse-echo
+  round-trip through an allowlisted matching-SNI tunnel, byte-exact
+  fragmented/coalesced/partial/FIN/4 MiB echoed streams, and the negative
+  vector (disallowed CONNECT 403, SNI mismatch/ECH/malformed hello rejected
+  with zero forwarded bytes, dial-refused 502 pre-hello).
 - **No post-startup DNS refresh.** The startup window resolves the allowlist
   once; schedule-driven refresh/retirement/alternation is implemented in
   `schedule.rs`/`worker.rs` and the shared-registration seam exists in
@@ -333,12 +350,13 @@ plus the native Linux dispatch (`sh scripts/verify.sh mid foundations` and
   stop path yet.
 - **Native Linux proofs are scoped, not blanket.** Recorded native evidence is
   confined to the exact candidate it ran against: `mid foundations`/`mid boot`
-  (static ELF + whitespace gates) and the 8 MiB main-thread accept/reset stack
-  run, all on the pinned rust image. Still pending for the production candidate:
-  the production-profile allocator witness, the actual static binary under the
-  privilege profile, and the native CONNECT/SNI opaque-relay E2E. No claim of
-  those pending gates is made; the M2 main-thread run does not itself cover
-  CONNECT+ClientHello inspection frame qualification.
+  (static ELF + whitespace gates), the 8 MiB main-thread accept/reset stack
+  run, and `e2e relay` (real static binary under the privilege profile: TLS 1.3
+  matching-SNI relay + byte-conservation + negative/effect proofs), all on the
+  pinned rust image lineage. Still pending for the production candidate: the
+  production-profile allocator witness, post-build harness/gh-report
+  assessment, and the E2E scope's remaining native profiles. No claim of those
+  pending gates is made.
 - **`scripts/verify.sh` phase-1 harness is stale** relative to the now-serving
   startup path (`fixtures boot` positive banner; `boundary phase1`
   NotImplemented lines) as documented above; the phase-1 boundary remains

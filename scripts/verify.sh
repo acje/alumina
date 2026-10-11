@@ -757,11 +757,116 @@ boundary_phase1() {
     echo "FINAL-PHASE1-COMPLETION: BLOCKED — pending fixture/doc/Rust repairs and review approval before any phase1 done-claim (no E2E equivalence claimed)"
 }
 
+# Real-IO CONNECT/SNI opaque-relay gate against the ACTUAL production binary
+# rebuilt from the exact current source (never a stale artifact): native Linux
+# release build (or container dispatch on a non-Linux host), then
+# scripts/e2e_relay.sh runs it in a fully network-isolated container. The
+# source/binary identity receipt is mandatory so the executed artifact is tied
+# to the reviewed candidate, and every e2e case must exit hard zero.
+e2e_relay() {
+    ROOT="$(pwd)"
+    # R1: the artifact PROFILE is explicitly observed from the build owner (the
+    # native host triple under which the release build actually runs), not
+    # guessed from --target-dir. The identical triple is carried into the cargo
+    # build AND into the artifact consumer path, so the executed binary is the
+    # one Cargo just produced - a stale default-path artifact can never be
+    # consumed. On the non-Linux dispatch route the triple is observed inside
+    # the same rust image that performs the build.
+    # N1: observe the build-owner native profile with the PRODUCER's own exit
+    # checked before any parsing. stdout/stderr are captured together so a
+    # failing producer (even one that wrote a plausible host line) is never
+    # masked by a later filter's exit 0, and the reason is not swallowed by
+    # 2>/dev/null. Parsing (`sed 's/^host: //p'`) runs only on the captured
+    # buffer of an exit-0 producer.
+    observe_build_target() {
+        _probe_out="$("$@" 2>&1)" || _probe_rc=$?
+        if [ "${_probe_rc:-0}" -ne 0 ]; then
+            printf 'E2E-RELAY-BLOCKED: build target probe failed before parse (exit %s):\n%s\n' \
+                "$_probe_rc" "$_probe_out" >&2
+            exit 1
+        fi
+        printf '%s\n' "$_probe_out"
+    }
+    if [ "$(uname -s)" = "Linux" ]; then
+        _probe_buf=$(observe_build_target rustc +${TOOLCHAIN} -vV) || exit 1
+    else
+        _probe_buf=$(observe_build_target \
+            podman --connection "${PODMAN_CONNECTION:-flock-vm}" run --rm --pull=never \
+            docker.io/library/rust@sha256:484dce463db97ee3b9c3dbeb82ac48408091573ec2da1ce9ccd84c823642779a \
+            sh -c 'rustc -vV') || exit 1
+    fi
+    # parse only from the successfully captured buffer (producer exit already 0)
+    E2E_TARGET=$(printf '%s\n' "$_probe_buf" | sed -n 's/^host: //p')
+    case "$E2E_TARGET" in
+        "" | *$'\n'* | *" "*)
+            echo "E2E-RELAY-BLOCKED: could not observe native build target profile ('${E2E_TARGET}')" >&2
+            exit 1
+            ;;
+    esac
+    export E2E_TARGET
+    TGT="$ROOT/target"
+    BIN="target/${E2E_TARGET}/release/alumina"
+    closure_metadata
+    # Pre-build source-input stability record: the diff producer exit is
+    # checked SEPARATELY (never a masked pipeline -- a failing `git diff` must
+    # fail the receipt, not be swallowed by a successful hasher), and the
+    # untracked harness scripts are hashed explicitly (git diff excludes them).
+    before_status() {
+        rcd=0
+        git diff HEAD >"$TGT/e2e-diff.$$" 2>&1 || rcd=$?
+        [ "$rcd" -eq 0 ] || {
+            echo "E2E-RELAY-BLOCKED: git diff HEAD exit $rcd (unreadable diff, not a receipt)" >&2
+            exit 1
+        }
+        diffhash=$(sha256_digest file "$TGT/e2e-diff.$$") || exit 1
+        harness1=$(sha256_digest file "scripts/e2e_relay.py") || exit 1
+        harness2=$(sha256_digest file "scripts/e2e_relay.sh") || exit 1
+        shellhash=$(sha256_digest file "scripts/verify.sh") || exit 1
+        printf '%s %s %s %s %s\n' "$(git rev-parse --verify HEAD 2>/dev/null || true)" \
+            "$diffhash" "$harness1" "$harness2" "$shellhash"
+    }
+    mkdir -p "$TGT"
+    before=$(before_status)
+    if [ "$(uname -s)" = "Linux" ]; then
+        echo "PRODUCTION-RELEASE-BUILD (native Linux, exact current source, target=${E2E_TARGET}):"
+        cargo +${TOOLCHAIN} build --locked --release --target "$E2E_TARGET" --target-dir "$TGT"
+    else
+        echo "PRODUCTION-RELEASE-BUILD (native Linux via container dispatch; host $(uname -s), target=${E2E_TARGET}):"
+        linux_dispatch "cargo +1.99.0 build --locked --release --target ${E2E_TARGET} --target-dir /app/target"
+    fi
+    after=$(before_status)
+    # Pre/post build source-input stability: the candidate inputs (HEAD +
+    # dirty diff + untracked harness + gate script) must be unchanged across
+    # the build, or a mid-build source change would detach the receipt from the
+    # executed binary.
+    if [ "$before" != "$after" ]; then
+        echo "E2E-RELAY-BLOCKED: source inputs changed during the build (receipt would not correspond)" >&2
+        echo "  before=$before" >&2
+        echo "  after =$after" >&2
+        exit 1
+    fi
+    [ -x "$ROOT/$BIN" ] || {
+        echo "E2E-RELAY-BLOCKED: production static binary missing after rebuild ($BIN for target $E2E_TARGET)" >&2
+        exit 1
+    }
+    echo "e2e/relay identity (executed binary tied to exact candidate):"
+    head=$(git rev-parse --verify HEAD 2>&1) || {
+        echo "E2E-RELAY-BLOCKED: git rev-parse HEAD failed" >&2
+        exit 1
+    }
+    binhash=$(sha256_digest file "$ROOT/$BIN") || exit 1
+    printf '  HEAD=%s target=%s dirty-diff-sha256=%s harness-py-sha256=%s harness-sh-sha256=%s binary-sha256=%s\n' \
+        "$head" "$E2E_TARGET" "$(printf '%s' "$after" | cut -d' ' -f2)" \
+        "$(printf '%s' "$after" | cut -d' ' -f3)" "$(printf '%s' "$after" | cut -d' ' -f4)" "$binhash"
+    sh scripts/e2e_relay.sh
+}
+
 case "$TIER/$SCOPE" in
     mid/foundations) mid_foundations ;;
     mid/boot) mid_boot ;;
     fixtures/boot) boot_fixtures ;;
     boundary/phase1) boundary_phase1 ;;
+    e2e/relay) e2e_relay ;;
     docs/*) docslink_check ;;
     *) usage ;;
 esac
