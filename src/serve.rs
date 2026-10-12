@@ -51,11 +51,14 @@ pub enum ServingMode {
 
 /// The terminal startup-readiness decision from the canonical rule
 /// (alumina.md:65): open the listener when the unresolved count is at most the
-/// configured allowance, else exit with status 75.
+/// configured allowance, else exit with status 75; a first-observed SIGTERM
+/// short-circuits the window as [`Self::Terminated`], which never binds or
+/// attaches a listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupDecision {
     Serve(ServingMode),
     Exit75 { unresolved: u32 },
+    Terminated,
 }
 
 /// The outcome of the boot-owned startup window: the readiness decision, the
@@ -175,9 +178,20 @@ impl ServeStorage {
         &self.cache
     }
 
+    /// The retained parsed configuration, read-only.
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// The retained refresh schedules, read-only.
     pub fn schedules(&self) -> &Schedules {
         &self.schedules
+    }
+
+    /// The retained refresh schedules, mutable for the owner's startup
+    /// selection and backoff bookkeeping.
+    pub(crate) fn schedules_mut(&mut self) -> &mut Schedules {
+        &mut self.schedules
     }
 
     /// The retained DNS transport with its fixed response workspace.
@@ -252,6 +266,15 @@ impl ServeStorage {
             .dns
             .advance_exchange(fqdn, &mut self.cache, &mut self.schedules)?;
         Ok(Some(result))
+    }
+
+    /// Emits the single per-window `startup_warning` for the first counted
+    /// exchange failure, looking the name up from the allowlist internally so
+    /// a shared owner never holds a config borrow across a log mutation.
+    pub(crate) fn startup_warning_first(&mut self, secs: u64, ordinal: usize, family: Family) {
+        if let Some(name) = self.config.allowlist().get(ordinal) {
+            self.logs.startup_warning(secs, name.as_str(), family);
+        }
     }
 
     /// Starts a cooperative DNS exchange on the retained transport for the
@@ -445,11 +468,31 @@ impl ServeStorage {
             },
             &mut self.logs,
         )?;
+        self.settle_startup(now0, report, decision_seconds, false)
+    }
+
+    /// Mounts the window clock, applies the readiness decision (or the typed
+    /// terminated outcome when the owner observed a first SIGTERM during the
+    /// window), binds the listener only for a serving decision, and emits the
+    /// single startup record. Shared by the blocking storage seam and the
+    /// shared-owner window so both produce the identical typed report and
+    /// listener rules.
+    pub(crate) fn settle_startup(
+        &mut self,
+        now0: u64,
+        report: StartupReport,
+        decision_seconds: u64,
+        terminated: bool,
+    ) -> Result<StartupOutcome, StartupError> {
         self.mount_clock(self.dns.window_start(), now0);
-        let decision = self.startup_decision(now0 + decision_seconds)?;
+        let decision = if terminated {
+            StartupDecision::Terminated
+        } else {
+            self.startup_decision(now0 + decision_seconds)?
+        };
         let listener = match decision {
             StartupDecision::Serve(_) => Some(self.bind_listener()?),
-            StartupDecision::Exit75 { .. } => None,
+            StartupDecision::Exit75 { .. } | StartupDecision::Terminated => None,
         };
         self.emit_startup_records(now0 + decision_seconds, &report, decision);
         Ok(StartupOutcome {
@@ -482,6 +525,7 @@ impl ServeStorage {
             StartupDecision::Serve(ServingMode::Full) => StartupStatus::Full,
             StartupDecision::Serve(ServingMode::Degraded) => StartupStatus::Degraded,
             StartupDecision::Exit75 { .. } => StartupStatus::Failed,
+            StartupDecision::Terminated => StartupStatus::Terminated,
         };
         let mut embedded = [StartupUnresolved {
             ordinal: 0,
@@ -808,9 +852,6 @@ mod tests {
         let mut storage = booted(1, 0);
         const DNS_EPOCH: u64 = 1_700_000_000;
         storage.mount_clock(Instant::now(), DNS_EPOCH);
-        // Entry is Fresh on the DNS scale at the accept instant and Stale a
-        // second later (TTL 1); a zero-anchored clock would see it as
-        // permanently Fresh forever (1cws M2r/w6xo witness).
         publish_a(&mut storage.cache, 0, DNS_EPOCH + 1, 1);
         let t0 = Instant::now();
         let slot = storage.accept(t0).expect("admitted");

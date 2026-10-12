@@ -10,8 +10,9 @@ window that resolves the allowlist within the 90 s window — and the serving
 runtime increment: one cooperative/shared-readiness owner continues that same
 startup listener/cache/clock into actual CONNECT/ClientHello gate relay on a
 serving decision, with the retained serving workspaces preallocated before
-the DNS window. Logging, schedule-driven DNS refresh, SIGTERM shutdown, and
-deployment remain later slices and are **not** implemented. See
+the DNS window. Schedule-driven DNS refresh and deployment remain later
+slices and are **not** implemented; the bounded log queue and SIGTERM
+shutdown are implemented below. See
 [Checkpoint status and limitations](#checkpoint-status-and-limitations).
 
 Alongside the boot scaffold, the **protocol-serving parsers** are present as
@@ -48,9 +49,11 @@ fault-injection script, or fuzz corpus; the startup-DNS transport (below) is
 the one component with independent review and native Linux proof to date. No
 product-wide zero-alloc claim is made.
 
-The `getrandom` 0.3.4 dependency intake is complete (recorded in bead
-`alumina-zjwk`, duplicate `alumina-z50j` closed; `build.rs` source-reviewed
-benign; `cargo deny check advisories` and `cargo audit` clean), and the
+The `getrandom` 0.4.3 dependency intake is complete (recorded in bead
+`alumina-1xom` from the prior `alumina-zjwk` 0.3.4 closure; published
+tarball `build.rs` source-reviewed benign — a strict subset of the cleared
+0.3.4 build script; `cargo deny check` and `cargo audit` clean, 0.4.3
+non-yanked), and the
 startup-DNS transport draft now carries focused actual-DNS runtime tests
 (success incl. AAAA, mismatched-TID rejection, fragmented partial reads,
 exchange timeout and deadline reconnect, token-generation exhaustion, plus
@@ -116,7 +119,10 @@ diagnostic. The serving-loop runtime route is exercised by host integration
 tests (mirroring `main`'s exact preallocate -> startup -> attach order) and natively
 by `sh scripts/verify.sh e2e relay`, which rebuilds the production binary from
 the exact candidate and runs an isolated real-IO CONNECT/SNI opaque-relay gate
-against the actual static binary under the privilege profile (see
+against the actual static binary under the privilege profile; the native
+SIGTERM shutdown path is proven the same way by `sh scripts/verify.sh
+e2e shutdown`, which sends real SIGTERM into the boot-armed self-pipe and
+records exit 0 on a clean drain vs deadline-forced exit 70 (see
 [Checkpoint status and limitations](#checkpoint-status-and-limitations)).
 
 ## Linux startup privileges
@@ -342,20 +348,52 @@ plus the native Linux dispatch (`sh scripts/verify.sh mid foundations` and
   `schedule.rs`/`worker.rs` and the shared-registration seam exists in
   `runtime.rs`/`startup_dns.rs`, but no schedule-driven post-boot refresh
   driver is wired.
-- **No structured logging queue.** The canonical 256 x 8 KiB alloc-free log
-  queue is reserved in the inventory (reserved-future) but not allocated or
-  implemented; `main` uses `print!`/`eprintln!` diagnostics only.
-- **No SIGTERM handler.** No signal code exists under `src/`; the canonical
-  8 s grace shutdown is not implemented, so the serving loop has no graceful
-  stop path yet.
+- **Bounded allocation-free log queue.** The canonical 256 × 8 KiB alloc-free
+  log queue is allocated at boot and wired to nonblocking fd-1/drain in setup;
+  `main` routes startup/shutdown records through it and reserves
+  `print!`/`eprintln!` for the earliest boot-only diagnostics. Schedule-driven
+  refresh/retirement/alternation itself remains a later slice: the startup
+  window resolves the allowlist once and no post-boot refresh driver is
+  wired.
+- **SIGTERM graceful shutdown wired and natively proven.** A boot-armed
+  safe self-pipe (`signal_hook::low_level::pipe`) carries SIGTERM into the
+  single serving poll; a first observation permanently stops admission,
+  closes pending setups, cancels the retained DNS transport and fixes a
+  monotonic 8 s shutdown deadline (repeat signals never extend it). A clean
+  drain (all slots empty) exits 0; a deadline-forced closure exits
+  `EX_SOFTWARE` (70). The shared startup window runs over that same poll, so
+  a pre-serving SIGTERM is acted on mid-window as the typed terminated
+  outcome (no listener is ever bound) rather than deferred to a later full
+  serving phase. Proven by host tests (`--features alloc-witness`
+  includes `sigterm_shutdown_path_spends_zero_allocations` driven through
+  `Runtime::turn`) and natively by `sh scripts/verify.sh e2e shutdown` (real
+  static binary, uid 65534, empty caps, `--network none`): idle wake,
+  no-self-exit, pre-serving signal against a fully silent resolver with
+  interval-wide no-bind, startup retry-backoff storm, signal while the final
+  allowlist answer is held (no bind at the settlement boundary),
+  established-relay
+  early drain, stalled relay + repeat-SIGTERM monotonic deadline, stalled
+  stdout in an exactly-full 4 KiB pipe (single-byte EAGAIN proof), and
+  silent-DNS no-refresh (a dead resolver
+  cannot delay a drain that never contacts it — the startup transport is
+  concluded and no post-startup refresh is admitted). A SIGTERM that
+  interrupts an idle poll is retried, never fatal (mio does not retry EINTR
+  itself).
 - **Native Linux proofs are scoped, not blanket.** Recorded native evidence is
   confined to the exact candidate it ran against: `mid foundations`/`mid boot`
   (static ELF + whitespace gates), the 8 MiB main-thread accept/reset stack
-  run, and `e2e relay` (real static binary under the privilege profile: TLS 1.3
-  matching-SNI relay + byte-conservation + negative/effect proofs), all on the
-  pinned rust image lineage. Still pending for the production candidate: the
-  production-profile allocator witness, post-build harness/gh-report
-  assessment, and the E2E scope's remaining native profiles. No claim of those
+  run, `e2e relay` (real static binary under the privilege profile: TLS 1.3
+  matching-SNI relay + byte-conservation + negative/effect proofs), and
+  `e2e shutdown` (real   static binary: SIGTERM self-pipe drain, pre-serving
+  silent-resolver no-bind, startup retry-backoff storm, signal-during-held-answer
+  no-bind (the one-poll same-batch DNS+signal property is proven by the
+  native private-owner Rust witness), monotonic forced-closure deadline,
+  repeat-signal
+  non-extension, stalled-stdout and silent-DNS no-refresh), all on the
+  pinned rust image lineage, plus the
+  native `aarch64-unknown-linux-musl` allocator-witness shutdown test.
+  Still pending for the production candidate: post-build harness/gh-report
+  assessment and the E2E scope's remaining native profiles. No claim of those
   pending gates is made.
 - **`scripts/verify.sh` phase-1 harness is stale** relative to the now-serving
   startup path (`fixtures boot` positive banner; `boundary phase1`

@@ -32,20 +32,29 @@
 use std::io;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+#[cfg(test)]
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token};
 
+use signal_hook::consts::SIGTERM;
+
+use crate::cache::{CacheError, Family};
 use crate::client_hello::{self, ChInspector, Inspect};
 use crate::config::FixedHostname;
 use crate::connect::{ConnectParser, Feed};
 use crate::eligibility::NumericAddr;
 use crate::gate::{Activity, TunnelGate, UpstreamWrite, ValidatedHello};
 use crate::log::{ActivityKind, RejectReason};
-use crate::serve::ServeStorage;
-use crate::startup_dns::StartupDnsError;
+use crate::serve::{ServeStorage, StartupError, StartupOutcome};
+use crate::startup_dns::{
+    EXCHANGE_DEADLINE_SECS, FailureReason, PublishedKind, StartupDnsError, TurnResult, WindowLedger,
+};
 use crate::worker::{AttemptCounts, ConnectPhase, MAX_TUNNELS, SlotIndex, TunnelIndex};
 
 /// The listener registration token.
@@ -72,6 +81,11 @@ const IDLE_SECS: Duration = Duration::from_secs(300);
 /// (alumina.md:191; RF-003); the slot closes at both-EOF-drained or here.
 const DRAIN_SECS: Duration = Duration::from_secs(5);
 
+/// The fixed shutdown grace from the first observed SIGTERM: establish-alone
+/// drains close their tunnels under this deadline, forced closure after is a
+/// failure (alumina.md:181,220; oracle b3nx B12/B16).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
+
 /// Bounded re-arm backoff after a transient accept failure (e.g. EMFILE).
 /// No canonical capacity number is invented; this only stops a hot re-arm loop
 /// (xz3f N6; alumina-refinement.md factual note).
@@ -96,11 +110,67 @@ const UPSTREAM_BASE: usize = MAX_TUNNELS + 1;
 /// never a slot.
 const DNS_LOCAL: usize = UPSTREAM_BASE + MAX_TUNNELS;
 
+/// The SIGTERM self-pipe source token: the next free local id after the DNS
+/// source, dispatched as a benign readiness flag that wakes the single poll
+/// so a handler-only route could never start the shutdown grace on an idle
+/// loop (oracle b3nx B18).
+const SIGNAL_LOCAL: usize = DNS_LOCAL + 1;
+
 /// Token layout: low 9 bits = local id (1..=MAX_TUNNELS client,
 /// `UPSTREAM_BASE..` upstream, 0 = listener), high bits = slot generation so a
 /// stale event for a reused slot index is dropped before touching a socket.
+/// The local id space also carries the reserved readiness sources `DNS_LOCAL`
+/// and `SIGNAL_LOCAL`, both below `LOCAL_MASK`.
 const LOCAL_MASK: usize = 0x1ff;
 const GEN_SHIFT: usize = 9;
+
+/// The owner's shutdown phase. `Serving` is ordinary operation; once the
+/// first SIGTERM is observed the owner stops admission, closes pending
+/// setups, cancels the retained DNS transport and drains established tunnels
+/// under the fixed monotonic [`SHUTDOWN_GRACE`] from that first observation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shutdown {
+    Serving,
+    Draining { deadline: Instant },
+}
+
+/// The typed process exit decision once shutdown settles: a clean drain of
+/// every established tunnel exits 0; a deadline-forced closure of remaining
+/// sockets is a failure and exits `EX_SOFTWARE` (70) (alumina.md:220).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ShutdownExit {
+    Drained,
+    Forced,
+}
+
+impl ShutdownExit {
+    pub(crate) fn code(self) -> i32 {
+        match self {
+            ShutdownExit::Drained => 0,
+            ShutdownExit::Forced => 70,
+        }
+    }
+
+    /// The typed drain outcome carried by the single shutdown record, so a
+    /// deadline-forced closure is never silently lost to the exit that follows.
+    pub(crate) fn status(self) -> crate::log::ShutdownStatus {
+        match self {
+            ShutdownExit::Drained => crate::log::ShutdownStatus::Drained,
+            ShutdownExit::Forced => crate::log::ShutdownStatus::Forced,
+        }
+    }
+}
+
+/// The counted-exchange tallies of one startup window, accumulated by the
+/// cooperative shared owner exactly as the private driver does: published
+/// exchanges, counted failures, and the first failure's name ordinal and
+/// family (for the single `startup_warning`).
+#[derive(Default)]
+struct StartupTallies {
+    exchanges: u32,
+    failed: u32,
+    first_failure: Option<(u16, Family)>,
+}
 
 const BODY_200: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 const BODY_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n";
@@ -378,7 +448,20 @@ pub struct Serving {
     events: Events,
     listener_pause_until: Option<Instant>,
     dns_event: bool,
+    shutdown: Shutdown,
+    signal_rx: Option<UnixStream>,
+    _signal_registration: Option<signal_hook::SigId>,
+    signal_read_error: Option<io::ErrorKind>,
+    #[cfg(test)]
+    test_signal_wake: Option<UnixStream>,
+    #[cfg(test)]
+    pre_settlement: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    pre_poll: Option<PrePollHook>,
 }
+
+#[cfg(test)]
+type PrePollHook = Rc<dyn Fn(&Serving)>;
 
 impl Serving {
     /// Builds the loop's retained serving workspaces over boot-completed
@@ -392,9 +475,17 @@ impl Serving {
     /// window opens ([`Self::attach_listener`] registers the listener that
     /// later opens).
     ///
+    /// The SIGTERM lifecycle source is armed here too, before the startup DNS
+    /// window: [`signal_hook::low_level::pipe::register`] installs the safe
+    /// self-pipe write action and the read end joins the single serving poll,
+    /// so a signal can never be lost to a boot step that runs after serving
+    /// construction. The `SigId` and read end are retained for the owner's
+    /// lifetime and dropped only at (or after) process exit.
+    ///
     /// # Errors
     ///
-    /// Returns a serve error when the poll cannot be created.
+    /// Returns a serve error when the poll cannot be created or the SIGTERM
+    /// self-pipe source cannot be set up or registered.
     pub(crate) fn preallocate(
         storage: ServeStorage,
         traffic: crate::inventory::TrafficStorage,
@@ -408,7 +499,8 @@ impl Serving {
                 SlotWorkspace::with_traffic(up, down)
             })
             .collect();
-        Ok(Serving {
+        let (signal_rx, _signal_registration, _test_wake) = Self::create_signal_source()?;
+        let mut serving = Serving {
             poll,
             storage,
             listener: None,
@@ -416,7 +508,70 @@ impl Serving {
             events: Events::with_capacity(MAX_OPS * 4),
             listener_pause_until: None,
             dns_event: false,
-        })
+            shutdown: Shutdown::Serving,
+            signal_rx: Some(signal_rx),
+            _signal_registration: Some(_signal_registration),
+            signal_read_error: None,
+            #[cfg(test)]
+            test_signal_wake: _test_wake,
+            #[cfg(test)]
+            pre_settlement: None,
+            #[cfg(test)]
+            pre_poll: None,
+        };
+        serving.register_signal_source()?;
+        Ok(serving)
+    }
+
+    /// Creates the retained SIGTERM self-pipe: a connected socket pair whose
+    /// write end is registered with the safe signal-hook action and whose read
+    /// end is returned for registration on the single serving poll. The write
+    /// action and the read end are both retained until process exit. A test
+    /// build additionally retains a clone of the write end ([`Self`]'s
+    /// `test_signal_wake`) so an alloc-witness can drive the exact pipe event
+    /// the signal handler would write, without delivering a process-wide
+    /// SIGTERM to parallel-running host tests (the native E2E gates exercise
+    /// real OS signal delivery against the binary).
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the socket pair cannot be created, made
+    /// nonblocking, or the signal action cannot be registered.
+    fn create_signal_source()
+    -> Result<(UnixStream, signal_hook::SigId, Option<UnixStream>), ServeError> {
+        let (rx, tx) = UnixStream::pair()?;
+        rx.set_nonblocking(true)?;
+        #[cfg(test)]
+        let test_wake = tx.try_clone().ok();
+        let sigid = signal_hook::low_level::pipe::register(SIGTERM, tx)?;
+        Ok((rx, sigid, {
+            #[cfg(test)]
+            {
+                test_wake
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        }))
+    }
+
+    /// Registers the retained SIGTERM read end on the single serving poll so
+    /// the idle wait wakes on a signal, mirroring the DNS readiness source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the external fd registration fails.
+    fn register_signal_source(&mut self) -> Result<(), ServeError> {
+        let Some(rx) = self.signal_rx.as_ref() else {
+            return Ok(());
+        };
+        let fd = rx.as_raw_fd();
+        let mut source = mio::unix::SourceFd(&fd);
+        self.poll
+            .registry()
+            .register(&mut source, Self::signal_token(), Interest::READABLE)?;
+        Ok(())
     }
 
     /// Registers the startup-bound listener on the serving poll, completing
@@ -475,6 +630,23 @@ impl Serving {
         Token(DNS_LOCAL)
     }
 
+    /// The fixed token the retained SIGTERM self-pipe read end is attached
+    /// under on this registry.
+    pub const fn signal_token() -> Token {
+        Token(SIGNAL_LOCAL)
+    }
+
+    /// The owner's shutdown phase, for host tests inspecting lifecycle state.
+    pub fn shutdown(&self) -> Shutdown {
+        self.shutdown
+    }
+
+    /// Whether the owner has entered shutdown: admission is stopped, pending
+    /// setups are closed and established tunnels drain under the fixed grace.
+    pub(crate) fn is_shutdown(&self) -> bool {
+        matches!(self.shutdown, Shutdown::Draining { .. })
+    }
+
     /// Whether a DNS freshness event was observed since the last query, so the
     /// shared owner decides when to advance the cooperative exchange.
     pub fn take_dns_event(&mut self) -> bool {
@@ -522,20 +694,230 @@ impl Serving {
     /// after a paused accept fails.
     pub fn run_once(&mut self, timeout: Option<Duration>) -> Result<(), ServeError> {
         self.resume_listener(Instant::now())?;
-        let effective = match (self.poll_timeout(), timeout) {
-            (Some(d), Some(t)) => Some(d.min(t)),
-            (Some(d), None) => Some(d),
-            (None, t) => t,
-        };
         let mut batch = std::mem::replace(&mut self.events, Events::with_capacity(0));
-        self.poll.poll(&mut batch, effective)?;
+        loop {
+            let effective = match (self.poll_timeout(), timeout) {
+                (Some(d), Some(t)) => Some(d.min(t)),
+                (Some(d), None) => Some(d),
+                (None, t) => t,
+            };
+            match self.poll.poll(&mut batch, effective) {
+                Ok(()) => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
         let now = Instant::now();
+        if batch
+            .iter()
+            .any(|event| event.token().0 & LOCAL_MASK == SIGNAL_LOCAL)
+        {
+            self.on_sigterm()?;
+        }
         self.expire_sweep(now);
         for event in batch.iter() {
+            if event.token().0 & LOCAL_MASK == SIGNAL_LOCAL {
+                continue;
+            }
             self.dispatch(event)?;
         }
         self.events = batch;
         Ok(())
+    }
+
+    /// Drives the startup DNS window cooperatively over the single serving
+    /// poll. The retained DNS transport is attached to the serving poll
+    /// *before* selection starts, so the boot-armed poll carries the SIGTERM
+    /// self-pipe, DNS freshness, and the listener together: a first-observed
+    /// SIGTERM during the window is seen within one bounded poll instead of
+    /// being invisible for the window's full duration, and it settles as the
+    /// typed terminated outcome that never binds a listener. Each iteration
+    /// advances the in-flight cooperative exchange, selects the next due step
+    /// only while idle, and folds a single bounded wait over the serving poll
+    /// (signal priority is handled inside [`Self::run_once`]).
+    pub(crate) fn run_startup_window(
+        &mut self,
+        nameserver: SocketAddr,
+        now0: u64,
+        window: Duration,
+    ) -> Result<StartupOutcome, StartupError> {
+        self.attach_dns_shared().map_err(|err| {
+            StartupError::Dns(StartupDnsError::Transport {
+                kind: err.kind,
+                detail: "shared",
+            })
+        })?;
+        let window_deadline = self
+            .storage
+            .dns_mut()
+            .begin_window(nameserver, now0, window)?;
+        let names = self.storage.config().allowlist().len();
+        for ordinal in 0..names {
+            for family in Family::ALL {
+                self.storage
+                    .schedules_mut()
+                    .overwrite_due_at(ordinal, family, now0)
+                    .map_err(StartupDnsError::from)?;
+            }
+        }
+        let mut ledger = WindowLedger::new(names);
+        let mut tallies = StartupTallies::default();
+        let mut terminated = false;
+        loop {
+            if self.is_shutdown() {
+                terminated = true;
+                break;
+            }
+            if ledger.all_resolved() {
+                break;
+            }
+            if Instant::now() >= window_deadline {
+                break;
+            }
+            if let Some((ordinal, ex_family)) = self.storage.dns().active_identity() {
+                match self.storage.advance_dns()? {
+                    None => {}
+                    Some(TurnResult::Pending) => {}
+                    Some(TurnResult::Published) => {
+                        tallies.exchanges += 1;
+                        let kind = self
+                            .storage
+                            .dns_mut()
+                            .take_published_kind()
+                            .unwrap_or(PublishedKind::ResolvedPositive);
+                        let name_index = self
+                            .storage
+                            .cache()
+                            .name_index(ordinal)
+                            .ok_or(StartupDnsError::Cache(CacheError::NameOutOfRange))?;
+                        let has = !self
+                            .storage
+                            .cache()
+                            .entry(name_index, ex_family)?
+                            .bindings()
+                            .is_empty();
+                        ledger.mark_published(ordinal, kind);
+                        ledger.resolve(ordinal, has);
+                    }
+                    Some(TurnResult::Failed) => {
+                        tallies.failed += 1;
+                        if tallies.first_failure.is_none() {
+                            tallies.first_failure = Some((ordinal as u16, ex_family));
+                            let now = self.storage.dns().now_u64();
+                            self.storage.startup_warning_first(now, ordinal, ex_family);
+                        }
+                        let reason = self
+                            .storage
+                            .dns_mut()
+                            .take_failed_reason()
+                            .unwrap_or(FailureReason::Receive);
+                        ledger.mark_failed(ordinal, reason);
+                    }
+                }
+            }
+            if !self.storage.dns().has_active_exchange() {
+                let secs = self.storage.dns().now_u64();
+                let selected = self
+                    .storage
+                    .schedules_mut()
+                    .select_due(secs)
+                    .map_err(StartupDnsError::from)?;
+                if let Some(token) = selected {
+                    let ordinal = token.name();
+                    let family = token.family();
+                    if ledger.is_resolved(ordinal) {
+                        self.storage
+                            .schedules_mut()
+                            .release_selection(ordinal, family)
+                            .map_err(StartupDnsError::from)?;
+                        continue;
+                    }
+                    let remaining = window_deadline.saturating_duration_since(Instant::now());
+                    let deadline =
+                        Instant::now() + Duration::from_secs(EXCHANGE_DEADLINE_SECS).min(remaining);
+                    ledger.track_attempt(ordinal, family);
+                    self.storage
+                        .start_dns_exchange(nameserver, ordinal, family, deadline)?;
+                    continue;
+                }
+            }
+
+            self.sync_dns_shared().map_err(|err| {
+                StartupError::Dns(StartupDnsError::Transport {
+                    kind: err.kind,
+                    detail: "shared",
+                })
+            })?;
+            if self.is_shutdown() {
+                terminated = true;
+                break;
+            }
+            let now_i = Instant::now();
+            let remaining = window_deadline.saturating_duration_since(now_i);
+            let exchange_wait = self
+                .storage
+                .dns()
+                .exchange_deadline()
+                .map(|d| d.saturating_duration_since(Instant::now()));
+            let dns_wait = match exchange_wait {
+                Some(exchange_wait) => exchange_wait.min(remaining),
+                None => self
+                    .storage
+                    .dns()
+                    .next_due_wait(self.storage.schedules(), &ledger)?
+                    .min(remaining),
+            };
+            let log_wait = self
+                .storage
+                .logs()
+                .next_drain(now_i)
+                .map(|retry| retry.saturating_duration_since(Instant::now()));
+            let wait = match log_wait {
+                Some(log_wait) => dns_wait.min(log_wait),
+                None => dns_wait,
+            };
+            self.storage.logs_mut().drain_sink();
+            #[cfg(test)]
+            if let Some(hook) = self.pre_poll.as_ref() {
+                (hook.as_ref())(self);
+            }
+            self.run_once(Some(wait)).map_err(|err| {
+                StartupError::Dns(StartupDnsError::Transport {
+                    kind: err.kind,
+                    detail: "startup-serve",
+                })
+            })?;
+        }
+        if !terminated {
+            #[cfg(test)]
+            if let Some(hook) = self.pre_settlement.take() {
+                hook();
+            }
+            self.run_once(Some(Duration::ZERO)).map_err(|err| {
+                StartupError::Dns(StartupDnsError::Transport {
+                    kind: err.kind,
+                    detail: "startup-settle",
+                })
+            })?;
+            terminated = self.is_shutdown();
+        }
+        if terminated {
+            self.storage.dns_mut().cancel_for_shutdown();
+        }
+        self.sync_dns_shared().map_err(|err| {
+            StartupError::Dns(StartupDnsError::Transport {
+                kind: err.kind,
+                detail: "shared",
+            })
+        })?;
+        let elapsed = self.storage.dns().window_start().elapsed().as_secs();
+        self.storage.dns_mut().conclude_shared_transport()?;
+        self.storage.settle_startup(
+            now0,
+            ledger.finish(tallies.exchanges, tallies.failed, tallies.first_failure),
+            elapsed,
+            terminated,
+        )
     }
 
     /// Re-arms an accept-paused listener once its backoff has elapsed, so a
@@ -573,6 +955,9 @@ impl Serving {
         if local == DNS_LOCAL {
             self.dns_event = true;
             return Ok(());
+        }
+        if local == SIGNAL_LOCAL {
+            return self.on_sigterm();
         }
         let event_gen = (raw >> GEN_SHIFT) as u64;
         let upstream = local >= UPSTREAM_BASE;
@@ -620,6 +1005,199 @@ impl Serving {
         Ok(())
     }
 
+    /// Processes one SIGTERM observation: drains the retained self-pipe
+    /// (bounded nonblocking reads), and on the first observation permanently
+    /// stops admission, closes pending setups, cancels the retained DNS
+    /// transport and fixes the monotonic shutdown deadline; every later
+    /// observation only re-wakes the poll and never moves the deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the listener deregistration fails.
+    pub(crate) fn on_sigterm(&mut self) -> Result<(), ServeError> {
+        self.drain_signal_pipe();
+        if !matches!(self.shutdown, Shutdown::Serving) {
+            return Ok(());
+        }
+        let now = Instant::now();
+        self.shutdown = Shutdown::Draining {
+            deadline: now + SHUTDOWN_GRACE,
+        };
+        self.stop_admission()?;
+        self.close_pending_setups();
+        self.cancel_dns_transport();
+        Ok(())
+    }
+
+    /// Test-only writable handle to the SIGTERM self-pipe: writing one byte
+    /// produces the identical readable edge on `signal_rx` that a real SIGTERM
+    /// handler write would, so host tests drive the actual signal-observation
+    /// path without a process-wide raise.
+    #[cfg(test)]
+    pub(crate) fn signal_wake_mut(&mut self) -> Option<&mut UnixStream> {
+        self.test_signal_wake.as_mut()
+    }
+
+    /// Test-only synchronisation point inside the shared startup window: arms
+    /// a one-shot closure that fires exactly before the post-all-resolved
+    /// zero-wait settlement recheck ([`Self::run_startup_window`]), so a test
+    /// can deterministically deliver a SIGTERM byte to the self-pipe after the
+    /// window has resolved every name but before the settlement turn decides
+    /// Serve-vs-Terminated. Not a public control interface: `#[cfg(test)]`
+    /// only, never set in a production build.
+    #[cfg(test)]
+    pub(crate) fn arm_pre_settlement_hook(&mut self, f: Box<dyn FnOnce()>) {
+        self.pre_settlement = Some(f);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_pre_poll_hook(&mut self, f: PrePollHook) {
+        self.pre_poll = Some(f);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_dns_fd_readable(&self) -> bool {
+        self.storage.dns().test_fd_readable()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_active_ordinal(&self) -> Option<usize> {
+        self.storage.dns().active_ordinal()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_active_receiving(&self) -> bool {
+        self.storage.dns().test_active_receiving()
+    }
+
+    /// Bounded nonblocking drain of the SIGTERM self-pipe: at most 64 bytes
+    /// per observation, so a signal storm can never monopolize the shared poll
+    /// turn while kernel coalescing keeps every drained byte at least one
+    /// SIGTERM. A would-block or interrupted read is the benign empty/retry
+    /// case; a real read error (e.g. `EBADF`) is *named* on [`Self`]
+    /// ([`Self::signal_read_error`]) instead of being swallowed, so a broken
+    /// self-pipe is visible rather than misread as "no signal pending".
+    fn drain_signal_pipe(&mut self) {
+        const DRAIN_CAP: usize = 64;
+        let Some(rx) = self.signal_rx.as_mut() else {
+            return;
+        };
+        let mut buf = [0u8; 16];
+        let mut remaining = DRAIN_CAP;
+        while remaining > 0 {
+            let len = remaining.min(buf.len());
+            match rx.read(&mut buf[..len]) {
+                Ok(n) if n > 0 => remaining = remaining.saturating_sub(n),
+                Ok(_) => break,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    self.signal_read_error = Some(e.kind());
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The first real (non-benign) error observed draining the SIGTERM
+    /// self-pipe, for host tests proving the drain names read errors exactly.
+    #[cfg(test)]
+    fn signal_read_error(&self) -> Option<io::ErrorKind> {
+        self.signal_read_error
+    }
+
+    /// Permanently stops admission: the listener socket is deregistered and
+    /// dropped (owned sockets close once), so no new connection can be
+    /// accepted for the rest of the process lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when the listener deregistration fails.
+    fn stop_admission(&mut self) -> Result<(), ServeError> {
+        if let Some(mut listener) = self.listener.take() {
+            match self.poll.registry().deregister(&mut listener) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes every non-established slot at the first SIGTERM: pending setups
+    /// (pre-Relay stages) have their sockets closed exactly once, established
+    /// relay tunnels keep draining under unchanged deadlines, idle slots stay
+    /// idle (nothing to release), and a slot already Closing is left to its
+    /// own teardown rather than double-closed.
+    fn close_pending_setups(&mut self) {
+        for index in 0..self.slots.len() {
+            match self.slots[index].stage {
+                Stage::Idle | Stage::Relay | Stage::Closing => {}
+                Stage::ReadingConnect
+                | Stage::RunningDecision
+                | Stage::Dialing
+                | Stage::SendingConnected
+                | Stage::ValidatingHello
+                | Stage::WritingHello
+                | Stage::Refusing(_) => self.close_slot(index),
+            }
+        }
+    }
+
+    /// Cancels the retained DNS transport: the active exchange and the open
+    /// connection are cleared so no DNS deadline or refresh admission outlives
+    /// the first SIGTERM, while the retained transport heap stays owned until
+    /// process exit.
+    fn cancel_dns_transport(&mut self) {
+        self.storage.dns_mut().cancel_for_shutdown();
+    }
+
+    /// The typed exit decision while draining: a clean drain with no occupied
+    /// slot exits 0 immediately; once the fixed shutdown deadline passes the
+    /// remaining sockets are closed exactly once and the drain is declared a
+    /// forced failure (exit 70).
+    pub(crate) fn shutdown_exit(&mut self) -> Option<ShutdownExit> {
+        let phase = self.shutdown;
+        match phase {
+            Shutdown::Serving => None,
+            Shutdown::Draining { deadline } => {
+                if Instant::now() >= deadline {
+                    self.force_close_remaining_sockets();
+                    Some(ShutdownExit::Forced)
+                } else if self.storage.occupied() == 0 {
+                    Some(ShutdownExit::Drained)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Closes every remaining owned socket in one sweep at the forced
+    /// deadline: no established tunnel may outlive the shutdown grace.
+    fn force_close_remaining_sockets(&mut self) {
+        for index in 0..self.slots.len() {
+            if self.slots[index].stage != Stage::Idle {
+                self.close_slot(index);
+            }
+        }
+    }
+
+    /// Test-only seam: rewrites an already-draining shutdown deadline so the
+    /// forced-closure decision can be exercised without waiting the grace.
+    #[cfg(test)]
+    pub(crate) fn set_shutdown_deadline(&mut self, deadline: Instant) {
+        if let Shutdown::Draining { deadline: stored } = &mut self.shutdown {
+            *stored = deadline;
+        }
+    }
+
     fn accept_all(&mut self) -> Result<(), ServeError> {
         loop {
             let Some(listener) = &self.listener else {
@@ -629,12 +1207,6 @@ impl Serving {
                 Ok((stream, _addr)) => self.admit(stream)?,
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(_) => {
-                    // A transient accept failure (e.g. EMFILE) with the
-                    // connection still queued: re-arming immediately would
-                    // re-fire readiness in a hot loop. Pause acceptance until
-                    // the bounded backoff elapses (xz3f N6). No canonical
-                    // capacity number is invented; the backoff only bounds the
-                    // acceptance retry cadence.
                     self.listener_pause_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     return Ok(());
                 }
@@ -1498,6 +2070,11 @@ impl Serving {
         {
             earliest = Some(dns);
         }
+        if let Shutdown::Draining { deadline } = self.shutdown
+            && earliest.is_none_or(|e| deadline < e)
+        {
+            earliest = Some(deadline);
+        }
         let now = Instant::now();
         if let Some(log_wake) = self.storage.logs().next_drain(now)
             && earliest.is_none_or(|e| log_wake < e)
@@ -1679,6 +2256,15 @@ mod tests {
     fn pump(serving: &mut Serving, times: usize) {
         for _ in 0..times {
             let _ = serving.run_once(Some(Duration::from_millis(2)));
+        }
+    }
+
+    #[cfg(all(test, feature = "alloc-witness"))]
+    fn turn_pump(runtime: &mut crate::runtime::Runtime, times: usize) {
+        for _ in 0..times {
+            runtime.turn(Some(Duration::from_millis(2))).expect(
+                "an owner turn inside the witnessed shutdown may not error and stay silent",
+            );
         }
     }
 
@@ -2888,6 +3474,342 @@ mod tests {
                 "no 504 may be spliced after a begun response on expiry"
             );
         });
+    }
+
+    #[test]
+    fn sigterm_first_observation_enters_draining_and_stops_admission() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let client = connect(port);
+            pump(serving, 40);
+            assert_eq!(
+                serving.storage().occupied(),
+                1,
+                "a connecting client must be admitted before the signal"
+            );
+            assert!(
+                serving.listener.is_some(),
+                "admission is open before the first SIGTERM"
+            );
+
+            serving
+                .signal_wake_mut()
+                .expect("the serving owns the self-pipe write end")
+                .write_all(&[1])
+                .expect("write the signal byte into the self-pipe");
+            pump(serving, 40);
+            assert!(
+                serving.is_shutdown(),
+                "a self-pipe signal must reach draining through the shared poll"
+            );
+            assert!(
+                matches!(serving.shutdown(), Shutdown::Draining { .. }),
+                "the first SIGTERM must enter the draining phase"
+            );
+            assert_eq!(
+                serving.signal_read_error(),
+                None,
+                "a healthy self-pipe drain must not name a real read error"
+            );
+            assert!(
+                serving.listener.is_none(),
+                "the listener must be dropped, so no later connection can be accepted"
+            );
+            assert_eq!(
+                serving.storage().occupied(),
+                0,
+                "a pending setup is closed at the first signal; established tunnels drain"
+            );
+            assert!(
+                !serving.storage().dns().has_active_exchange(),
+                "the retained DNS transport is cancelled at the first signal"
+            );
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn sigterm_repeat_does_not_extend_the_deadline() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            serving.on_sigterm().expect("first SIGTERM observation");
+            let Shutdown::Draining { deadline: first } = serving.shutdown() else {
+                panic!("first SIGTERM must enter draining");
+            };
+            std::thread::sleep(Duration::from_millis(5));
+            serving.on_sigterm().expect("second SIGTERM observation");
+            let Shutdown::Draining { deadline: second } = serving.shutdown() else {
+                panic!("state must stay draining after a second SIGTERM");
+            };
+            assert_eq!(
+                first, second,
+                "a later SIGTERM never extends the fixed shutdown deadline"
+            );
+        });
+    }
+
+    #[test]
+    fn sigterm_clean_drain_exits_zero_when_no_tunnels() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            serving.on_sigterm().expect("first SIGTERM observation");
+            assert_eq!(serving.storage().occupied(), 0);
+            assert_eq!(
+                serving.shutdown_exit(),
+                Some(ShutdownExit::Drained),
+                "an empty drain after the first signal is a clean exit"
+            );
+            assert_eq!(ShutdownExit::Drained.code(), 0);
+        });
+    }
+
+    #[test]
+    fn sigterm_deadline_force_closes_remaining_sockets_and_exits_seventy() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let client = connect(port);
+            pump(serving, 40);
+            assert_eq!(serving.storage().occupied(), 1);
+            serving.slots[0].stage = Stage::Relay;
+
+            serving.on_sigterm().expect("first SIGTERM observation");
+            assert_eq!(
+                serving.storage().occupied(),
+                1,
+                "an established relay keeps draining and is not closed by the signal itself"
+            );
+            assert_eq!(
+                serving.shutdown_exit(),
+                None,
+                "while a tunnel occupies a slot before the deadline, the owner keeps draining"
+            );
+
+            serving.set_shutdown_deadline(Instant::now() - Duration::from_millis(1));
+            assert_eq!(
+                serving.shutdown_exit(),
+                Some(ShutdownExit::Forced),
+                "once the fixed deadline passes, remaining sockets are closed as a failure"
+            );
+            assert_eq!(ShutdownExit::Forced.code(), 70);
+            assert_eq!(
+                serving.storage().occupied(),
+                0,
+                "the forced closure releases every remaining occupied socket"
+            );
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn sigterm_folds_shutdown_deadline_into_the_idle_poll_wait() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            assert_eq!(
+                serving.poll_timeout(),
+                None,
+                "idle serving with no traffic/DNS/log has no wait"
+            );
+            serving.on_sigterm().expect("first SIGTERM observation");
+            let wait = serving
+                .poll_timeout()
+                .expect("an idle drain must still wake at the shutdown deadline");
+            assert!(
+                wait <= Duration::from_secs(8),
+                "the drain wait is bounded by the fixed 8s grace from the first observation, got {wait:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn sigterm_dispatch_priority_no_accept_after_first_signal() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let client = connect(port);
+            pump(serving, 40);
+            assert_eq!(serving.storage().occupied(), 1);
+
+            serving.on_sigterm().expect("first SIGTERM observation");
+            let raw = 0;
+            serving
+                .dispatch_readiness(
+                    Token(raw),
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("stale listener readiness after the signal");
+            assert_eq!(
+                serving.storage().occupied(),
+                0,
+                "no admissions may occur after the first signal"
+            );
+            assert!(
+                matches!(serving.shutdown(), Shutdown::Draining { .. }),
+                "the owner stays in draining after a stale listener wake"
+            );
+            drop(client);
+        });
+    }
+
+    #[cfg(feature = "alloc-witness")]
+    #[test]
+    fn sigterm_shutdown_path_spends_zero_allocations() {
+        std::thread::Builder::new()
+            .name("shutdown-alloc-witness".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(shutdown_alloc_witness_body)
+            .expect("spawn shutdown alloc witness")
+            .join()
+            .expect("shutdown alloc witness thread");
+    }
+
+    #[cfg(feature = "alloc-witness")]
+    fn shutdown_alloc_witness_body() {
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), port))
+            .expect("bind listener");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut runtime = crate::runtime::Runtime::new(storage, listener, traffic)
+            .expect("runtime owner (preallocate + attach)");
+
+        let pending_client = connect(port);
+        turn_pump(&mut runtime, 40);
+        assert_eq!(
+            runtime.serving().storage().occupied(),
+            1,
+            "the pending setup occupies the first storage slot before the signal"
+        );
+
+        let mut relay_client = connect(port);
+        turn_pump(&mut runtime, 40);
+        assert_eq!(
+            runtime.serving().storage().occupied(),
+            2,
+            "two real admitted setups occupy storage before the signal: one pending, one promoted below"
+        );
+
+        let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+        let sink_addr = sink.local_addr().expect("sink addr");
+        let upstream = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+        let _sink_stream = sink.accept().expect("accept sink side").0;
+        wait_upstream_connected(&upstream);
+        let index = 1;
+        let wire = hello_wire(b"sub.example.org", false);
+        relay_client
+            .write_all(&wire)
+            .expect("hello bytes available on the real admitted client socket");
+        let drain_reader = {
+            let mut drain = relay_client
+                .try_clone()
+                .expect("clone the relay client for the CONNECT-response drain reader");
+            std::thread::Builder::new()
+                .name("relay-client-drain".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 256];
+                    while matches!(drain.read(&mut buf), Ok(n) if n > 0) {}
+                })
+                .expect("spawn the CONNECT-response drain reader")
+        };
+        {
+            let serving = runtime.serving_mut();
+            let ws = &mut serving.slots[index];
+            ws.approved = FixedHostname::normalize(b"sub.example.org");
+            ws.gate.on_connect_head(0);
+            ws.gate.on_authorized();
+            ws.stage = Stage::Dialing;
+            ws.upstream = Some(upstream);
+            ws.head_len = 0;
+            ws.buf_base = 0;
+            ws.buf_len = 0;
+            ws.fwd = 0;
+            ws.insp_rel = 0;
+            ws.hello_consumed = 0;
+        }
+        runtime
+            .serving_mut()
+            .register_upstream(index)
+            .expect("register the real upstream socket");
+        runtime
+            .serving_mut()
+            .upstream_writable(index)
+            .expect("dial-connected promotion through the production owner path");
+        turn_pump(&mut runtime, 40);
+        assert!(
+            runtime.serving().slots[index].tunnel.is_some(),
+            "the promoted relay must graduate to a real storage tunnel handle"
+        );
+        assert!(
+            matches!(runtime.serving().slots[index].stage, Stage::Relay),
+            "an established relay holds the second slot before the signal"
+        );
+        assert!(
+            runtime.serving().slots[index].client.is_some()
+                && runtime.serving().slots[index].upstream.is_some(),
+            "the relay owns live client and upstream sockets before the signal"
+        );
+
+        let (_, counts) = crate::alloc::run_phase(crate::alloc::Phase::Shutdown, || {
+            runtime
+                .serving_mut()
+                .signal_wake_mut()
+                .expect("the owner holds the self-pipe write end")
+                .write_all(&[1])
+                .expect("write the signal byte into the self-pipe");
+            turn_pump(&mut runtime, 40);
+            assert!(
+                runtime.serving().is_shutdown(),
+                "a real self-pipe signal must enter draining through Runtime::turn"
+            );
+            assert_eq!(
+                runtime.serving().storage().occupied(),
+                1,
+                "the pending setup is closed at the first signal; the established relay keeps draining"
+            );
+            assert!(
+                matches!(runtime.serving().slots[index].stage, Stage::Relay),
+                "the established relay keeps draining past the first signal"
+            );
+            assert_eq!(
+                runtime.serving_mut().shutdown_exit(),
+                None,
+                "while the relay still occupies a slot before the deadline, the drain does not settle"
+            );
+            runtime
+                .serving_mut()
+                .set_shutdown_deadline(Instant::now() - Duration::from_millis(1));
+            turn_pump(&mut runtime, 40);
+            let exit = runtime
+                .serving_mut()
+                .shutdown_exit()
+                .expect("a drain past the fixed deadline must settle");
+            assert_eq!(exit.code(), 70, "a forced closure exit is EX_SOFTWARE");
+            assert!(
+                runtime.serving().slots[index].client.is_none()
+                    && runtime.serving().slots[index].upstream.is_none(),
+                "forced closure releases the relay sockets exactly once"
+            );
+            assert_eq!(
+                runtime.serving().storage().occupied(),
+                0,
+                "forced closure releases the real storage tunnel through release_tunnel: occupied 2 -> 1 -> 0"
+            );
+            runtime.emit_shutdown_record_and_drain(exit);
+            assert!(
+                runtime.serving().is_shutdown(),
+                "the typed shutdown record and final bounded drain keep the owner draining"
+            );
+        });
+        assert!(
+            counts.all_zero(),
+            "the real-signal shutdown through Runtime::turn must allocate/deallocate nothing: {counts:?}"
+        );
+        drain_reader
+            .join()
+            .expect("the CONNECT-response drain reader exits after the forced close");
+        drop(relay_client);
+        drop(pending_client);
     }
 
     #[test]

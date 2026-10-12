@@ -96,6 +96,10 @@ fn main() {
                         }
                     }
                     StartupDecision::Exit75 { .. } => std::process::exit(EX_TEMPFAIL),
+                    StartupDecision::Terminated => {
+                        owner.emit_shutdown_and_drain();
+                        std::process::exit(0);
+                    }
                 },
                 Err(err) => {
                     owner.emit_fatal_and_drain(format_args!("alumina: startup: {err}"));

@@ -143,7 +143,7 @@ impl From<ScheduleError> for StartupDnsError {
 /// startup report can tell a validated negative from an attempted positive
 /// with no eligible bindings instead of collapsing both into one catch-all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublishedKind {
+pub(crate) enum PublishedKind {
     /// A positive answer published at least one eligible binding.
     ResolvedPositive,
     /// A positive answer whose candidates were all ineligible; nothing was
@@ -371,6 +371,109 @@ impl StartupReport {
     }
 }
 
+/// The per-name, per-family bookkeeping of one startup window, shared between
+/// the private blocking driver (`resolve_window`) and the shared owner's
+/// cooperative window so both produce the identical typed report from the
+/// identical selection/backoff rule set. Kept here so the private [`Latest`]
+/// classification and [`PublishedKind`] resolution stay encapsulated: the
+/// selected/exchanged/report math never leaks raw stages to an owner.
+#[derive(Debug)]
+pub(crate) struct WindowLedger {
+    resolved: [bool; ALLOWLIST_MAX],
+    attempted: [bool; ALLOWLIST_MAX * 2],
+    latest: [Latest; ALLOWLIST_MAX],
+    names: usize,
+}
+
+impl WindowLedger {
+    pub(crate) fn new(names: usize) -> WindowLedger {
+        WindowLedger {
+            resolved: [false; ALLOWLIST_MAX],
+            attempted: [false; ALLOWLIST_MAX * 2],
+            latest: [Latest::Unattempted; ALLOWLIST_MAX],
+            names,
+        }
+    }
+
+    pub(crate) fn names(&self) -> usize {
+        self.names
+    }
+
+    pub(crate) fn resolved(&self) -> &[bool] {
+        &self.resolved[..self.names]
+    }
+
+    pub(crate) fn is_resolved(&self, ordinal: usize) -> bool {
+        self.resolved[ordinal]
+    }
+
+    pub(crate) fn all_resolved(&self) -> bool {
+        self.resolved[..self.names].iter().all(|&r| r)
+    }
+
+    pub(crate) fn track_attempt(&mut self, ordinal: usize, family: Family) {
+        self.attempted[ordinal * 2 + family_index(family)] = true;
+    }
+
+    /// Merges a concluded exchange into the ledger: a resolved-positive answer
+    /// (with at least one eligible binding) marks the name usable and terminal;
+    /// a validated negative or no-eligible answer is recorded as its own class
+    /// and never re-attempted as resolved.
+    pub(crate) fn mark_published(&mut self, ordinal: usize, kind: PublishedKind) {
+        match kind {
+            PublishedKind::ResolvedPositive => self.resolved[ordinal] = true,
+            PublishedKind::Negative | PublishedKind::NoEligible => {}
+        }
+        self.latest[ordinal].merge(ExchangeResult::Published(kind));
+    }
+
+    /// Overlays the "usable name" binding check: a name counts as resolved only
+    /// when a published positive answer actually left at least one eligible
+    /// binding, exactly as the private driver computes it.
+    pub(crate) fn resolve(&mut self, ordinal: usize, has: bool) {
+        self.resolved[ordinal] |= has;
+    }
+
+    pub(crate) fn mark_failed(&mut self, ordinal: usize, reason: FailureReason) {
+        self.latest[ordinal].merge(ExchangeResult::Failed(reason));
+    }
+
+    /// Finishes the window ledger into the typed startup report, applying the
+    /// canonical count and outcome rules: attempted per name-family pair,
+    /// not-attempted as the remainder, resolved names where a usable binding
+    /// was published, and each unresolved name reported from its latest
+    /// classified outcome rather than inferred.
+    pub(crate) fn finish(
+        &self,
+        exchanges: u32,
+        failed: u32,
+        first_failure: Option<(u16, Family)>,
+    ) -> StartupReport {
+        let attempted_count = self.attempted[..self.names * 2]
+            .iter()
+            .filter(|&&t| t)
+            .count() as u32;
+        let resolved_names = self.resolved[..self.names].iter().filter(|&&r| r).count() as u32;
+        let mut report = StartupReport {
+            exchanges,
+            failed,
+            cancelled: 0,
+            not_attempted: (self.names * 2) as u32 - attempted_count,
+            resolved_names,
+            outcomes: [NameOutcome::NotAttempted(NotAttemptedReason::WindowClosed); ALLOWLIST_MAX],
+            first_failure,
+        };
+        for ordinal in 0..self.names {
+            report.outcomes[ordinal] = if self.resolved[ordinal] {
+                NameOutcome::Resolved
+            } else {
+                self.latest[ordinal].to_outcome()
+            };
+        }
+        report
+    }
+}
+
 /// A tightly scoped test hook that substitutes the outcome of the next
 /// nonblocking send attempt, so a deterministically forced send backpressure
 /// (a real WouldBlock) can be exercised without depending on any kernel or
@@ -419,6 +522,13 @@ pub struct StartupDns {
     token_gen: usize,
     registration: Registration,
     active: Option<ActiveExchange>,
+    /// Whether the owner is currently inside a startup window. Within the
+    /// window the transport keeps its single connection warm and reusable
+    /// across every allowlist name, exactly as private mode does; the
+    /// per-publish conclusion is withheld until the window ends. Outside a
+    /// window a concluded shared exchange closes the transport so a serving
+    /// refresh never leaves an idle socket under the serving poll.
+    window_open: bool,
     /// The classification of the most recently published outcome, read out by
     /// the blocking driver when the exchange concludes (never inferred from
     /// the cache afterwards, where negative and no-eligible are ambiguous).
@@ -476,6 +586,7 @@ impl StartupDns {
             token_gen: 0,
             registration: Registration::Private,
             active: None,
+            window_open: false,
             last_published: None,
             last_failed: None,
             #[cfg(test)]
@@ -491,7 +602,9 @@ impl StartupDns {
         Ok(u16::from_be_bytes(bytes))
     }
 
-    fn now_u64(&self) -> u64 {
+    /// Resolve the whole-second DNS epoch clock from the window anchor; the
+    /// private driver and the shared owner read the same seconds value.
+    pub(crate) fn now_u64(&self) -> u64 {
         self.now0.saturating_add(self.start.elapsed().as_secs())
     }
 
@@ -501,6 +614,63 @@ impl StartupDns {
     /// continue seamlessly from startup into serving (one anchor, 1cws M2r).
     pub(crate) fn window_start(&self) -> Instant {
         self.start
+    }
+
+    /// Starts a startup window on the retained transport without owning the
+    /// wait: it anchors the DNS epoch and monotonic origin, pins the
+    /// nameserver peer, and returns the absolute window deadline. From here
+    /// the shared owner drives selection and cooperative exchanges over the
+    /// serving poll and reports through [`Self::finalize_window`]; the private
+    /// driver uses the same anchor inside [`Self::resolve_window`].
+    pub(crate) fn begin_window(
+        &mut self,
+        nameserver: SocketAddr,
+        now0: u64,
+        window: Duration,
+    ) -> Result<Instant, StartupDnsError> {
+        self.now0 = now0;
+        self.start = Instant::now();
+        let deadline = self
+            .start
+            .checked_add(window)
+            .ok_or(StartupDnsError::DeadlineOverflow)?;
+        self.addr = nameserver;
+        self.window_open = true;
+        Ok(deadline)
+    }
+
+    /// The bounded wait the shared owner folds into its single serving poll
+    /// between startup selections: the earliest scheduled step among
+    /// not-yet-usable names (with the one-second start guard and floor), or
+    /// the maximum wait when nothing is scheduled, so the poll only sleeps to
+    /// the clipped window deadline instead of deciding early.
+    pub(crate) fn next_due_wait(
+        &self,
+        schedules: &Schedules,
+        ledger: &WindowLedger,
+    ) -> Result<Duration, StartupDnsError> {
+        wait_until_next_step(self, schedules, ledger.names(), ledger.resolved())
+    }
+
+    /// The classification of the most recently published startup exchange, so
+    /// a shared owner records a validated negative or no-eligible answer
+    /// distinctly from a resolved positive (never inferred from the cache
+    /// afterwards). `None` when nothing has published.
+    pub(crate) fn take_published_kind(&mut self) -> Option<PublishedKind> {
+        self.last_published.take()
+    }
+
+    /// The failure reason of the most recently failed startup exchange, so a
+    /// shared owner records the exact counted reason instead of collapsing
+    /// every non-published conclusion into one class.
+    pub(crate) fn take_failed_reason(&mut self) -> Option<FailureReason> {
+        self.last_failed.take()
+    }
+
+    /// The outstanding exchange ordinal and family, captured together for a
+    /// shared owner settling a concluded exchange against its ledger.
+    pub(crate) fn active_identity(&self) -> Option<(usize, Family)> {
+        self.active.as_ref().map(|ex| (ex.ordinal, ex.family))
     }
 
     /// Closes the transport connection exactly once. In private mode the
@@ -551,15 +721,64 @@ impl StartupDns {
         Ok(Token(self.token_gen))
     }
 
-    /// Closes the transport when the shared owner drove this exchange, so a
-    /// concluded exchange never leaves an idle socket registered with (or
-    /// retained under) the serving poll. Private mode keeps the connection
-    /// warm for reuse within the startup window.
-    fn conclude_shared_transport(&mut self) -> Result<(), StartupDnsError> {
+    /// Closes the transport when the shared owner drove this exchange and no
+    /// startup window is open, so a concluded serving-refresh exchange never
+    /// leaves an idle socket registered with (or retained under) the serving
+    /// poll. Private mode keeps the connection warm for reuse within the
+    /// startup window, as does an open window in shared mode: the window owner
+    /// calls this once at window end to close the single reused connection.
+    pub(crate) fn conclude_shared_transport(&mut self) -> Result<(), StartupDnsError> {
+        self.window_open = false;
         if matches!(self.registration, Registration::Shared { .. }) {
             self.close_connection()?;
         }
         Ok(())
+    }
+
+    /// Cancels the retained transport for owner shutdown: the outstanding
+    /// exchange is cleared (no deadline or active-exchange predicate remains
+    /// to keep the shared poll hot) and the connection closed exactly once.
+    /// In shared mode closing the fd removes the source from the owner's poll
+    /// set at the kernel layer; the retained transport and its heap stay owned
+    /// until process exit, so the cancellation is infallible rather than
+    /// surfacing a deregistration bookkeeping error on an abandoned socket
+    /// that would otherwise turn a clean drain into a forced failure.
+    pub(crate) fn cancel_for_shutdown(&mut self) {
+        self.active = None;
+        self.window_open = false;
+        self.stream = None;
+        if let Registration::Shared { armed, .. } = &mut self.registration {
+            *armed = None;
+        }
+        self.filled = 0;
+        self.written = 0;
+        self.msglen = None;
+    }
+
+    /// Test-only readiness probe on the retained shared stream: true only once
+    /// the owner-side socket has response bytes queued that the window has not
+    /// yet read. Uses a nonblocking `peek` (never consumes data), so `Ok(n) if
+    /// n > 0` holds exactly for queued bytes — unlike a raw `poll` readiness
+    /// bit, which stays set on POLLHUP/POLLERR once the responder drops its
+    /// socket after the write-ack.
+    #[cfg(test)]
+    pub(crate) fn test_fd_readable(&self) -> bool {
+        let Some(stream) = self.stream.as_ref() else {
+            return false;
+        };
+        let mut probe = [0u8; 1];
+        matches!(stream.peek(&mut probe), Ok(n) if n > 0)
+    }
+
+    /// Test-only stage probe: whether the active exchange has sent its full
+    /// query and is awaiting the response (the responder withholds answers
+    /// only once a query is on the wire).
+    #[cfg(test)]
+    pub(crate) fn test_active_receiving(&self) -> bool {
+        matches!(
+            self.active.as_ref(),
+            Some(ex) if ex.step == ExchangeStep::Receiving
+        )
     }
 
     /// Performs the nonblocking connect and registers the source, leaving the
@@ -818,18 +1037,24 @@ impl StartupDns {
             self.poll_ticks += 1;
         }
         let deadline = self.exchange_deadline().unwrap_or(until);
-        let now = Instant::now();
-        let timeout = if now >= deadline || now >= until {
-            Duration::ZERO
-        } else {
-            deadline.min(until).saturating_duration_since(now)
-        };
-        self.poll
-            .poll(&mut self.events, Some(timeout))
-            .map_err(|e| StartupDnsError::Transport {
-                kind: e.kind(),
-                detail: "poll",
-            })?;
+        loop {
+            let now = Instant::now();
+            let timeout = if now >= deadline || now >= until {
+                Duration::ZERO
+            } else {
+                deadline.min(until).saturating_duration_since(now)
+            };
+            match self.poll.poll(&mut self.events, Some(timeout)) {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    return Err(StartupDnsError::Transport {
+                        kind: err.kind(),
+                        detail: "poll",
+                    });
+                }
+            }
+        }
         Ok(self.events.iter().any(|event| event.token() == self.watch))
     }
 
@@ -927,7 +1152,10 @@ impl StartupDns {
                     Ok(n) => {
                         self.written += n;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted =>
+                    {
                         blocked = true;
                     }
                     Err(_) => {
@@ -993,7 +1221,9 @@ impl StartupDns {
                     return Ok(RecvStep::Failed);
                 }
                 Ok(n) => self.filled += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => {
                     self.close_connection()?;
                     self.note_failure(ex.ordinal, ex.family, schedules, FailureReason::Receive)?;
@@ -1417,7 +1647,9 @@ impl StartupDns {
                 }
                 RecvStep::Published => {
                     self.active = None;
-                    self.conclude_shared_transport()?;
+                    if !self.window_open {
+                        self.conclude_shared_transport()?;
+                    }
                     return Ok(TurnResult::Published);
                 }
             },

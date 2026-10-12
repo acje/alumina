@@ -861,12 +861,96 @@ e2e_relay() {
     sh scripts/e2e_relay.sh
 }
 
+# Native SIGTERM shutdown gate against the ACTUAL production binary, rebuilt
+# from the exact current source with the same identity receipt as e2e_relay
+# (source/binary correspondence is mandatory so the executed artifact is tied
+# to the reviewed candidate). The gate drives real SIGTERM into the served
+# binary: idle wake, no-self-exit, pre-serving observation, early drain,
+# deadline-forced closure (repeat-signal no-extension), stalled stdout and
+# silent DNS cooperation. Every case child is supervised foreground.
+e2e_shutdown() {
+    ROOT="$(pwd)"
+    observe_build_target() {
+        _probe_out="$("$@" 2>&1)" || _probe_rc=$?
+        if [ "${_probe_rc:-0}" -ne 0 ]; then
+            printf 'E2E-SHUTDOWN-BLOCKED: build target probe failed before parse (exit %s):\n%s\n' \
+                "$_probe_rc" "$_probe_out" >&2
+            exit 1
+        fi
+        printf '%s\n' "$_probe_out"
+    }
+    if [ "$(uname -s)" = "Linux" ]; then
+        _probe_buf=$(observe_build_target rustc +${TOOLCHAIN} -vV) || exit 1
+    else
+        _probe_buf=$(observe_build_target \
+            podman --connection "${PODMAN_CONNECTION:-flock-vm}" run --rm --pull=never \
+            docker.io/library/rust@sha256:484dce463db97ee3b9c3dbeb82ac48408091573ec2da1ce9ccd84c823642779a \
+            sh -c 'rustc -vV') || exit 1
+    fi
+    E2E_TARGET=$(printf '%s\n' "$_probe_buf" | sed -n 's/^host: //p')
+    case "$E2E_TARGET" in
+        "" | *$'\n'* | *" "*)
+            echo "E2E-SHUTDOWN-BLOCKED: could not observe native build target profile ('${E2E_TARGET}')" >&2
+            exit 1
+            ;;
+    esac
+    export E2E_TARGET
+    TGT="$ROOT/target"
+    BIN="target/${E2E_TARGET}/release/alumina"
+    closure_metadata
+    before_status() {
+        rcd=0
+        git diff HEAD >"$TGT/shutdown-diff.$$" 2>&1 || rcd=$?
+        [ "$rcd" -eq 0 ] || {
+            echo "E2E-SHUTDOWN-BLOCKED: git diff HEAD exit $rcd (unreadable diff, not a receipt)" >&2
+            exit 1
+        }
+        diffhash=$(sha256_digest file "$TGT/shutdown-diff.$$") || exit 1
+        harness1=$(sha256_digest file "scripts/e2e_shutdown.py") || exit 1
+        harness2=$(sha256_digest file "scripts/e2e_shutdown.sh") || exit 1
+        shellhash=$(sha256_digest file "scripts/verify.sh") || exit 1
+        printf '%s %s %s %s %s\n' "$(git rev-parse --verify HEAD 2>/dev/null || true)" \
+            "$diffhash" "$harness1" "$harness2" "$shellhash"
+    }
+    mkdir -p "$TGT"
+    before=$(before_status)
+    if [ "$(uname -s)" = "Linux" ]; then
+        echo "PRODUCTION-RELEASE-BUILD (native Linux, exact current source, target=${E2E_TARGET}):"
+        cargo +${TOOLCHAIN} build --locked --release --target "$E2E_TARGET" --target-dir "$TGT"
+    else
+        echo "PRODUCTION-RELEASE-BUILD (native Linux via container dispatch; host $(uname -s), target=${E2E_TARGET}):"
+        linux_dispatch "cargo +1.99.0 build --locked --release --target ${E2E_TARGET} --target-dir /app/target"
+    fi
+    after=$(before_status)
+    if [ "$before" != "$after" ]; then
+        echo "E2E-SHUTDOWN-BLOCKED: source inputs changed during the build (receipt would not correspond)" >&2
+        echo "  before=$before" >&2
+        echo "  after =$after" >&2
+        exit 1
+    fi
+    [ -x "$ROOT/$BIN" ] || {
+        echo "E2E-SHUTDOWN-BLOCKED: production static binary missing after rebuild ($BIN for target $E2E_TARGET)" >&2
+        exit 1
+    }
+    echo "e2e/shutdown identity (executed binary tied to exact candidate):"
+    head=$(git rev-parse --verify HEAD 2>&1) || {
+        echo "E2E-SHUTDOWN-BLOCKED: git rev-parse HEAD failed" >&2
+        exit 1
+    }
+    binhash=$(sha256_digest file "$ROOT/$BIN") || exit 1
+    printf '  HEAD=%s target=%s dirty-diff-sha256=%s harness-py-sha256=%s harness-sh-sha256=%s binary-sha256=%s\n' \
+        "$head" "$E2E_TARGET" "$(printf '%s' "$after" | cut -d' ' -f2)" \
+        "$(printf '%s' "$after" | cut -d' ' -f3)" "$(printf '%s' "$after" | cut -d' ' -f4)" "$binhash"
+    sh scripts/e2e_shutdown.sh
+}
+
 case "$TIER/$SCOPE" in
     mid/foundations) mid_foundations ;;
     mid/boot) mid_boot ;;
     fixtures/boot) boot_fixtures ;;
     boundary/phase1) boundary_phase1 ;;
     e2e/relay) e2e_relay ;;
+    e2e/shutdown) e2e_shutdown ;;
     docs/*) docslink_check ;;
     *) usage ;;
 esac

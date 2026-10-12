@@ -36,8 +36,14 @@ harness = false
 [dependencies]
 toml = { version = "=1.1.8", default-features = false, features = ["std", "parse", "serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
-mio = { version = "=1.2.4", default-features = false, features = ["net", "os-poll"] }
-getrandom = { version = "=0.3.4" }
+mio = { version = "=1.2.4", default-features = false, features = ["net", "os-poll", "os-ext"] }
+getrandom = { version = "=0.4.3" }
+# SIGTERM lifecycle: safe self-pipe route (oracle b3nx B18/B19, H1 selected).
+# default-features=false keeps only the ungated flag/low_level surfaces; the
+# `pipe` safe registration primitive writes into a pollable fd with no handler
+# allocation in the signal path (evidence jvlx). mio os-ext unlocks SourceFd so
+# the retained self-pipe read end registers on the single serving poll.
+signal-hook = { version = "=0.4.5", default-features = false }
 # Promoted from the already-resolved closure (mio/getrandom pull libc 0.2.190):
 # minimal nonblocking-stdout fcntl + write boundary for the log sink. Pinned to
 # the exact resolved version; no new closure node (contract intent 26l1.21.3).

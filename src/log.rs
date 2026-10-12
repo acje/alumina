@@ -135,6 +135,7 @@ enum Kind {
     StartupWarning,
     StartupFinal,
     Fatal,
+    ShutdownFinal,
     Reject,
     EarlyActivity,
     CapacityHigh,
@@ -149,6 +150,7 @@ impl Kind {
             Kind::StartupWarning => "startup_warning",
             Kind::StartupFinal => "startup_final",
             Kind::Fatal => "fatal",
+            Kind::ShutdownFinal => "shutdown_final",
             Kind::Reject => "reject",
             Kind::EarlyActivity => "early_activity",
             Kind::CapacityHigh => "capacity_high",
@@ -165,6 +167,7 @@ pub(crate) enum StartupStatus {
     Full,
     Degraded,
     Failed,
+    Terminated,
 }
 
 impl StartupStatus {
@@ -173,6 +176,27 @@ impl StartupStatus {
             StartupStatus::Full => "full",
             StartupStatus::Degraded => "degraded",
             StartupStatus::Failed => "failure",
+            StartupStatus::Terminated => "terminated",
+        }
+    }
+}
+
+/// The typed terminal outcome of a SIGTERM shutdown drain: a clean drain of
+/// every established tunnel (or an empty drain with no tunnels) exits 0; a
+/// deadline-forced closure of remaining sockets is a failure and exits
+/// `EX_SOFTWARE` (70) (alumina.md:220). Emitted as the single shutdown record
+/// before the owner exits so a forced closure is never silently lost.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownStatus {
+    Drained,
+    Forced,
+}
+
+impl ShutdownStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ShutdownStatus::Drained => "drained",
+            ShutdownStatus::Forced => "forced",
         }
     }
 }
@@ -803,6 +827,21 @@ impl LogStore {
         ];
         self.set_now(secs);
         self.enqueue(Level::Warn, Kind::EarlyActivity, &fields);
+    }
+
+    /// The single typed shutdown record emitted before the owner exits on a
+    /// SIGTERM: `status` names whether the drain finished clean or was
+    /// deadline-forced, so a forced closure is never silently lost to the
+    /// immediate `process::exit` that follows (alumina.md:220). The caller
+    /// drains once after this, and the drain is bounded/nonblocking so a
+    /// stalled stdout can never delay the exit verdict.
+    pub(crate) fn shutdown_final(&mut self, secs: u64, status: ShutdownStatus) {
+        self.set_now(secs);
+        let fields = [
+            Field::new("secs", Val::U64(secs)),
+            Field::new("status", Val::Str(status.as_str())),
+        ];
+        self.enqueue(Level::Info, Kind::ShutdownFinal, &fields);
     }
 
     /// Evaluates the 80%/70% capacity thresholds for tunnel slots and pending
