@@ -1,8 +1,23 @@
 # Alumina — Build Plan (phased vertical slices)
 
-**Status:** planning document. This plan defines *what a future implementation will build and prove, in what order*; it starts **no** implementation. Architecture and ownership: [architecture.md](architecture.md). Complete traceability: [traceability.md](traceability.md). Canonical requirements: `alumina.md` (sole governing specification; no ADRs exist).
+**Status:** this plan is the implementation + qualification owner: it defines
+*what is built and proved, in what order* and names the gates that own
+qualification/release. A large subset of the slices below is now **implemented
+and correctness-tested** by separately-commissioned execution missions
+(mission `alumina-26l1` and successors; see §0 sequencing status), and the
+repository is a **scoped testQA-ready candidate** — it is **not** a
+production-qualified or externally-deployed system (four-claim ledger in
+README.md; see `qa-package/README.md` for the local QA package). Every gate
+below that has not run remains open; this document does not claim
+completion. Architecture and ownership: [architecture.md](architecture.md). Complete traceability: [traceability.md](traceability.md). Canonical requirements: `alumina.md` (sole governing specification; no ADRs exist).
 
-Mission scope bounds (verbatim intent): produce planning documents only; do **not** implement, install dependencies, build graphs, commit, push, or sync. This document is the executable-shaped plan that later, separately commissioned build missions will follow.
+Mission scope bounds (history): this document (and `architecture.md` /
+`traceability.md`) was commissioned as a planning-only deliverable — "produce
+planning documents only; do **not** implement, install dependencies, build
+graphs, commit, push, or sync" — and later execution missions (mission
+`alumina-26l1` and successors, per §0) implemented the slices against exactly
+this plan. The plan remains the executable-shaped qualification owner those
+missions and future ones follow.
 
 ## 0. Sequencing status — provisional product-first parser layer
 
@@ -27,13 +42,27 @@ re-sequencing so the two cannot be read as the same claim:
 - **"Provisional" is precise:** none has passed the qualification gates this
   plan names. These are correct-by-construction inputs to later slices, **not**
   servable functionality.
-- **Deferred (required before any resource-treated serving claim):** F0 Linux
-  proof, F1 allocator witnesses on the remaining serving phases (the
-  background-refresh-phase DNS parse now carries `alloc-witness` zero-heap
-  controls; connect/TLS serving witnesses and a product-wide claim remain
-  open), F2 deterministic fault injection of gate transitions, F3 mio operation
-  matrix, F4 parser fuzzing, Linux MID/BOUNDARY, E2E deployment/confinement.
-  `getrandom` dependency intake is complete (bead `alumina-zjwk`; `build.rs`
+- **Deferred (still required before any resource-treated serving claim):** F0
+  Linux proof (met for the pin: static-ELF + MID gates green natively), F1
+  allocator witnesses on the remaining serving phases (boot, startup-DNS and
+  shutdown carry `alloc-witness` zero-heap controls; the current-serving
+  refresh/serving completeness witness and a product-wide claim remain open),
+  F2 deterministic fault injection across the remaining gate transitions (the
+  fault seam exists, `src/fault.rs`; full gate-transition fault-injection
+  campaigns for serving remain unfilled), **F3 current-serving completeness
+  witness** (the mio operation matrix itself is **implemented** —
+  `tests/mio_matrix.rs`, 8 tests incl. `linux_epoll_operation_matrix` with
+  poll/register/reregister/deregister + `alloc-witness` controls, recorded
+  native release evidence README:63-70, orientations z9m0/po3c; per cnrd T3
+  the F3 label was stale: the matrix is built, completeness for the current
+  serving/SIGTERM op set is the open witness, it is not an "unbuilt matrix"
+  and not "complete"), F4 parser-fuzzing campaigns (DNS wire, CONNECT/
+  ClientHello, log-record; the F4 scaffold `src/fuzz.rs` exists but no
+  campaign receipts), Linux MID/BOUNDARY (MID `mid foundations`/`mid boot`
+  and `fixtures boot` now run green natively; `boundary phase1` remains
+  BLOCKED pending the open gates + review approval), E2E
+  deployment/confinement and the release gates (Slice 7). `getrandom`
+  dependency intake is complete (bead `alumina-zjwk`; `build.rs`
   source-reviewed benign; `cargo deny` advisories and `cargo audit` clean), and
   the startup-DNS transport TIDs it blocked now exist as a provisional draft
   (`src/startup_dns.rs`) with focused actual-DNS runtime tests, a counted

@@ -1,11 +1,12 @@
 # Alumina — Requirement / Resource / Verification Traceability Matrix
 
-**Status:** planning document. Canonical source: `alumina.md` (lines 1–236). This matrix is the single map from every specification section, invariant, resource row, and verification requirement to its design home ([architecture.md](architecture.md)), its execution plan ([build-plan.md](build-plan.md)), and its proof status. **Nothing is verified yet**: this is a planning-only mission, so every status below is `designed` (named design decision), `artifact` (bound/identity chosen, not measured), `gate` (future implementation-proof obligation), `external` (deployment-level release obligation), or `out-of-scope` (explicitly not implemented). No row claims runtime evidence.
+**Status:** traceability matrix. Canonical source: `alumina.md` (lines 1–236). This matrix is the single map from every specification section, invariant, resource row, and verification requirement to its design home ([architecture.md](architecture.md)), its execution plan ([build-plan.md](build-plan.md)), and its proof status. The repository is a **scoped testQA-ready candidate**: an **implemented and correctness-tested** subset now carries local runtime evidence (see below), while external deployment validation and full production qualification remain open (four-claim ledger in README.md; local QA package + measured harness evaluation in `docs/harness-evaluation.md`). Statuses below are `designed` (named design decision), `artifact` (bound/identity chosen, not measured), `gate` (future/proof obligation), `verified-local` (implemented and locally verified — raw exit-0 evidence with exact candidate identity; see the evidence note below), `external` (deployment-level release obligation), or `out-of-scope` (explicitly not implemented). No row below claims *more* than its stated status.
 
 Status vocabulary:
 - **designed** — a named design decision D1–Dn or explicit architecture element exists.
 - **artifact** — a number/identity (stack bound, width, pin) is chosen; not measured/proved.
 - **gate** — a future acceptance/proof step named in a Slice; not yet demonstrated.
+- **verified-local** — implemented and demonstrated locally with raw exit-0 evidence on an exact candidate: e.g. `verify.sh mid foundations`/`mid boot`, `fixtures boot` (supervised typed-terminated positive + exit-78 negatives), `e2e relay`, `e2e shutdown` (native, exact-candidate identity receipts), `deny`/`audit`, `docs`. Each such claim is scoped to the exact candidate it ran against; it is never a production-qualification or external-deployment claim.
 - **external** — deployment/operator obligation; cannot be established internally.
 - **out-of-scope** — explicit non-goal (architecture.md §9 / build-plan.md §7).
 
@@ -26,7 +27,7 @@ Status vocabulary:
 | L60 | Listener: address:port, wildcard allowed, bind failure prevents startup | Slice 1 | designed | |
 | L61 | Names: A-label, case-insensitive compare, single trailing dot, absolute DNS, no search suffixes | Slice 2 | designed | |
 | L62 | Resolver selection: first nameserver, port 53, numeric unicast no zone; fixed for process lifetime | Slice 1 | designed | |
-| L63 | Resolution: bounded DNS stub; resolve before listener; requests never trigger lookups | Slice 2 | designed | |
+| L63 | Resolution: bounded DNS stub; resolve before listener; requests never trigger lookups | Slice 2 | verified-local | Startup + shared-owner path (runtime.rs turn), native DNS evidence (ucxi) |
 | L64 | Startup deadline: fixed order; 90 s absolute post-storage-init; clipped exchanges; check before publication | Slice 1/2 | designed → gate | T1 boot/startup split |
 | L65 | Startup readiness: usable iff eligible non-retired binding; early open; allowance; EX_TEMPFAIL 75 | Slice 1/2 | designed → gate | Startup readiness verification |
 | L66 | Degraded serving: allowance only at startup; no readiness endpoint | Slice 1 | designed | |
@@ -39,9 +40,9 @@ Status vocabulary:
 | L73 | Addresses: global-routable unicast only; fixed boundary table; validate pre-publish + per attempt | Slice 2 | designed → gate | All IPv4/IPv6 ranges |
 | L74 | Cache lifetime: per-name/type entry, generation, deadlines computed never stored, replacements | Slice 2 | designed → gate | G2 cache generation |
 | L75 | Stale retirement: 259200 s stale grace; absolute retirement deadline; no extension; check per attempt | Slice 2 | designed → gate | |
-| L76 | Refresh scheduling: min(300, max(30, TTL)); fixed due table; round-robin; one query per name/type | Slice 2 | designed → gate | |
+| L76 | Refresh scheduling: min(300, max(30, TTL)); fixed due table; round-robin; one query per name/type | Slice 2 | verified-local | Driver wired 579b9ce (starts_due_dns_if_idle + next_selectable_due); native due-initiation gate (ucxi) |
 | L77 | Negative refresh scheduling: SOA-based bounds; NXDOMAIN both types; NODATA queried type | Slice 2 | designed → gate | |
-| L78 | Refresh failures: 1/2/4/8/16/30 backoff; per-type retry distinct; no monopolization | Slice 2 | designed → gate | |
+| L78 | Refresh failures: 1/2/4/8/16/30 backoff; per-type retry distinct; no monopolization | Slice 2 | verified-local | schedule.rs backoff + native retry/backoff gate (ucxi) |
 | L79 | Incident notifications: per-type incidents, one warn, info recovery, hourly error summary | Slice 2/6 | designed → gate | |
 | L80 | Incident summaries: full fields; activity definition; exact-once byte accounting; stale admission count | Slice 6 | designed → gate | |
 | L81 | Reporting bounds: preallocate; window ids not reusable while live tunnel retains one; saturate counters | [architecture.md §5](architecture.md#5-generations-lifetimes-and-anti-alias-t7t1-merged-domains) | artifact → gate | G4 window-id domain |
@@ -63,19 +64,19 @@ Status vocabulary:
 | L144 | Single Owner: worker owns tunnel/DNS/timers/cache | §2, III-1 | designed | |
 | L145 | Cache Publication: preallocate, staging, generation advance, no tunnel cache refs | §5 G2/G3 | designed | |
 | L146 | Scheduling: fair round-robin, budgets, timer recheck, dup-free queue | D6/D7 | designed → gate | T6 app-queue rule |
-| L147 | I/O model: mio+epoll, no async runtime; gates on successful writes | D3; F3 | designed → gate | T2 mio seam |
+| L147 | I/O model: mio+epoll, no async runtime; gates on successful writes | D3; F3 | verified-local | mio op matrix implemented (tests/mio_matrix.rs, alloc-witness); current-serving completeness witness open (cnrd T3) |
 | L148 | Failure handling: panic=abort; no unwrap/expect in production | §7 | designed | |
 | L149 | Runtime surface: CONNECT listener only; SIGTERM only; stdout logs | §7/§8 | designed | |
-| L150 | Runtime prerequisites: non-root, empty caps, no_new_privs; read once; storage before DNS; exit without dealloc | §7/§8; Slice 1 | designed → gate | |
+| L150 | Runtime prerequisites: non-root, empty caps, no_new_privs; read once; storage before DNS; exit without dealloc | §7/§8; Slice 1 | verified-local | fixtures boot (supervised typed-terminated positive + exit-78 negatives) |
 | L152–185 | Initial resource profile: table rows (below) + sizing notes + throughput note | §6 | artifact | Full row matrix in §3 |
 | L187–189 | Lifecycle setup: setup deadline, connect deadlines clipped | §4 | designed → gate | |
 | L190 | Relay: idle deadline, reset on successful writes only | §4 | designed → gate | |
 | L191 | Closure: first-EOF drain, drain deadline, reverse traffic, release exactly once | §4 | designed → gate | |
-| L192 | Shutdown: SIGTERM grace, no extension, drain, exit | §4/§7 | designed → gate | |
+| L192 | Shutdown: SIGTERM grace, no extension, drain, exit | §4/§7 | verified-local | native e2e shutdown gate (ucxi; exact-candidate identity receipts) |
 | L193 | Capacity/logging: 503 no eviction; error entry when tunnel-slot/pending-setup/log-queue usage first exceeds 80% and again when it falls below 70%; reject warn; early-activity warn | Slice 6 | designed → gate | T5 metadata-only warn |
 | L194 | Log delivery: best-effort, allocation-free, whole-record drop+count, nonblocking drain | Slice 6 | designed → gate | |
 | L196–221 | Invariants I–IV (13) | [architecture.md §1](architecture.md#1-governing-invariants-invariant-led-design) | designed → gate | §4 matrix below |
-| L223–236 | Verification requirements (12 categories) | build-plan Slices 1–7 | gate | §5 matrix below |
+| L223–236 | Verification requirements (12 categories) | build-plan Slices 1–7 | gate | §5 matrix below; measured coverage/timing in docs/harness-evaluation.md |
 
 ## 2. Invariant matrix (all 13)
 

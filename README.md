@@ -10,9 +10,10 @@ window that resolves the allowlist within the 90 s window — and the serving
 runtime increment: one cooperative/shared-readiness owner continues that same
 startup listener/cache/clock into actual CONNECT/ClientHello gate relay on a
 serving decision, with the retained serving workspaces preallocated before
-the DNS window. Schedule-driven DNS refresh and deployment remain later
-slices and are **not** implemented; the bounded log queue and SIGTERM
-shutdown are implemented below. See
+the DNS window. Post-boot schedule-driven DNS refresh is wired (commit
+`579b9ce`, see Checkpoint status); deployment remains a later slice and is
+**not** implemented; the bounded log queue and SIGTERM shutdown are
+implemented below. See
 [Checkpoint status and limitations](#checkpoint-status-and-limitations).
 
 Alongside the boot scaffold, the **protocol-serving parsers** are present as
@@ -136,17 +137,20 @@ grounded real fixtures run host-side:
 sh scripts/verify.sh fixtures boot
 ```
 
-**Checkpoint caveat.** The positive fixture's expected banner
+**Checkpoint caveat (resolved 2026-10-12).** The positive fixture previously
+asserted an obsolete non-serving banner
 (`PHASE1-BOOT-OK (non-serving scaffold; DNS and listener are later slices)`)
-predates both the wired startup DNS window/listener and the now-serving
-runtime: against the current binary a Serve decision enters the serving loop
-(no 0-exit banner) and an unresolved-exceeds-allowance run exits 75, so the
-fixture contract as written is stale for the serving binary, and re-deriving
-it (a bounded-stop expectation for the serving loop, with guard-bite proofs)
-is a tracked harness-migration item under mission `alumina-26l1.21`. This
-checkpoint does not claim that fixture green; its applicable checkpoint gates
-(host MID, native Linux dispatch, deny/audit, docs) are the verified evidence
-recorded with it.
+that the serving binary no longer emits. It is migrated (mission
+`alumina-qa-package-20261012`) to a supervised typed-terminal proof: the
+fixture-facts variant runs under the approved privilege profile with the
+resolver pointed at loopback (deterministic connection-refused, no environment
+network dependency), and a supervisor sends a real SIGTERM mid-window. The
+startup window settles the typed terminated outcome (`startup_final
+status="terminated"`, listener never bound), a clean shutdown drain emits
+`shutdown_final status="drained"`, the child is reaped at exit 0, and the
+obsolete non-serving banner is barred from stdout by a fixed-string guard
+(plant/fail/revert/clean proven). The three negative fixtures stay distinct
+exit-78 fail-closed proofs.
 
 (`PODMAN_CONNECTION` selects the builder; default `flock-vm`.) Each fixture
 runs the actually-built static binary from its fixed `config.toml`/`resolv.conf`
@@ -158,7 +162,10 @@ kernel facts (`read_kernel_facts`, `/proc/self/status`) to stderr at actual
 entry. Every fixture asserts that binary-entry facts line exactly, the exact
 stderr diagnostic, and the expected exit (0 / EX_CONFIG 78):
 
-1. non-root + empty caps + `no_new_privs` — phase-1 OK, exit 0, entry facts all-zero;
+1. non-root + empty caps + `no_new_privs` — the fixture-facts variant reaches
+   the typed terminated startup under supervision (startup_final
+   status="terminated" + shutdown_final status="drained"), is reaped at exit
+   0, and never emits the obsolete non-serving banner; entry facts all-zero;
 2. root (euid 0, any UID axis) — rejected, exit 78;
 3. non-root, empty caps, `no_new_privs` missing — rejected, exit 78;
 4. non-root with a raised capability set (rootful builder raises
@@ -296,15 +303,48 @@ does not duplicate the aliases.
 - `tests/eligibility.rs`, `tests/mio_matrix.rs` — eligibility classification and
   native Linux mio operation matrix (feature-gated `alloc-witness`) tests.
 
+## QA package (local testQA candidate)
+
+The local static native QA package bundles the reproducible binary with
+run/validation instructions, a non-secret example configuration, and an
+artifact/source identity record — **no external deployment**. See
+[`qa-package/README.md`](qa-package/README.md) for the full instructions; the
+essentials:
+
+- **Artifact:** three distinct intended native Linux variants are built
+  separately (exercise smoke artifact, MID production release, e2e musl
+  release — scopes and digests in `qa-package/README.md`). The wrapper's
+  exercised artifact is the fixture-facts variant
+  (`target/fixture-facts/release/alumina`) that `validate.sh`'s `fixtures
+  boot` gate builds from exact source and executes under the privilege
+  profile in the same run, then static-ELF-checks and hashes.
+- **Example inputs:** [`qa-package/config.example.toml`](qa-package/config.example.toml)
+  and [`qa-package/resolv.example.conf`](qa-package/resolv.example.conf) — fixed
+  documented inputs, no secrets.
+- **Smoke:** `qa-package/validate.sh` runs the repo-native native harness gates
+  (`fixtures boot` supervised typed-terminated positive + exit-78 negatives,
+  `docs`, deny/audit, MID) against the packaged candidate and captures the raw
+  identity/exits; local isolated positive/negative only, foreground `--rm`
+  runners, no remote target.
+
 ## Checkpoint status and limitations
 
-This repository state is published as a **checkpoint of an incomplete,
-expressly non-serving implementation**, not a deployable or servable candidate.
-The root register
-[`alumina-refinement.md`](alumina-refinement.md) (RF-009/RF-010) and the
-canonical spec `alumina.md` remain the governing status/qualification record; a
-runtime completion claim requires the build-plan gates plus deployment
-qualification, which are not done.
+**Status — four-claim ledger.** The repository state at `579b9ce` is
+**implemented and correctness-tested** (boot, startup-serving/terminated
+settlement, CONNECT/SNI relay, SIGTERM shutdown, post-boot refresh driver) and
+carries a **scoped testQA-ready candidate**: this QA package — a local
+reproducible static binary with example config, run/validation instructions
+and artifact/source identity (see [QA package](#qa-package-local-testqa-candidate)),
+no external deployment claim. It is **not externally deployed/validated** (no
+nonprod target is authorized or identified — see `alumina.md` §8 and
+`docs/build-plan.md` §7) and **not production-qualified**: the F3
+current-serving completeness witness, F4 parser-fuzzing campaigns,
+deployment-confinement/image and performance qualification remain open
+(`docs/build-plan.md` §2/§7; `alumina-refinement.md` RF-009/RF-010). The root
+register [`alumina-refinement.md`](alumina-refinement.md) and the canonical
+spec `alumina.md` remain the governing status/qualification record; a runtime
+completion claim requires the build-plan qualification gates plus deployment
+qualification, which are not done. No claim of the open gates is made.
 
 Verified checkpoint evidence for this snapshot (exact file inventory, sha256
 identity at `HEAD da2b150`, and every raw command with exit code) is recorded
@@ -343,18 +383,21 @@ plus the native Linux dispatch (`sh scripts/verify.sh mid foundations` and
   fragmented/coalesced/partial/FIN/4 MiB echoed streams, and the negative
   vector (disallowed CONNECT 403, SNI mismatch/ECH/malformed hello rejected
   with zero forwarded bytes, dial-refused 502 pre-hello).
-- **No post-startup DNS refresh.** The startup window resolves the allowlist
-  once; schedule-driven refresh/retirement/alternation is implemented in
-  `schedule.rs`/`worker.rs` and the shared-registration seam exists in
-  `runtime.rs`/`startup_dns.rs`, but no schedule-driven post-boot refresh
-  driver is wired.
+- **Post-boot DNS refresh is wired (commit `579b9ce`).** The startup window
+  resolves the allowlist once; schedule-driven
+  refresh/retirement/alternation was implemented in `schedule.rs`/`worker.rs`
+  with the shared-registration seam, and the single serving owner now
+  initiates due queries itself: `Runtime::turn ->
+  starts_due_dns_if_idle -> start_dns_exchange` (runtime.rs), with
+  `poll_timeout` folding the next selectable due
+  (`Schedules::next_selectable_due`, schedule.rs) into the serving wait so
+  the idle loop wakes to refresh. A first-observed SIGTERM suppresses new DNS
+  initiation (the `is_shutdown` branch) and cancels the active exchange with
+  the fixed 8 s grace unchanged.
 - **Bounded allocation-free log queue.** The canonical 256 × 8 KiB alloc-free
   log queue is allocated at boot and wired to nonblocking fd-1/drain in setup;
   `main` routes startup/shutdown records through it and reserves
-  `print!`/`eprintln!` for the earliest boot-only diagnostics. Schedule-driven
-  refresh/retirement/alternation itself remains a later slice: the startup
-  window resolves the allowlist once and no post-boot refresh driver is
-  wired.
+  `print!`/`eprintln!` for the earliest boot-only diagnostics.
 - **SIGTERM graceful shutdown wired and natively proven.** A boot-armed
   safe self-pipe (`signal_hook::low_level::pipe`) carries SIGTERM into the
   single serving poll; a first observation permanently stops admission,
@@ -395,11 +438,15 @@ plus the native Linux dispatch (`sh scripts/verify.sh mid foundations` and
   Still pending for the production candidate: post-build harness/gh-report
   assessment and the E2E scope's remaining native profiles. No claim of those
   pending gates is made.
-- **`scripts/verify.sh` phase-1 harness is stale** relative to the now-serving
-  startup path (`fixtures boot` positive banner; `boundary phase1`
-  NotImplemented lines) as documented above; the phase-1 boundary remains
-  BLOCKED, and harness migration with guard-bite proofs is tracked under
-  mission `alumina-26l1.21`.
+- **`scripts/verify.sh` phase-1 harness migrated** to the now-serving startup
+  path: the `fixtures boot` positive is the supervised typed-terminated
+  startup/cleanup proof (guard-bite plant/fail/revert/clean) and the `boundary
+  phase1` F3 row is corrected by evidence (mio operation matrix is built in
+  `tests/mio_matrix.rs` with alloc-witness controls; the current-serving
+  completeness witness is still open, per cnrd T3). The phase-1 boundary
+  remains BLOCKED only by the genuinely-open gates (F4 campaigns, deployment
+  confinement, review approval) — the RELEASE-NOT-READY diagnostic stays Open,
+  never converted to a release clean.
 - **Deferred/Unknown:** deployment confinement, E2E, fuzz corpora,
   platform/confinement/performance qualification. No external deployment claim
   is made; security scanning push protection is active on the GitHub remote.

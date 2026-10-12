@@ -243,7 +243,7 @@ boot_fixtures() {
             'set -eu' \
             'mkdir -p /work' \
             "printf '%s\\n' 'allowlist = [\"example.com\"]' 'listen = \"0.0.0.0:8080\"' 'startup_unresolved_allowance = 0' > /work/config.toml" \
-            "printf '%s\\n' 'nameserver 1.1.1.1' > /work/resolv.conf" \
+            "printf '%s\\n' 'nameserver 127.0.0.1' > /work/resolv.conf" \
             'chown -R 65534:65534 /work' \
             'apk add --no-cache util-linux >/dev/null 2>&1 || true'
         true
@@ -317,14 +317,101 @@ boot_fixtures() {
         rm -f "$expectf"
     }
 
+    # Fixed-string stdout probes against the captured fixture stdout. The
+    # script runs under `set -eu`, and `$?` is only reliably observed through
+    # an if/else guard (a bare `grep; rc=$?` is killed by set -e the instant
+    # grep is nonzero -- no-match for not_contains is the REQUIRED outcome, so
+    # it must never die silently). Probe error stays distinct from absence:
+    # contains passes only on a match and diagnoses a probe error;
+    # not_contains passes only on the documented no-match exit (1), and a
+    # probe error (2) is a FAIL -- absence is never inferred from an
+    # unreadable or failed probe stream.
+    fixture_require_stdout_contains() {
+        fragment="$1"
+        if grep -Fq -- "$fragment" "$FIXTURE_OUTF"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        if [ "$rc" -eq 0 ]; then
+            return 0
+        fi
+        if [ "$rc" -eq 2 ]; then
+            echo "FIXTURE $FIXTURE_LABEL ERROR: stdout probe failed (exit 2); required fragment unverifiable: $fragment" >&2
+        else
+            echo "FIXTURE $FIXTURE_LABEL FAIL: stdout lacks fixed-string fragment: $fragment" >&2
+        fi
+        exit 1
+    }
+
+    fixture_require_stdout_not_contains() {
+        fragment="$1"
+        if grep -Fq -- "$fragment" "$FIXTURE_OUTF"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        case "$rc" in
+            1)
+                return 0
+                ;;
+            0)
+                echo "FIXTURE $FIXTURE_LABEL FAIL: stdout must not contain fixed-string fragment: $fragment" >&2
+                exit 1
+                ;;
+            *)
+                echo "FIXTURE $FIXTURE_LABEL ERROR: stdout probe failed (exit $rc); absence not established: $fragment" >&2
+                exit 1
+                ;;
+        esac
+    }
+
     # 1) POSITIVE: NoNewPrivs=1, process dropped to uid 65534 with empty cap
-    #    sets -> exit 0 and the phase-1 success banner as an exact stdout line;
-    #    the legitimate stdout inventory lines are retained. The binary's own
-    #    entry facts (all four sets empty, NNP set) must be the exact stderr.
+    #    sets. The fixture-facts variant runs the CURRENT serving startup under
+    #    the approved privilege profile. The resolver points at loopback where
+    #    nothing listens (deterministic connection-refused; no environment
+    #    network dependency), so the 90 s window cannot short-close on an early
+    #    serve decision. A supervisor then signals the mid-window process with
+    #    a real SIGTERM and bounded-waits for its exit: the startup window
+    #    settles the typed terminated outcome (startup_final status="terminated",
+    #    no listener bound), a clean shutdown drain emits shutdown_final
+    #    status="drained", and the child exits 0 -- never the obsolete
+    #    non-serving scaffold banner, never a hung serve (a child still alive
+    #    after signal + 10 s fails the fixture; a supervised-child deadline is
+    #    a FAIL, never a pass). The binary's own entry facts (all four sets
+    #    empty, NNP set) must remain the exact stderr.
+    pos_script=$(cat <<'POSPOS'
+cd /work
+/app/target/fixture-facts/release/alumina &
+pid=$!
+sleep 3
+kill -TERM "$pid" 2>/dev/null || true
+i=0
+while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do i=$((i+1)); sleep 1; done
+if kill -0 "$pid" 2>/dev/null; then
+    echo "FIXTURE-POSITIVE-FAIL: supervised serving child alive after SIGTERM + 10s"
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null
+    exit 2
+fi
+if wait "$pid"; then rc=0; else rc=$?; fi
+printf "FIXTURE-POSITIVE-SUPERVISED: reaped child rc=%s\n" "$rc"
+exit "$rc"
+POSPOS
+)
     run_fixture "positive" 0 "$CONN" \
-        "setpriv --reuid 65534 --regid 65534 --clear-groups /bin/sh -c 'cd /work && /app/target/fixture-facts/release/alumina'" \
+        "setpriv --reuid 65534 --regid 65534 --clear-groups /bin/sh -c '$pos_script'" \
         --security-opt no-new-privileges --user 0:0
-    fixture_require_stdout_exact "PHASE1-BOOT-OK (non-serving scaffold; DNS and listener are later slices)"
+    # The typed records prove the actual startup-serving/typed-terminal path:
+    # the window ended on the terminated decision and the drain was clean. The
+    # obsolete non-serving scaffold banner is barred: its presence would be the
+    # false-clean this migration removes.
+    fixture_require_stdout_contains "level=info kind=startup_final"
+    fixture_require_stdout_contains 'status="terminated"'
+    fixture_require_stdout_contains "level=info kind=shutdown_final"
+    fixture_require_stdout_contains 'status="drained"'
+    fixture_require_stdout_contains "FIXTURE-POSITIVE-SUPERVISED: reaped child rc=0"
+    fixture_require_stdout_not_contains "PHASE1-BOOT-OK"
     fixture_require_stderr_exact "kernel-facts: ruid=65534 euid=65534 suid=65534 fsuid=65534 cap_eff=0 cap_prm=0 cap_amb=0 no_new_privs=1"
 
     # 2) ROOT: euid 0 -> EX_CONFIG 78 (root-UID diagnostic); all four UID axes
@@ -406,7 +493,7 @@ python3 /app/scripts/fixture_metadata_probe.py /app/target/fixture-facts/release
     }
     echo "METADATA-OK: executed variant ordinary non-setid, security.capability absent, sha256 matches $variant_sha"
 
-    echo "BOOT-FIXTURES-RAN (separate-stream capture; negative stdout empty + stderr byte-exact facts+diagnostic; positive exact banner line with stdout inventory retained; integer exit 0/78; all cap sets observed non-empty in caps-effective; permitted-only applicability disposition; production digest unchanged; setid-reject + security.capability absence + variant sha256 match proven)"
+    echo "BOOT-FIXTURES-RAN (separate-stream capture; negative stdout empty + stderr byte-exact facts+diagnostic; positive supervised typed-terminated startup record (startup_final status=terminated + shutdown_final status=drained, reaped exit 0) with retained stdout; integer exit 0/78; all cap sets observed non-empty in caps-effective; permitted-only applicability disposition; production digest unchanged; setid-reject + security.capability absence + variant sha256 match proven)"
 }
 
 # One effective Node environment preflight: refuse ANY set NODE_OPTIONS/NODE_PATH
@@ -747,7 +834,7 @@ boundary_phase1() {
     identity_snapshot "$IDENTITY_AFTER"
     identity_compare "$IDENTITY_BEFORE" "$IDENTITY_AFTER"
     artifact_identity target/release/alumina || exit 1
-    echo "NotImplemented: F3 mio operation matrix (Slice 2 gate)"
+    echo "F3 mio operation matrix: IMPLEMENTED (tests/mio_matrix.rs: 8 tests incl. linux_epoll_operation_matrix with poll/register/reregister/deregister + alloc-witness controls; recorded native release evidence README:63-70, z9m0/po3c); current-serving completeness witness still OPEN (cnrd T3) - not 'unbuilt matrix', not 'complete'"
     echo "NotImplemented: DNS wire parser fuzz (Slice 2)"
     echo "NotImplemented: CONNECT/ClientHello parser fuzz (Slices 3-4)"
     echo "NotImplemented: log-record encoding fuzz (Slice 6)"
