@@ -163,6 +163,13 @@ impl ServeStorage {
             .saturating_add(now.saturating_duration_since(self.origin).as_secs())
     }
 
+    pub(crate) fn schedule_due_instant(&self, due: u64) -> Instant {
+        let secs = due.saturating_sub(self.now0);
+        self.origin
+            .checked_add(Duration::from_secs(secs))
+            .unwrap_or_else(Instant::now)
+    }
+
     /// Re-anchors the retained worker and cache-seconds authority to the exact
     /// origin and DNS epoch a startup window (or a test) establishes. Called
     /// by [`Self::run_startup_within`] after `resolve_window` so serving

@@ -387,6 +387,38 @@ impl Schedules {
         }
         Ok(None)
     }
+
+    /// The earliest whole-second moment at which some non-pending slot becomes
+    /// selectable for a due refresh, for a single owner folding the refresh
+    /// schedule into its one serving poll wait: a slot contributes the later of
+    /// its due time and start-rate guard, and an in-flight slot contributes
+    /// nothing (the outstanding exchange's own deadline already bounds the wait
+    /// and its outcome rewrites the due time). Returns `Some(now)` when work is
+    /// already selectable this instant, and `None` when no slot is scheduled.
+    pub fn next_selectable_due(&self, now: u64) -> Option<u64> {
+        let mut earliest: Option<u64> = None;
+        let total = self.name_count() * 2;
+        for linear in 0..total {
+            let name = linear / 2;
+            let family = match linear % 2 {
+                0 => Family::A,
+                _ => Family::Aaaa,
+            };
+            let slot = self.slot(name, family);
+            if slot.pending {
+                continue;
+            }
+            let Some(due) = slot.due else {
+                continue;
+            };
+            let selectable_at = due.max(slot.not_before);
+            earliest = Some(earliest.map_or(selectable_at, |e| e.min(selectable_at)));
+        }
+        match earliest {
+            Some(e) if e <= now => Some(now),
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +546,59 @@ mod tests {
         assert!(
             schedules.select_due(1).unwrap().is_some(),
             "completed slot re-selectable after the one-second start guard"
+        );
+    }
+
+    #[test]
+    fn next_selectable_due_guides_the_owner_wake() {
+        let mut schedules = Schedules::new(2).unwrap();
+        assert_eq!(
+            schedules.next_selectable_due(1000),
+            None,
+            "nothing scheduled yields no wake"
+        );
+
+        schedules.overwrite_due_at(0, Family::A, 1000).unwrap();
+        assert_eq!(
+            schedules.next_selectable_due(999),
+            Some(1000),
+            "a future due reports the exact selectable moment"
+        );
+        assert_eq!(
+            schedules.next_selectable_due(1005),
+            Some(1005),
+            "already-selectable work clamps the wake to the present"
+        );
+
+        let token = schedules.select_due(1005).unwrap().unwrap();
+        assert_eq!(
+            (token.name(), token.family()),
+            (0, Family::A),
+            "the due slot is selected by the owner"
+        );
+        assert_eq!(
+            schedules.next_selectable_due(1005),
+            None,
+            "an in-flight slot contributes no wake (the exchange deadline owns the wait)"
+        );
+
+        schedules.overwrite_due_at(1, Family::Aaaa, 1050).unwrap();
+        assert_eq!(
+            schedules.next_selectable_due(1005),
+            Some(1050),
+            "a different slot's future due still drives the owner wake"
+        );
+
+        schedules.release_selection(0, Family::A).unwrap();
+        assert_eq!(
+            schedules.next_selectable_due(1005),
+            Some(1006),
+            "the one-second start guard holds a due slot until it elapses"
+        );
+        assert_eq!(
+            schedules.next_selectable_due(1007),
+            Some(1007),
+            "once the guard elapses the slot is selectable now"
         );
     }
 

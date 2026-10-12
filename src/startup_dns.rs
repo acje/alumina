@@ -894,6 +894,10 @@ impl StartupDns {
         self.addr = addr;
     }
 
+    pub(crate) fn peer(&self) -> SocketAddr {
+        self.addr
+    }
+
     /// Registers the retained transport with an external single-poll owner so
     /// DNS freshness joins traffic readiness in one wait. The private poll is
     /// bypassed from here on: the shared registry is the source's only

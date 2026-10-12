@@ -15,7 +15,9 @@ use mio::net::TcpListener;
 
 use crate::serve::{ServeStorage, StartupError, StartupOutcome};
 use crate::serving::{ServeError, Serving, Shutdown, ShutdownExit};
-use crate::startup_dns::{STARTUP_WINDOW_SECS, StartupDnsError, TurnResult};
+use crate::startup_dns::{
+    EXCHANGE_DEADLINE_SECS, STARTUP_WINDOW_SECS, StartupDnsError, TurnResult,
+};
 
 /// The bounded number of cooperative DNS advances a single owner turn may make,
 /// so a chatty or stalled peer can never starve traffic within a turn.
@@ -241,6 +243,7 @@ impl Runtime {
     pub fn turn(&mut self, timeout: Option<Duration>) -> Result<(), ServeError> {
         self.serving.run_once(timeout)?;
         if !self.serving.is_shutdown() {
+            self.starts_due_dns_if_idle()?;
             let event_seen = self.serving.take_dns_event();
             let sendable = self.dns_sendable_without_wait();
             let deadline_due = self.dns_deadline_due();
@@ -250,6 +253,30 @@ impl Runtime {
             self.serving.sync_dns_shared()?;
         }
         self.serving.storage_mut().logs_mut().drain_sink();
+        Ok(())
+    }
+
+    fn starts_due_dns_if_idle(&mut self) -> Result<(), ServeError> {
+        if self.serving.storage().dns().has_active_exchange() {
+            return Ok(());
+        }
+        let secs = self.serving.storage().dns().now_u64();
+        let Some(selected) = self
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .select_due(secs)
+            .map_err(StartupDnsError::from)
+            .map_err(ServeError::from)?
+        else {
+            return Ok(());
+        };
+        let nameserver = self.serving.storage().dns().peer();
+        let deadline = Instant::now() + Duration::from_secs(EXCHANGE_DEADLINE_SECS);
+        self.serving
+            .storage_mut()
+            .start_dns_exchange(nameserver, selected.name(), selected.family(), deadline)
+            .map_err(ServeError::from)?;
         Ok(())
     }
 
@@ -1221,5 +1248,586 @@ mod tests {
             "the final name's answer became readable in the same poll batch, so the \
              post-batch turn re-checks shutdown before advance_dns and never counts it resolved"
         );
+    }
+
+    enum SessionGate {
+        Answer(Box<dyn FnMut(Vec<u8>) -> Option<Vec<u8>>>),
+        Silent,
+    }
+
+    fn spawn_supervised_responder(
+        on_session: impl FnMut(usize) -> SessionGate + Send + 'static,
+    ) -> (
+        SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = StdListener::bind("127.0.0.1:0").expect("bind responder");
+        let addr = listener.local_addr().expect("responder addr");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            let mut on_session = on_session;
+            let mut session = 0usize;
+            loop {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                session += 1;
+                if stop_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let gate = on_session(session);
+                match gate {
+                    SessionGate::Answer(mut answer) => {
+                        while let Some(query) = read_query(&mut sock) {
+                            let Some(reply) = answer(query) else {
+                                break;
+                            };
+                            if write_response(&mut sock, &reply).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    SessionGate::Silent => {
+                        let mut sink = [0u8; 64];
+                        loop {
+                            match sock.read(&mut sink) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    fn spawn_supervised_positive_with_count() -> (
+        SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        thread::JoinHandle<()>,
+    ) {
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queries_in_responder = queries.clone();
+        let (addr, stop, handle) = spawn_supervised_responder(move |_session| {
+            let queries_for_query = queries_in_responder.clone();
+            SessionGate::Answer(Box::new(move |query| {
+                queries_for_query.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                positive_response(&query)
+            }))
+        });
+        (addr, stop, queries, handle)
+    }
+
+    fn spawn_supervised_first_session_positive_with_count() -> (
+        SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        thread::JoinHandle<()>,
+    ) {
+        let sessions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sessions_for_thread = sessions.clone();
+        let (addr, stop, handle) = spawn_supervised_responder(move |session| {
+            sessions_for_thread.store(session, std::sync::atomic::Ordering::SeqCst);
+            if session == 1 {
+                SessionGate::Answer(Box::new(|query| positive_response(&query)))
+            } else {
+                SessionGate::Silent
+            }
+        });
+        (addr, stop, sessions, handle)
+    }
+
+    fn stop_and_join_responder(
+        addr: SocketAddr,
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    ) {
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::net::TcpStream::connect(addr)
+            .expect("unblock the responder accept for a clean join")
+            .shutdown(std::net::Shutdown::Both)
+            .ok();
+        handle.join().expect("join responder thread");
+    }
+
+    #[test]
+    fn idle_runtime_wakes_indefinite_poll_onto_due_refresh_and_renews() {
+        let t = thread::Builder::new()
+            .name("runtime-idle-refresh-falsifier".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(idle_refresh_body)
+            .expect("spawn idle-refresh falsifier thread");
+        t.join().expect("idle-refresh falsifier thread");
+    }
+
+    fn idle_refresh_body() {
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut owner = Preallocated::preallocate(storage, traffic).expect("preallocate");
+        let (responder_addr, stop, queries, responder) = spawn_supervised_positive_with_count();
+        let outcome = owner
+            .run_startup_within(responder_addr, 1000, Duration::from_secs(3))
+            .expect("startup window");
+        assert_eq!(
+            outcome.decision,
+            StartupDecision::Serve(ServingMode::Full),
+            "the startup window must resolve the allowlist name"
+        );
+        let mut runtime = owner
+            .attach(outcome.listener.expect("serving listener"))
+            .expect("attach");
+
+        let queries_at_attach = queries.load(std::sync::atomic::Ordering::SeqCst);
+        let secs = runtime.serving().storage().dns().now_u64();
+        runtime
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .overwrite_due_at(0, Family::A, secs)
+            .expect("due the A family now");
+        assert!(
+            !runtime.serving().storage().dns().has_active_exchange(),
+            "the retained transport must be idle before the due probe"
+        );
+
+        let probe_start = Instant::now();
+        let mut started = false;
+        for _ in 0..200 {
+            runtime
+                .turn(None)
+                .expect("owner turn on the production indefinite poll");
+            if runtime.serving().storage().dns().has_active_exchange() {
+                started = true;
+                break;
+            }
+        }
+        assert!(
+            probe_start.elapsed() < Duration::from_secs(10),
+            "the indefinite production poll must wake on its own fold to start a due refresh"
+        );
+        assert!(
+            started,
+            "an idle serving owner must auto-start a due refresh under the production \
+             indefinite poll, woken by its own poll fold rather than a test-supplied timeout"
+        );
+
+        let pre_refresh_due = runtime
+            .serving()
+            .storage()
+            .schedules()
+            .due_time(0, Family::A)
+            .expect("A due query")
+            .expect("A scheduled");
+        let mut renewed = false;
+        for _ in 0..200 {
+            if !runtime.serving().storage().dns().has_active_exchange()
+                && let Ok(Some(due)) = runtime
+                    .serving()
+                    .storage()
+                    .schedules()
+                    .due_time(0, Family::A)
+                && due > pre_refresh_due
+            {
+                renewed = true;
+                break;
+            }
+            runtime
+                .turn(None)
+                .expect("owner turn to renewal on the indefinite poll");
+        }
+        let queries_after = queries.load(std::sync::atomic::Ordering::SeqCst);
+        stop_and_join_responder(responder_addr, &stop, responder);
+        assert!(
+            renewed,
+            "the auto-initiated refresh must publish a positive and reschedule the family \
+             ahead of its pre-refresh due"
+        );
+        assert!(
+            queries_after > queries_at_attach,
+            "the auto-initiated refresh must issue a real query on the live responder"
+        );
+        assert!(
+            name_published(&runtime, 0, Family::A),
+            "a published renewal leaves the family usable"
+        );
+    }
+
+    #[test]
+    fn due_refresh_renews_across_cycles_under_indefinite_poll() {
+        let t = thread::Builder::new()
+            .name("runtime-multicycle-falsifier".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(multicycle_body)
+            .expect("spawn multicycle falsifier thread");
+        t.join().expect("multicycle falsifier thread");
+    }
+
+    fn multicycle_body() {
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut owner = Preallocated::preallocate(storage, traffic).expect("preallocate");
+        let (responder_addr, stop, queries, responder) = spawn_supervised_positive_with_count();
+        let outcome = owner
+            .run_startup_within(responder_addr, 1000, Duration::from_secs(3))
+            .expect("startup window");
+        assert_eq!(
+            outcome.decision,
+            StartupDecision::Serve(ServingMode::Full),
+            "startup must resolve the allowlist name"
+        );
+        let mut runtime = owner
+            .attach(outcome.listener.expect("serving listener"))
+            .expect("attach");
+
+        let mut completed_cycles = 0usize;
+        for _ in 0..2 {
+            let queries_before = queries.load(std::sync::atomic::Ordering::SeqCst);
+            let secs = runtime.serving().storage().dns().now_u64();
+            runtime
+                .serving
+                .storage_mut()
+                .schedules_mut()
+                .overwrite_due_at(0, Family::A, secs)
+                .expect("due the A family for a refresh cycle");
+            loop {
+                runtime
+                    .turn(None)
+                    .expect("owner turn on the production indefinite poll");
+                if !runtime.serving().storage().dns().has_active_exchange()
+                    && runtime
+                        .serving()
+                        .storage()
+                        .schedules()
+                        .due_time(0, Family::A)
+                        .expect("A due query")
+                        .expect("A scheduled")
+                        > secs
+                {
+                    break;
+                }
+                assert!(
+                    queries.load(std::sync::atomic::Ordering::SeqCst) < queries_before + 64,
+                    "refresh cycle must not stall on the resolver"
+                );
+            }
+            let queries_after = queries.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                queries_after > queries_before,
+                "each refresh cycle must issue a real query on the live responder \
+                 (cycle {})",
+                completed_cycles + 1
+            );
+            assert!(
+                name_published(&runtime, 0, Family::A),
+                "the family must stay usable across refresh cycles"
+            );
+            completed_cycles += 1;
+        }
+        stop_and_join_responder(responder_addr, &stop, responder);
+        assert_eq!(
+            completed_cycles, 2,
+            "the production indefinite poll must drive two complete real-query refresh cycles"
+        );
+    }
+
+    #[test]
+    fn idle_runtime_retries_failed_refresh_on_backoff() {
+        let t = thread::Builder::new()
+            .name("runtime-refresh-retry-falsifier".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(refresh_retry_body)
+            .expect("spawn refresh-retry falsifier thread");
+        t.join().expect("refresh-retry falsifier thread");
+    }
+
+    fn refresh_retry_body() {
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut owner = Preallocated::preallocate(storage, traffic).expect("preallocate");
+        let (responder_addr, stop, sessions, responder) =
+            spawn_supervised_first_session_positive_with_count();
+        let outcome = owner
+            .run_startup_within(responder_addr, 1000, Duration::from_secs(3))
+            .expect("startup window");
+        assert_eq!(
+            outcome.decision,
+            StartupDecision::Serve(ServingMode::Full),
+            "the first responder session must resolve the allowlist name"
+        );
+        let mut runtime = owner
+            .attach(outcome.listener.expect("serving listener"))
+            .expect("attach");
+
+        let secs = runtime.serving().storage().dns().now_u64();
+        runtime
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .overwrite_due_at(0, Family::A, secs)
+            .expect("due the A family now");
+        runtime
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .overwrite_due_at(0, Family::Aaaa, secs)
+            .expect("due the Aaaa family now");
+
+        let mut inflight = false;
+        for _ in 0..200 {
+            runtime
+                .turn(None)
+                .expect("owner turn to first refresh on the indefinite poll");
+            if runtime.serving().storage().dns().has_active_exchange() {
+                inflight = true;
+                break;
+            }
+        }
+        assert!(
+            inflight,
+            "the owner must auto-start the first due refresh under the production indefinite poll"
+        );
+
+        let mut receiving = false;
+        for _ in 0..200 {
+            runtime
+                .turn(None)
+                .expect("owner turn advancing the first refresh");
+            if matches!(
+                runtime.serving().storage().dns().exchange_step(),
+                Some(crate::startup_dns::ExchangeStep::Receiving)
+            ) {
+                receiving = true;
+                break;
+            }
+        }
+        assert!(
+            receiving,
+            "the first refresh must reach the silent session and wait on the response"
+        );
+        let mut fresh_session = false;
+        for _ in 0..200 {
+            if sessions.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                fresh_session = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            fresh_session,
+            "the first refresh must have reached a fresh session"
+        );
+
+        let probe_start = Instant::now();
+        runtime.turn(None).expect("emission-free in-flight turn");
+        let probe_elapsed = probe_start.elapsed();
+        assert!(
+            probe_elapsed >= Duration::from_secs(1),
+            "the owner must wait out the real exchange deadline while an exchange is in flight \
+             with a selectable-now sibling (no zero-wait busy-spin): {probe_elapsed:?}"
+        );
+
+        let mut retried_after_failure = false;
+        for _ in 0..60 {
+            runtime.turn(None).expect("owner turn on backoff");
+            let seen = sessions.load(std::sync::atomic::Ordering::SeqCst);
+            if seen >= 3 {
+                retried_after_failure = true;
+                break;
+            }
+        }
+        stop_and_join_responder(responder_addr, &stop, responder);
+        assert!(
+            retried_after_failure,
+            "after a silent refresh session fails, the owner must wake on the due/backoff and \
+             re-initiate on its own (session count never reached 3)"
+        );
+        assert!(
+            !runtime.serving().is_shutdown(),
+            "the refresh owner stays serving while background retries continue"
+        );
+    }
+
+    #[test]
+    fn sigterm_stops_due_refresh_flow() {
+        let t = thread::Builder::new()
+            .name("runtime-sigterm-suppression-falsifier".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(sigterm_suppression_body)
+            .expect("spawn sigterm-suppression falsifier thread");
+        t.join().expect("sigterm-suppression falsifier thread");
+    }
+
+    fn sigterm_suppression_body() {
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut owner = Preallocated::preallocate(storage, traffic).expect("preallocate");
+        let (responder_addr, stop, _queries, responder) = spawn_supervised_positive_with_count();
+        let outcome = owner
+            .run_startup_within(responder_addr, 1000, Duration::from_secs(3))
+            .expect("startup window");
+        assert_eq!(
+            outcome.decision,
+            StartupDecision::Serve(ServingMode::Full),
+            "the startup window must resolve the allowlist name"
+        );
+        let mut runtime = owner
+            .attach(outcome.listener.expect("serving listener"))
+            .expect("attach");
+
+        let secs = runtime.serving().storage().dns().now_u64();
+        runtime
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .overwrite_due_at(0, Family::A, secs)
+            .expect("due the A family now");
+
+        let mut started = false;
+        for _ in 0..200 {
+            runtime
+                .turn(None)
+                .expect("owner turn to due start on the indefinite poll");
+            if runtime.serving().storage().dns().has_active_exchange() {
+                started = true;
+                break;
+            }
+        }
+        assert!(
+            started,
+            "a due refresh must start before the signal so the suppression probe is meaningful"
+        );
+        assert!(
+            !runtime.serving().is_shutdown(),
+            "the owner is still serving before the signal byte lands"
+        );
+
+        runtime
+            .serving
+            .signal_wake_mut()
+            .expect("self-pipe test write end")
+            .write_all(&[1])
+            .expect("queue a SIGTERM byte through the real self-pipe");
+        let secs = runtime.serving().storage().dns().now_u64();
+        runtime
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .overwrite_due_at(0, Family::A, secs)
+            .expect("re-arm the A family due after the signal");
+        runtime
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .overwrite_due_at(0, Family::Aaaa, secs)
+            .expect("re-arm the Aaaa family due after the signal");
+        for _ in 0..20 {
+            runtime
+                .turn(Some(Duration::from_millis(5)))
+                .expect("owner turn during shutdown");
+            assert!(
+                runtime.serving().is_shutdown(),
+                "the first observed SIGTERM enters the draining phase"
+            );
+            assert!(
+                !runtime.serving().storage().dns().has_active_exchange(),
+                "no new DNS initiation may occur after the first SIGTERM even with due refresh work"
+            );
+        }
+        stop_and_join_responder(responder_addr, &stop, responder);
+    }
+
+    #[cfg(feature = "alloc-witness")]
+    #[test]
+    fn due_refresh_owner_path_spends_zero_allocations() {
+        std::thread::Builder::new()
+            .name("refresh-alloc-witness".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(refresh_alloc_witness_body)
+            .expect("spawn refresh alloc witness")
+            .join()
+            .expect("refresh alloc witness thread");
+    }
+
+    #[cfg(feature = "alloc-witness")]
+    fn refresh_alloc_witness_body() {
+        let port = ephemeral_port();
+        let storage = ServeStorage::boot(&config(port)).expect("boot storage");
+        let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+        let mut owner = Preallocated::preallocate(storage, traffic).expect("preallocate");
+        let (responder_addr, stop, _queries, responder) = spawn_supervised_positive_with_count();
+        let outcome = owner
+            .run_startup_within(responder_addr, 1000, Duration::from_secs(3))
+            .expect("startup window");
+        assert_eq!(
+            outcome.decision,
+            StartupDecision::Serve(ServingMode::Full),
+            "startup resolves before the witness"
+        );
+        let mut runtime = owner
+            .attach(outcome.listener.expect("serving listener"))
+            .expect("attach");
+        let secs = runtime.serving().storage().dns().now_u64();
+        runtime
+            .serving
+            .storage_mut()
+            .schedules_mut()
+            .overwrite_due_at(0, Family::A, secs)
+            .expect("due today for the witness");
+
+        let runtime = {
+            let (runtime, counts) =
+                crate::alloc::run_phase(crate::alloc::Phase::BackgroundRefresh, || {
+                    let mut runtime = runtime;
+                    let pre_due = runtime
+                        .serving()
+                        .storage()
+                        .schedules()
+                        .due_time(0, Family::A)
+                        .expect("A due query")
+                        .expect("A scheduled");
+                    let mut published = false;
+                    for _ in 0..200 {
+                        runtime
+                            .turn(Some(Duration::from_millis(5)))
+                            .expect("witness owner turn");
+                        if !runtime.serving().storage().dns().has_active_exchange() {
+                            let Ok(Some(due)) = runtime
+                                .serving()
+                                .storage()
+                                .schedules()
+                                .due_time(0, Family::A)
+                            else {
+                                continue;
+                            };
+                            if due > pre_due {
+                                published = true;
+                                break;
+                            }
+                        }
+                    }
+                    assert!(
+                        published,
+                        "the due-initiated refresh must publish a positive renewal in the witness"
+                    );
+                    runtime
+                });
+            assert!(
+                counts.all_zero(),
+                "the actual refresh owner path must allocate/deallocate nothing: {counts:?}"
+            );
+            runtime
+        };
+
+        stop_and_join_responder(responder_addr, &stop, responder);
+        std::mem::forget(runtime);
     }
 }

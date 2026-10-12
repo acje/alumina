@@ -2081,6 +2081,20 @@ impl Serving {
         {
             earliest = Some(log_wake);
         }
+        if !self.storage.dns().has_active_exchange()
+            && let Some(due) = self
+                .storage
+                .schedules()
+                .next_selectable_due(self.storage.cache_secs(now))
+        {
+            let wake = self.storage.schedule_due_instant(due);
+            if wake <= now {
+                let floor = now + Duration::from_millis(100);
+                earliest = Some(earliest.map_or(floor, |e| e.min(floor)));
+            } else if earliest.is_none_or(|e| wake < e) {
+                earliest = Some(wake);
+            }
+        }
         let deadline = earliest?;
         if deadline <= now {
             Some(Duration::ZERO)
@@ -2216,6 +2230,25 @@ mod tests {
                 serving.poll_timeout(),
                 Some(Duration::ZERO),
                 "a queued runnable log folds to an immediate wake with no traffic (T3)"
+            );
+        });
+    }
+
+    #[test]
+    fn serving_poll_timeout_folds_bounded_floor_for_idle_selectable_now_due() {
+        with_serving_stack(ephemeral_port(), |serving| {
+            let secs = serving.storage().dns().now_u64();
+            serving
+                .storage_mut()
+                .schedules_mut()
+                .overwrite_due_at(0, crate::cache::Family::A, secs)
+                .expect("due the A family now");
+            let wait = serving.poll_timeout();
+            assert!(
+                matches!(wait, Some(d) if d >= Duration::from_millis(50) && d <= Duration::from_millis(200)),
+                "an idle transport with a selectable-now due slot folds a bounded floor wake so \
+                 an indefinite production poll initiates the refresh without busy-spinning: \
+                 {wait:?}"
             );
         });
     }
