@@ -1,452 +1,143 @@
-# Alumina — phase-1 foundations + boot + wired serving runtime
+# Alumina — single-binary HTTPS CONNECT egress proxy
 
-Statically-linked, single-binary HTTP CONNECT egress proxy for constrained
-servers. This repository currently contains the phase-1 foundations slice
-(exact toolchain pin F0, allocation-counter witness F1, deterministic scripted
-I/O outcomes F2, parser-target/corpus ownership scaffolding F4), the boot
-increment: strict config/resolver validated types, Linux startup privilege
-preflight, the fixed boot-storage inventory, and a boot-owned startup DNS
-window that resolves the allowlist within the 90 s window — and the serving
-runtime increment: one cooperative/shared-readiness owner continues that same
-startup listener/cache/clock into actual CONNECT/ClientHello gate relay on a
-serving decision, with the retained serving workspaces preallocated before
-the DNS window. Post-boot schedule-driven DNS refresh is wired (commit
-`579b9ce`, see Checkpoint status); deployment remains a later slice and is
-**not** implemented; the bounded log queue and SIGTERM shutdown are
-implemented below. See
-[Checkpoint status and limitations](#checkpoint-status-and-limitations).
+Statically-linked, single-binary HTTPS CONNECT egress proxy for constrained
+servers (golden-path fixed profile). **Sole governing specification:**
+[`alumina.md`](alumina.md) (repository root) — no other document changes
+canonical requirements; its bytes are fixed (sha256
+`322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836`).
 
-Alongside the boot scaffold, the **protocol-serving parsers** are present as
-provisional, instrument-free implementations: DNS response classification
-(`dns.rs`), CONNECT request-head parsing (`connect.rs`), TLS 1.3 ClientHello
-inspection/framing (`client_hello.rs`), plus shared normalized-hostname types
-(`config.rs` `FixedHostname`). "Provisional" is deliberate — they are
-correct-by-construction, fixed-storage inputs to later slices, **not**
-qualified serving components. See [Provisional protocol-parser status](#provisional-protocol-parser-status).
+## State (four-claim ledger)
 
+At HEAD `8934adb` the repository is:
 
-## Provisional protocol-parser status
+1. **Implemented and correctness-tested** — boot (strict config/resolver,
+   privilege preflight, startup-DNS window), the wired single-owner serving
+   runtime (`main` → `Runtime::serve`), CONNECT/ClientHello relay, SIGTERM
+   shutdown, post-boot DNS refresh driver.
+2. **A scoped local testQA candidate** — reproducible static binary, example
+   config, identity record ([qa-package/README.md](qa-package/README.md));
+   **no external deployment**.
+3. **Not deployed/validated** — no nonprod/prod target is authorized or
+   identified (`alumina.md` §8; build-plan §7).
+4. **Not production-qualified** — open gates: F3 current-serving completeness
+   witness, F4 parser-fuzzing campaigns, deployment confinement / initial
+   deployment, performance (build-plan §2/§7; traceability §5). The
+   qualification stays BLOCKED until those pass; **no runtime completion claim
+   is made**.
 
-A subset of the protocol-serving parser layer was implemented product-first,
-before the qualification gates in `docs/build-plan.md` (§0). These hold **no**
-servable-status claim and have not passed those gates:
+## Documents (ownership)
 
-| Component | Provisionally implemented | Deferred qualification |
-| --- | --- | --- |
-| DNS response classification (`src/dns.rs`) | covering-SOA rule, bounded CNAME ≤8, NODATA/NXDOMAIN, unknown-RR skip, case-insensitive owners, ≤128 RR bound, fixed reusable parse workspace + fixed binding storage (0 heap in parse under `alloc-witness`), authority-only SOA negative provenance, per-owner candidate cap | F2 scripted malformed/timeout outcomes, F4 wire-parser fuzzing, Linux MID/BOUNDARY |
-| CONNECT request-head parse (`src/connect.rs`) | exact HTTP/1.x version, first-CRLFCRLF boundary (byte-conservation via `head_len`), tchar headers, fixed 8 KiB head | F1 serving-phase witness, F2 boundary/deadline scripts, F4 framing fuzzing |
-| TLS 1.3 ClientHello gate (`src/client_hello.rs`) | record/handshake reassembly, fixed storage, ECH rejection, SNI normalization, duplicate-extension and length-integrity rejection | F1 serving-phase witness, F2 gate-transition scripts (D3/Boundary A/B, early activity), F4 fuzzing, TLS 1.3 endpoint interop |
-| Normalized hostname (`src/config.rs` `FixedHostname`) | shared fixed `[u8; FQDN_MAX_LEN]` lowercase type feeding the two gates | — (no gate beyond the parsers that use it) |
-| Startup-DNS transport (`src/startup_dns.rs`) | one reusable mio poll/event connection, fixed 512 B query + 16386 B response buffers, typed non-allocating errors separated into counted per-exchange network failures vs fatal storage/entropy/lifecycle/token-exhaustion, monotonic poll-token generation that refuses (rather than wraps) on exhaustion, explicit register/deregister lifecycle (state reset even when deregister errors), every counted failure advanced in the schedule backoff, half-open exchange deadline clipped to the startup window | serving integration, connecting route, F4 fuzzing, BOUNDARY (the transport itself was independently reviewed: `bd alumina-4z6b`/`alumina-c14m`; read-outcome classification/connectedness approved in the read-triage cycle `bd alumina-vl6d`) |
+| Document | Role |
+|---|---|
+| [`alumina.md`](alumina.md) | **Canonical spec** — sole governing requirements |
+| [docs/architecture.md](docs/architecture.md) | Conceptual design + as-built single-owner mapping (decisions D1–D7) |
+| [docs/build-plan.md](docs/build-plan.md) | Qualification owner — gates F0–F4, seven slices, current status |
+| [docs/traceability.md](docs/traceability.md) | Requirement → design → proof matrix + unresolved-evidence ledger |
+| [alumina-refinement.md](alumina-refinement.md) | Material normative candidates for user review only |
+| [docs/harness-evaluation.md](docs/harness-evaluation.md) | Measured harness fitness (dated, scoped) |
+| [qa-package/README.md](qa-package/README.md) | Local testQA run/validation instructions |
 
-Each parser core carries focused falsifier/positive tests per repaired defect
-(review report `alumina-p4ot`, repair directives `alumina-26l1.1` and
-`alumina-26l1.2`), verified
-single-crate with `cargo +1.99.0 atest -p alumina --locked`
-(all green), `cargo +1.99.0 fmt --all --check`, `cargo +1.99.0 aclippy -p
-alumina --locked --all-targets -- -D warnings`. The endpoint parser cores
-(DNS/CONNECT/ClientHello) still have no serving-phase allocation witness,
-fault-injection script, or fuzz corpus; the startup-DNS transport (below) is
-the one component with independent review and native Linux proof to date. No
-product-wide zero-alloc claim is made.
+## As-built single-owner model
 
-The `getrandom` 0.4.3 dependency intake is complete (recorded in bead
-`alumina-1xom` from the prior `alumina-zjwk` 0.3.4 closure; published
-tarball `build.rs` source-reviewed benign — a strict subset of the cleared
-0.3.4 build script; `cargo deny check` and `cargo audit` clean, 0.4.3
-non-yanked), and the
-startup-DNS transport draft now carries focused actual-DNS runtime tests
-(success incl. AAAA, mismatched-TID rejection, fragmented partial reads,
-exchange timeout and deadline reconnect, token-generation exhaustion, plus
-review-requested falsifiers: a schedule-storage refusal escaping `resolve`
-as a fatal error, and a connect-refused nameserver counting a failure and
-still advancing the schedule backoff) and an `alloc-witness`
-allocation-free-including-reconnect witness. Those transport tests were
-verified on the macOS host (`cargo +1.99.0 atest -p alumina --locked` and
-the `--features alloc-witness` variant, all green; fmt and `aclippy -D
-warnings` clean) and on native Linux arm64 inside the pinned builder image
-(release, `--features alloc-witness`): `tests/mio_matrix.rs` 8/8 and the
-startup-DNS unit set 12/12 including the reconnect allocation witness. The
-transport itself has been independently reviewed (`bd alumina-c14m` /
-`alumina-4z6b`; DNS read-outcome classification additionally `alumina-vl6d`);
-it remains provisional pending the serving-phase gates and BOUNDARY, and is
-not a servable component yet.
+`main` is the one boot owner: preallocate retained serving workspaces →
+startup DNS window (`ServeStorage::run_startup`) → on a Serve decision attach
+the startup listener and enter `Runtime::serve`. One `mio` poll observes DNS
+freshness and traffic readiness together; the cooperative turn starts due DNS
+exchanges itself (`src/runtime.rs`). Serving state (parser/inspector/gate/
+cursors per slot, event buffer) is preallocated before the DNS window; the two
+512 KiB per-tunnel buffers are reused across CONNECT parse / ClientHello
+inspection / relay. See [architecture §1](docs/architecture.md#1-governing-invariants-invariant-led-design).
+
+The **provisional protocol-parser layer** (`dns`, `connect`, `client_hello`,
+`startup_dns`) is correct-by-construction, fixed-storage input to later
+slices — **not** qualified serving code.
+
+## Runtime surface and fixed inputs
+
+- Reads `./config.toml` (≤ 4096 B, all keys mandatory, no defaults) and
+  `./resolv.conf` (first nameserver, numeric unicast, port 53). No CLI args,
+  no env policy overrides; one listening socket; **SIGTERM is the only handled
+  lifecycle signal** (SIGPIPE is ignored; catchable admin signals cannot
+  reload config — `alumina.md:149`).
+- Privilege preflight (non-root, empty caps, `no_new_privs`); unmet
+  prerequisites → EX_CONFIG 78; unresolved beyond allowance → EX_TEMPFAIL 75.
 
 ## Toolchain
 
-- Pinned in `rust-toolchain.toml`: Rust `1.99.0` (edition 2024).
-- Static target: `aarch64-unknown-linux-musl`.
-- Linux builder image: `rust:1.99.0-alpine` (arm64), verified official digest
-  `docker.io/library/rust@sha256:484dce463db97ee3b9c3dbeb82ac48408091573ec2da1ce9ccd84c823642779a`
-  (matches `scripts/verify.sh` IMAGE). The former 1.98.1 digest
-  (`400acfd2e044747555ff87ead291c3c480b7a02ba54bc7ac1a1bbce927b862cc`) is not
-  carried forward.
-- **Verification prerequisites.**
-  - Linux MID gates (`sh scripts/verify.sh mid foundations`, `sh scripts/verify.sh mid boot`) run
-    inside the Linux builder with `git`, `readelf`, `cargo` 1.99.0 and the actual checkout visible
-    (its `.git/HEAD` must be present). The whitespace gate fails closed if `git` or `.git/HEAD` is
-    missing — no host proof receipt is consumed.
-  - The boundary (`sh scripts/verify.sh boundary phase1`) runs on the **host** as sole coordinator
-    and dispatches those Linux MID children through the existing live `flock-vm` Podman connection
-    with the pinned builder image (`--pull=never`); it never invokes Linux-only functions directly
-    on a non-Linux host. The host additionally requires `podman` with reachable `flock-vm` (and
-    `flock-vm-root` for the caps-effective fixture), the pinned builder image present, `cargo-audit`
-    and `cargo-deny` installed, `sha256sum`/`shasum` for its before/after source-identity
-    capture, and `python3` (host stdlib only, no dependencies) for the authoritative
-    cargo-config-candidate observation that distinguishes verified absence from
-    permission/traversal/non-regular errors. Absent tools or any failed child stop the boundary non-zero (e.g.
-    `LINUX-DISPATCH-BLOCKED`, `AUDIT-DENY-BLOCKED`, `SOURCE-IDENTITY-CHANGED FAIL`) — never a green
-    skip; the before/after snapshots must be byte-identical or completion markers are refused.
+Rust `1.99.0` (edition 2024); static target `aarch64-unknown-linux-musl`;
+pinned builder image `docker.io/library/rust@sha256:484dce463db97ee3b9c3dbeb82ac48408091573ec2da1ce9ccd84c823642779a`;
+`panic = "abort"`.
 
-## Boot inputs (fixed, documented)
+## Verification
 
-The production binary reads two fixed files from the working directory. It
-reads **no** CLI arguments, configuration keys, or environment variables as
-policy (no CLI/env overrides):
-
-| Input | Path | Contract |
-| --- | --- | --- |
-| Config | `./config.toml` | Single TOML doc <= 4096 B (reject oversized, no truncation); all keys mandatory, no defaults/coercion; `allowlist` 1..=32 exact FQDN, `listen` `addr:port`, `startup_unresolved_allowance` 0..=allowlist_len-1 |
-| Resolver | `./resolv.conf` | First `nameserver` entry only; numeric unicast IPv4/IPv6, no zone id, port 53; missing/unreadable/invalid prevents startup (never skips) |
-
-Boot order (`alumina.md:64`): privilege check -> config + resolver reads ->
-storage initialization (128 MiB traffic store + retained serving workspaces)
--> startup DNS window (allowlist resolution within the 90 s window) -> serving
-decision. On a Serve decision the listener is bound and `main` continues the
-same owner into the shared-readiness `Runtime` serving loop for the process
-lifetime; an unresolved count beyond the allowance exits `EX_TEMPFAIL` (75);
-any boot/startup failure exits `EX_CONFIG` (78) with a field/source
-diagnostic. The serving-loop runtime route is exercised by host integration
-tests (mirroring `main`'s exact preallocate -> startup -> attach order) and natively
-by `sh scripts/verify.sh e2e relay`, which rebuilds the production binary from
-the exact candidate and runs an isolated real-IO CONNECT/SNI opaque-relay gate
-against the actual static binary under the privilege profile; the native
-SIGTERM shutdown path is proven the same way by `sh scripts/verify.sh
-e2e shutdown`, which sends real SIGTERM into the boot-armed self-pipe and
-records exit 0 on a clean drain vs deadline-forced exit 70 (see
-[Checkpoint status and limitations](#checkpoint-status-and-limitations)).
-
-## Linux startup privileges
-
-At startup the binary requires (checked from `/proc/self/status`, never set by
-the binary): a non-root UID, empty effective/permitted/ambient capability sets,
-and `no_new_privs`. Unmet prerequisites fail as EX_CONFIG 78. The kernel-
-grounded real fixtures run host-side:
+Host-run selectors and gates (all `sh scripts/verify.sh …` selectors and host
+Cargo commands):
 
 ```
-sh scripts/verify.sh fixtures boot
+cargo +1.99.0 atest -p alumina --locked
+cargo +1.99.0 atest -p alumina --locked --features alloc-witness
+cargo +1.99.0 fmt --check
+cargo +1.99.0 aclippy -p alumina --locked --all-targets -- -D warnings
+sh scripts/verify.sh docs                       # native 4-doc offline link gate
+sh scripts/verify.sh fixtures boot              # host Podman coordinator; Darwin allowed
+sh scripts/verify.sh e2e relay                  # host-runnable; auto-dispatches Linux build on Darwin
+sh scripts/verify.sh e2e shutdown               # host-runnable via rootful harness
+sh scripts/verify.sh boundary phase1            # host coordinator: mid+fixtures+docs+audit/deny+identity; never E2E
 ```
 
-**Checkpoint caveat (resolved 2026-10-12).** The positive fixture previously
-asserted an obsolete non-serving banner
-(`PHASE1-BOOT-OK (non-serving scaffold; DNS and listener are later slices)`)
-that the serving binary no longer emits. It is migrated (mission
-`alumina-qa-package-20261012`) to a supervised typed-terminal proof: the
-fixture-facts variant runs under the approved privilege profile with the
-resolver pointed at loopback (deterministic connection-refused, no environment
-network dependency), and a supervisor sends a real SIGTERM mid-window. The
-startup window settles the typed terminated outcome (`startup_final
-status="terminated"`, listener never bound), a clean shutdown drain emits
-`shutdown_final status="drained"`, the child is reaped at exit 0, and the
-obsolete non-serving banner is barred from stdout by a fixed-string guard
-(plant/fail/revert/clean proven). The three negative fixtures stay distinct
-exit-78 fail-closed proofs.
+Source-derived per-selector command context (durable authoritative table, bd
+`alumina-1d5x`). Rows describe what each selector requires per `scripts/`
+source — availability of the local connections/images/tools is **not asserted
+here** (not re-tested; no runnable-now claim), and nothing in this repo
+provisions them:
 
-(`PODMAN_CONNECTION` selects the builder; default `flock-vm`.) Each fixture
-runs the actually-built static binary from its fixed `config.toml`/`resolv.conf`
-working directory under a different kernel-grounded process-attribute profile.
-The executed artifact is the proof-only `fixture-facts` feature build (a
-clearly-separate variant under `target/fixture-facts`; the default production
-release under `target/release` is untouched) so the binary prints its own
-kernel facts (`read_kernel_facts`, `/proc/self/status`) to stderr at actual
-entry. Every fixture asserts that binary-entry facts line exactly, the exact
-stderr diagnostic, and the expected exit (0 / EX_CONFIG 78):
+| Selector | Host context |
+|---|---|
+| `mid foundations` / `mid boot` | **Linux-only** direct selectors; no host auto-dispatch, no intrinsic Podman requirement; refuse non-Linux (fail closed). Native Cargo 1.99.0, static readelf, git. Produces `target/release/alumina` (not executed by MID). |
+| `fixtures boot` | **Host Podman coordinator; Darwin allowed by source.** Requires existing rootless `flock-vm` **and** rootful `flock-vm-root` connections, pinned rust image present on both, **prebuilt `target/release/alumina`**, SHA256 tool. Builds/executes the separate fixture-facts variant; production digest unchanged. |
+| `e2e relay` / `e2e shutdown` | **Directly host-runnable.** Linux builds natively; on Darwin the selector probes the container target, `linux_dispatch` rebuilds the exact-source production target, then the rootful Podman harness runs the gate. Existing rootful connection + `E2E_IMAGE` default `localhost/alumina-e2e:e2e-20261011`; host Cargo metadata still runs. |
+| `boundary phase1` | **Host coordinator.** Dispatches mid foundations+boot, then fixtures, docs, git diff, audit/deny, identity. Needs existing Podman connections/images, host Cargo/audit/deny, Node, Git/SHA/Python. **Never invokes `e2e relay`/`e2e shutdown`**; exit-zero coordination is not release qualification. |
 
-1. non-root + empty caps + `no_new_privs` — the fixture-facts variant reaches
-   the typed terminated startup under supervision (startup_final
-   status="terminated" + shutdown_final status="drained"), is reaped at exit
-   0, and never emits the obsolete non-serving banner; entry facts all-zero;
-2. root (euid 0, any UID axis) — rejected, exit 78;
-3. non-root, empty caps, `no_new_privs` missing — rejected, exit 78;
-4. non-root with a raised capability set (rootful builder raises
-   `cap_net_admin` via inheritable+ambient), `no_new_privs` set — rejected on
-   the non-empty effective set, exit 78, with the binary observing all three
-   capability sets non-empty (effective-first refusal, not per-axis isolation).
+On a non-Linux host, direct `mid` selectors refuse — run those slices through
+`boundary phase1`, the only route that dispatches them. `fixtures boot` and
+the `e2e` selectors are directly host-runnable and do not need boundary. The
+wrapper `qa-package/validate.sh` invokes `boundary phase1`, then probes the
+fixture-facts static/hash and re-invokes docs — it **never executes E2E and
+never provisions VMs, connections, or images** (build ordering only; existing
+infrastructure remains prerequisite).
 
-After the fixtures, an authoritative metadata probe (xattr filesystem API via
-`scripts/fixture_metadata_probe.py`, run inside the builder) proves the
-`security.capability` xattr is absent on the exact executed variant, recording
-file mode and sha256, keeping probe errors (stat/listxattr/getxattr failure,
-non-regular file) distinct from verified absence.
+`atest`/`aclippy` are the fleet Cargo aliases (host config; each Linux MID
+dispatch writes the same aliases into its throwaway container config — the repo
+does not duplicate them). Eight-doc offline link check (all retained Markdown
+including this file and the register): `node scripts/docs_check/check.mjs
+README.md alumina.md alumina-refinement.md docs/architecture.md
+docs/build-plan.md docs/traceability.md docs/harness-evaluation.md
+qa-package/README.md`.
 
-Permitted-only applicability (authoritative kernel rule `alumina-5zn`): for a
-non-root exec of this ordinary non-setid executable — which the metadata proof
-confirms carries no file capabilities — the kernel execve rule gives
-`P'(permitted) = P'(effective) = P(ambient)` (capabilities(7); commoncap.c
-v6.6). A non-root exec clears pre-existing permitted/effective, so a profile
-with `CapEff=0` and `CapPrm` non-zero is **not reachable at this binary
-entry**; with empty ambient all sets are empty, with non-empty ambient all
-three are non-empty together (fixture 4 observes exactly that), and
-ambient-only is likewise unreachable because ambient always feeds both
-permitted and effective. It is therefore recorded as a proven-applicability
-disposition, never asserted native green; the kernel nonempty-permitted and
-nonempty-ambient refusal policy is unchanged and the decision-table unit test
-(`preflight_rejects_each_unmet_prerequisite_independently`) asserts each
-synthetic axis independently. Earlier `PR_SET_KEEPCAPS`/`SECBIT_KEEP_CAPS`
-VM-user-namespace claims in this section are corrected: `SECBIT_KEEP_CAPS` is
-cleared on execve and is not a permitted-retention mechanism.
-
-## Features
-
-- `alloc-witness` (non-default, opt-in): installs a counting global allocator
-  (delegating to the system allocator) so the integration-test harness can
-  assert allocation behaviour in named phases. Normal production releases are
-  built WITHOUT this feature, so they are never instrumented.
-- `fixture-facts` (non-default, opt-in): proof-only diagnostic used by the
-  kernel fixtures. The built binary prints its own kernel facts to stderr at
-  entry so fixtures assert facts at the exact executable entry. Compile-time
-  gated; no policy effect, no privileged bypass, no runtime env/CLI override;
-  never part of `default`.
-
-## Commands
-
-- Production release (clean, un-instrumented, static):
-  `cargo +1.99.0 build --release --locked`
-- Foundation witness tests (F1 + F2 + F4):
-  `cargo +1.99.0 atest -p alumina --locked --features alloc-witness --test foundations`
-- Foundation tests without the witness (F2 + F4 subset):
-  `cargo +1.99.0 atest -p alumina --locked --test foundations`
-- Boot tests (strict config/resolver corpus, preflight decision table,
-  storage inventory; cross-platform, no kernel dependence):
-  `cargo +1.99.0 atest -p alumina --locked --test boot`
-- Middle-verification gates (Linux; static-ELF proof + witness tests + fmt +
-  clippy + whitespace):
-  `sh scripts/verify.sh mid foundations`
-  `sh scripts/verify.sh mid boot`
-- Native CONNECT/SNI opaque-relay E2E (rebuilds the production binary from the
-  exact candidate, then runs the isolated real-IO gate against it; hard exit 0,
-  guard-bite tested):
-  `sh scripts/verify.sh e2e relay`
-- Full phase-1 boundary (sole host owner: coordinates foreground Linux MID,
-  boot fixtures, source identity, doc-link and audit/deny gates — every
-  missing or failed child blocks completion and returns non-zero; no
-  hardcoded success claims; final phase-1 completion stays BLOCKED pending
-  fixture/doc/Rust repairs and review approval, no E2E equivalence claimed):
-  `sh scripts/verify.sh boundary phase1`
-
-The `atest` / `aclippy` aliases are owned by the fleet user Cargo config on the
-host; each Linux MID dispatch writes the identical alias block into a fresh,
-throwaway `/cargo-home/config.toml` inside the container (no reusable volume is
-mounted for that config), so both owners define the same bytes. The repository
-does not duplicate the aliases.
+Native Linux proofs are **scoped to exact candidates, never blanket**:
+`mid foundations`/`mid boot`, `fixtures boot`, `e2e relay`, `e2e shutdown`,
+and the alloc-witness matrix are recorded against `1538a1b`/`579b9ce`/HEAD
+with exact-input identity receipts (bd evidence beads; reused locally in the
+QA package). The startup-DNS transport is independently **reviewed and
+approved** (bd `alumina-c14m`, round 2) and wired into `main`; its
+**serving qualification** (F1 serving-phase alloc witness, F2 gate-transition
+campaigns, F4 fuzz, BOUNDARY) remains open.
 
 ## Repository layout
 
-- `src/alloc.rs` — F1 phase-scoped allocation witness (feature-gated).
-- `src/fault.rs` — F2 deterministic scripted I/O outcomes + explicit
-  exhaustion and clock semantics.
-- `src/fuzz.rs` — F4 parser-target/corpus/seed ownership scaffold with honest
-  64-bit FNV-1a input hashing and seed-derived deterministic generation.
-- `src/config.rs` — strict TOML config validated internal types (EX_CONFIG 78).
-- `src/resolver.rs` — first-nameserver resolver-config parse (numeric unicast,
-  no zone, port 53, read once).
-- `src/preflight.rs` — Linux kernel prerequisite facts + decision table.
-- `src/inventory.rs` — fixed boot-storage inventory (128 MiB traffic +
-  per-slot serving workspaces + DNS named buffers, separately accounted as a
-  constant-derived lower bound; reserved-future = deferred log queue) +
-  actual traffic-storage allocation.
-- `src/boot.rs` — boot harness (fixed startup order, EX_CONFIG mapping).
-- `src/main.rs` — fixed documented `config.toml` / `resolv.conf` entry: boot ->
-  serving-workspace preallocation (before the DNS window) -> startup DNS
-  window -> on a Serve decision attach the startup listener and enter the
-  shared-readiness `Runtime` serving loop.
-- `src/serve.rs` — boot-owned `ServeStorage` (cache/schedules/dns/config/worker/
-  origin clock) + the 90 s startup window (`run_startup`).
-- `src/dns.rs` — provisional DNS response classification core (see Provisional
-  protocol-parser status).
-- `src/connect.rs` — provisional CONNECT request-head parser.
-- `src/client_hello.rs` — provisional TLS 1.3 ClientHello inspection gate.
-- `src/cache.rs`, `src/schedule.rs` — cache/schedule state used by the DNS
-  outcome pipeline (provisional).
-- `src/eligibility.rs` — address/provenance eligibility ranges.
-- `src/worker.rs` — worker decision core: slots/clock/deadlines/connect-phase,
-  decrement core only (no event loop).
-- `src/gate.rs`, `src/serving.rs` — forwarding gate + mio event dispatcher
-  (setup/relay/closures/drain). Wired through `main` via the shared-readiness
-  `Runtime` (`src/runtime.rs`): the retained serving workspaces (parser/
-  inspector/gate/cursors per slot) and the event buffer are preallocated
-  before the startup DNS window, and `Serving::attach_listener` registers the
-  listener the startup decision opened.
-- `src/runtime.rs` — shared-readiness owner: attaches the retained DNS
-  transport to the serving poll so one wait observes DNS freshness and
-  traffic readiness, advances the cooperative exchange in bounded turns, and
-  folds the DNS deadline into the serving timeout authority; `main` enters it
-  via `Runtime::serve`.
-- `src/startup_dns.rs` — provisional startup-DNS transport over mio
-  (see Provisional protocol-parser status); wired into `main` (via
-  `ServeStorage::run_startup`).
-- `scripts/verify.sh` — repo-native verification gate owner.
-- `scripts/e2e_relay.sh` — native Linux real-IO CONNECT/SNI opaque-relay gate
-  runner: network-isolated (`--network none`) container from the pinned-base
-  harness image, NNP + uid-65534 drop, foreground supervisor that reaps the
-  binary/upstream processes with real waits.
-- `scripts/e2e_relay.py` — the driver inside that container: DNS-over-TCP
-  responder, raw-echo/TLS/counting upstream fixtures, real TCP/TLS clients and
-  full-stream byte-exact + upstream-effect + distinct-timeout assertions.
-- `scripts/fixture_metadata_probe.py` — authoritative Linux-xattr metadata probe
-  (mode + `security.capability` absence + sha256) used by the boot fixtures.
-- `scripts/cargo_config_probe.py` — authoritative filesystem observation of
-  Cargo config candidates for the boundary source-identity record.
-- `scripts/docs_check/` — offline AST/literal docs-link checker (`check.mjs`).
-- `tests/foundations.rs` — foundations integration tests.
-- `tests/boot.rs` — boot increment integration tests (TDD corpus).
-- `tests/eligibility.rs`, `tests/mio_matrix.rs` — eligibility classification and
-  native Linux mio operation matrix (feature-gated `alloc-witness`) tests.
+`src/main.rs` boot owner → `src/runtime.rs` shared-readiness serving loop;
+`src/{serve,boot,config,resolver,preflight,inventory}.rs` boot path;
+`src/{dns,connect,client_hello,startup_dns,cache,schedule,worker,gate,serving,eligibility,log}.rs`
+serving/parser core; `src/{alloc,fault,fuzz}.rs` F1/F2/F4 scaffolds;
+`scripts/` verification owners; `tests/` integration corpus.
 
-## QA package (local testQA candidate)
+## Known limitations / not implemented (honest)
 
-The local static native QA package bundles the reproducible binary with
-run/validation instructions, a non-secret example configuration, and an
-artifact/source identity record — **no external deployment**. See
-[`qa-package/README.md`](qa-package/README.md) for the full instructions; the
-essentials:
-
-- **Artifact:** three distinct intended native Linux variants are built
-  separately (exercise smoke artifact, MID production release, e2e musl
-  release — scopes and digests in `qa-package/README.md`). The wrapper's
-  exercised artifact is the fixture-facts variant
-  (`target/fixture-facts/release/alumina`) that `validate.sh`'s `fixtures
-  boot` gate builds from exact source and executes under the privilege
-  profile in the same run, then static-ELF-checks and hashes.
-- **Example inputs:** [`qa-package/config.example.toml`](qa-package/config.example.toml)
-  and [`qa-package/resolv.example.conf`](qa-package/resolv.example.conf) — fixed
-  documented inputs, no secrets.
-- **Smoke:** `qa-package/validate.sh` runs the repo-native native harness gates
-  (`fixtures boot` supervised typed-terminated positive + exit-78 negatives,
-  `docs`, deny/audit, MID) against the packaged candidate and captures the raw
-  identity/exits; local isolated positive/negative only, foreground `--rm`
-  runners, no remote target.
-
-## Checkpoint status and limitations
-
-**Status — four-claim ledger.** The repository state at `579b9ce` is
-**implemented and correctness-tested** (boot, startup-serving/terminated
-settlement, CONNECT/SNI relay, SIGTERM shutdown, post-boot refresh driver) and
-carries a **scoped testQA-ready candidate**: this QA package — a local
-reproducible static binary with example config, run/validation instructions
-and artifact/source identity (see [QA package](#qa-package-local-testqa-candidate)),
-no external deployment claim. It is **not externally deployed/validated** (no
-nonprod target is authorized or identified — see `alumina.md` §8 and
-`docs/build-plan.md` §7) and **not production-qualified**: the F3
-current-serving completeness witness, F4 parser-fuzzing campaigns,
-deployment-confinement/image and performance qualification remain open
-(`docs/build-plan.md` §2/§7; `alumina-refinement.md` RF-009/RF-010). The root
-register [`alumina-refinement.md`](alumina-refinement.md) and the canonical
-spec `alumina.md` remain the governing status/qualification record; a runtime
-completion claim requires the build-plan qualification gates plus deployment
-qualification, which are not done. No claim of the open gates is made.
-
-Verified checkpoint evidence for this snapshot (exact file inventory, sha256
-identity at `HEAD da2b150`, and every raw command with exit code) is recorded
-in the durable bd evidence bead for the checkpoint publication increment, and
-in the handoff records for the `alumina-kzar` checkpoint agenda; the commands
-in this file re-derive it in the actual checkout with a recorded exit. Native
-Linux dispatch used the existing foreground `flock-vm` podman connection with
-the pinned builder image (exit observed, not merely probed). Reproducible
-checkpoint verification:
-
-```
-cargo +1.99.0 fmt --check
-cargo +1.99.0 atest -p alumina --locked
-cargo +1.99.0 atest -p alumina --locked --features alloc-witness
-cargo +1.99.0 aclippy -p alumina --locked --all-targets -- -D warnings
-cargo +1.99.0 deny check
-cargo +1.99.0 audit
-sh scripts/verify.sh docs
-```
-
-plus the native Linux dispatch (`sh scripts/verify.sh mid foundations` and
-`mid boot`, then the full suite in the pinned `flock-vm` image: default and
-`alloc-witness`).
-
-**Known limitations / not implemented (honest inventory):**
-
-- **Serving loop wired; the actual static binary relays a real native
-  CONNECT/SNI tunnel.** `main` preallocates the retained serving workspaces
-  before the DNS window and enters the shared-readiness `Runtime` loop, which
-  attaches the startup-opened listener and relays CONNECT/ClientHello
-  traffic. The native production route is proven by `sh scripts/verify.sh
-  e2e relay` (guard-bite tested): a freshly rebuilt static binary, dropped to
-  uid 65534 with empty caps and NNP, in a fully network-isolated
-  (`--network none`) container drives an authentic TLS 1.3 reverse-echo
-  round-trip through an allowlisted matching-SNI tunnel, byte-exact
-  fragmented/coalesced/partial/FIN/4 MiB echoed streams, and the negative
-  vector (disallowed CONNECT 403, SNI mismatch/ECH/malformed hello rejected
-  with zero forwarded bytes, dial-refused 502 pre-hello).
-- **Post-boot DNS refresh is wired (commit `579b9ce`).** The startup window
-  resolves the allowlist once; schedule-driven
-  refresh/retirement/alternation was implemented in `schedule.rs`/`worker.rs`
-  with the shared-registration seam, and the single serving owner now
-  initiates due queries itself: `Runtime::turn ->
-  starts_due_dns_if_idle -> start_dns_exchange` (runtime.rs), with
-  `poll_timeout` folding the next selectable due
-  (`Schedules::next_selectable_due`, schedule.rs) into the serving wait so
-  the idle loop wakes to refresh. A first-observed SIGTERM suppresses new DNS
-  initiation (the `is_shutdown` branch) and cancels the active exchange with
-  the fixed 8 s grace unchanged.
-- **Bounded allocation-free log queue.** The canonical 256 × 8 KiB alloc-free
-  log queue is allocated at boot and wired to nonblocking fd-1/drain in setup;
-  `main` routes startup/shutdown records through it and reserves
-  `print!`/`eprintln!` for the earliest boot-only diagnostics.
-- **SIGTERM graceful shutdown wired and natively proven.** A boot-armed
-  safe self-pipe (`signal_hook::low_level::pipe`) carries SIGTERM into the
-  single serving poll; a first observation permanently stops admission,
-  closes pending setups, cancels the retained DNS transport and fixes a
-  monotonic 8 s shutdown deadline (repeat signals never extend it). A clean
-  drain (all slots empty) exits 0; a deadline-forced closure exits
-  `EX_SOFTWARE` (70). The shared startup window runs over that same poll, so
-  a pre-serving SIGTERM is acted on mid-window as the typed terminated
-  outcome (no listener is ever bound) rather than deferred to a later full
-  serving phase. Proven by host tests (`--features alloc-witness`
-  includes `sigterm_shutdown_path_spends_zero_allocations` driven through
-  `Runtime::turn`) and natively by `sh scripts/verify.sh e2e shutdown` (real
-  static binary, uid 65534, empty caps, `--network none`): idle wake,
-  no-self-exit, pre-serving signal against a fully silent resolver with
-  interval-wide no-bind, startup retry-backoff storm, signal while the final
-  allowlist answer is held (no bind at the settlement boundary),
-  established-relay
-  early drain, stalled relay + repeat-SIGTERM monotonic deadline, stalled
-  stdout in an exactly-full 4 KiB pipe (single-byte EAGAIN proof), and
-  silent-DNS no-refresh (a dead resolver
-  cannot delay a drain that never contacts it — the startup transport is
-  concluded and no post-startup refresh is admitted). A SIGTERM that
-  interrupts an idle poll is retried, never fatal (mio does not retry EINTR
-  itself).
-- **Native Linux proofs are scoped, not blanket.** Recorded native evidence is
-  confined to the exact candidate it ran against: `mid foundations`/`mid boot`
-  (static ELF + whitespace gates), the 8 MiB main-thread accept/reset stack
-  run, `e2e relay` (real static binary under the privilege profile: TLS 1.3
-  matching-SNI relay + byte-conservation + negative/effect proofs), and
-  `e2e shutdown` (real   static binary: SIGTERM self-pipe drain, pre-serving
-  silent-resolver no-bind, startup retry-backoff storm, signal-during-held-answer
-  no-bind (the one-poll same-batch DNS+signal property is proven by the
-  native private-owner Rust witness), monotonic forced-closure deadline,
-  repeat-signal
-  non-extension, stalled-stdout and silent-DNS no-refresh), all on the
-  pinned rust image lineage, plus the
-  native `aarch64-unknown-linux-musl` allocator-witness shutdown test.
-  Still pending for the production candidate: post-build harness/gh-report
-  assessment and the E2E scope's remaining native profiles. No claim of those
-  pending gates is made.
-- **`scripts/verify.sh` phase-1 harness migrated** to the now-serving startup
-  path: the `fixtures boot` positive is the supervised typed-terminated
-  startup/cleanup proof (guard-bite plant/fail/revert/clean) and the `boundary
-  phase1` F3 row is corrected by evidence (mio operation matrix is built in
-  `tests/mio_matrix.rs` with alloc-witness controls; the current-serving
-  completeness witness is still open, per cnrd T3). The phase-1 boundary
-  remains BLOCKED only by the genuinely-open gates (F4 campaigns, deployment
-  confinement, review approval) — the RELEASE-NOT-READY diagnostic stays Open,
-  never converted to a release clean.
-- **Deferred/Unknown:** deployment confinement, E2E, fuzz corpora,
-  platform/confinement/performance qualification. No external deployment claim
-  is made; security scanning push protection is active on the GitHub remote.
+- Deployment confinement, initial deployment, remaining native E2E profiles,
+  fuzz campaign receipts, platform/confinement/performance qualification —
+  **open** (build-plan §7; traceability §5).
+- The serving loop is wired and native relay/shutdown paths are proven for the
+  exact candidates above; the F3 current-serving completeness witness and full
+  BOUNDARY remain open.
+- `getrandom` dependency intake complete, `cargo deny`/`cargo audit` clean; no
+  product-wide zero-alloc claim is made.
