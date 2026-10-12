@@ -19,11 +19,10 @@ At HEAD `8934adb` the repository is:
    **no external deployment**.
 3. **Not deployed/validated** — no nonprod/prod target is authorized or
    identified (`alumina.md` §8; build-plan §7).
-4. **Not production-qualified** — open gates: F3 current-serving completeness
-   witness, F4 parser-fuzzing campaigns, deployment confinement / initial
-   deployment, performance (build-plan §2/§7; traceability §5). The
-   qualification stays BLOCKED until those pass; **no runtime completion claim
-   is made**.
+4. **Not production-qualified** — open gates: F3 serving completeness witness,
+   F4 fuzz campaigns, deployment confinement/initial deployment, performance
+   (build-plan §2/§7; traceability §5). Qualification stays BLOCKED until those
+   pass; **no runtime completion claim is made**.
 
 ## Documents (ownership)
 
@@ -37,30 +36,21 @@ At HEAD `8934adb` the repository is:
 | [docs/harness-evaluation.md](docs/harness-evaluation.md) | Measured harness fitness (dated, scoped) |
 | [qa-package/README.md](qa-package/README.md) | Local testQA run/validation instructions |
 
-## As-built single-owner model
+## As-built model
 
-`main` is the one boot owner: preallocate retained serving workspaces →
-startup DNS window (`ServeStorage::run_startup`) → on a Serve decision attach
-the startup listener and enter `Runtime::serve`. One `mio` poll observes DNS
-freshness and traffic readiness together; the cooperative turn starts due DNS
-exchanges itself (`src/runtime.rs`). Serving state (parser/inspector/gate/
-cursors per slot, event buffer) is preallocated before the DNS window; the two
-512 KiB per-tunnel buffers are reused across CONNECT parse / ClientHello
-inspection / relay. See [architecture §1](docs/architecture.md#1-governing-invariants-invariant-led-design).
-
-The **provisional protocol-parser layer** (`dns`, `connect`, `client_hello`,
-`startup_dns`) is correct-by-construction, fixed-storage input to later
-slices — **not** qualified serving code.
+`main` is the single boot owner, `Runtime` the single serving owner (one `mio`
+poll); ownership, transitions, buffer reuse and the provisional parser layer
+are in [architecture §1/§2](docs/architecture.md#1-governing-invariants-invariant-led-design)
+and build-plan §0.
 
 ## Runtime surface and fixed inputs
 
-- Reads `./config.toml` (≤ 4096 B, all keys mandatory, no defaults) and
-  `./resolv.conf` (first nameserver, numeric unicast, port 53). No CLI args,
-  no env policy overrides; one listening socket; **SIGTERM is the only handled
-  lifecycle signal** (SIGPIPE is ignored; catchable admin signals cannot
-  reload config — `alumina.md:149`).
-- Privilege preflight (non-root, empty caps, `no_new_privs`); unmet
-  prerequisites → EX_CONFIG 78; unresolved beyond allowance → EX_TEMPFAIL 75.
+- `./config.toml` (≤ 4096 B, mandatory keys, no defaults) and `./resolv.conf`
+  (first nameserver, numeric unicast, port 53); no CLI args, no env overrides;
+  one listening socket; **SIGTERM the only handled lifecycle signal**
+  (`alumina.md:149`).
+- Privilege preflight (non-root, empty caps, `no_new_privs`): unmet → EX_CONFIG
+  78; unresolved beyond allowance → EX_TEMPFAIL 75.
 
 ## Toolchain
 
@@ -85,43 +75,31 @@ sh scripts/verify.sh e2e shutdown               # host-runnable via rootful harn
 sh scripts/verify.sh boundary phase1            # host coordinator: mid+fixtures+docs+audit/deny+identity; never E2E
 ```
 
-Source-derived per-selector command context (durable authoritative table, bd
-`alumina-1d5x`). Rows describe what each selector requires per `scripts/`
-source — availability of the local connections/images/tools is **not asserted
-here** (not re-tested; no runnable-now claim), and nothing in this repo
-provisions them:
-
-| Selector | Host context |
-|---|---|
-| `mid foundations` / `mid boot` | **Linux-only** direct selectors; no host auto-dispatch, no intrinsic Podman requirement; refuse non-Linux (fail closed). Native Cargo 1.99.0, static readelf, git. Produces `target/release/alumina` (not executed by MID). |
-| `fixtures boot` | **Host Podman coordinator; Darwin allowed by source.** Requires existing rootless `flock-vm` **and** rootful `flock-vm-root` connections, pinned rust image present on both, **prebuilt `target/release/alumina`**, SHA256 tool. Builds/executes the separate fixture-facts variant; production digest unchanged. |
-| `e2e relay` / `e2e shutdown` | **Directly host-runnable.** Linux builds natively; on Darwin the selector probes the container target, `linux_dispatch` rebuilds the exact-source production target, then the rootful Podman harness runs the gate. Existing rootful connection + `E2E_IMAGE` default `localhost/alumina-e2e:e2e-20261011`; host Cargo metadata still runs. |
-| `boundary phase1` | **Host coordinator.** Dispatches mid foundations+boot, then fixtures, docs, git diff, audit/deny, identity. Needs existing Podman connections/images, host Cargo/audit/deny, Node, Git/SHA/Python. **Never invokes `e2e relay`/`e2e shutdown`**; exit-zero coordination is not release qualification. |
-
-On a non-Linux host, direct `mid` selectors refuse — run those slices through
-`boundary phase1`, the only route that dispatches them. `fixtures boot` and
-the `e2e` selectors are directly host-runnable and do not need boundary. The
-wrapper `qa-package/validate.sh` invokes `boundary phase1`, then probes the
-fixture-facts static/hash and re-invokes docs — it **never executes E2E and
-never provisions VMs, connections, or images** (build ordering only; existing
-infrastructure remains prerequisite).
+Selector host context / prerequisites (incl. `mid` Linux-only fail-closed and
+`fixtures`/`e2e` host-runnable details): sole owner is
+[qa-package/README.md](qa-package/README.md); durable source table in bd
+`alumina-1d5x`.
 
 `atest`/`aclippy` are the fleet Cargo aliases (host config; each Linux MID
 dispatch writes the same aliases into its throwaway container config — the repo
-does not duplicate them). Eight-doc offline link check (all retained Markdown
-including this file and the register): `node scripts/docs_check/check.mjs
-README.md alumina.md alumina-refinement.md docs/architecture.md
-docs/build-plan.md docs/traceability.md docs/harness-evaluation.md
-qa-package/README.md`.
+does not duplicate them). Nine-doc offline link check (all retained Markdown
+including this file, the register and AGENTS.md): `node
+scripts/docs_check/check.mjs README.md AGENTS.md alumina.md
+alumina-refinement.md docs/architecture.md docs/build-plan.md
+docs/traceability.md docs/harness-evaluation.md qa-package/README.md`.
 
-Native Linux proofs are **scoped to exact candidates, never blanket**:
-`mid foundations`/`mid boot`, `fixtures boot`, `e2e relay`, `e2e shutdown`,
-and the alloc-witness matrix are recorded against `1538a1b`/`579b9ce`/HEAD
-with exact-input identity receipts (bd evidence beads; reused locally in the
-QA package). The startup-DNS transport is independently **reviewed and
-approved** (bd `alumina-c14m`, round 2) and wired into `main`; its
-**serving qualification** (F1 serving-phase alloc witness, F2 gate-transition
-campaigns, F4 fuzz, BOUNDARY) remains open.
+### Native proofs (scoped, exact-input)
+
+Native proofs are **scoped to exact candidates, never blanket**: `mid
+foundations`/`mid boot`, `fixtures boot`, `e2e relay`, `e2e shutdown`, and the
+alloc-witness matrix are recorded against `1538a1b`/`579b9ce`/HEAD with
+exact-input identity receipts (bd beads). The F3 mio operation matrix is
+**implemented** (`tests/mio_matrix.rs`, 8 tests incl.
+`linux_epoll_operation_matrix`, native evidence bd `z9m0`/`po3c`); its
+current-serving completeness witness remains open (bd `cnrd` T3). The
+startup-DNS transport is independently **reviewed and approved** (bd
+`alumina-c14m`, round 2) and wired into `main`; its **serving qualification**
+(F1 serving witness, F2 campaigns, F4 fuzz, BOUNDARY) remains open.
 
 ## Repository layout
 
@@ -136,8 +114,7 @@ serving/parser core; `src/{alloc,fault,fuzz}.rs` F1/F2/F4 scaffolds;
 - Deployment confinement, initial deployment, remaining native E2E profiles,
   fuzz campaign receipts, platform/confinement/performance qualification —
   **open** (build-plan §7; traceability §5).
-- The serving loop is wired and native relay/shutdown paths are proven for the
-  exact candidates above; the F3 current-serving completeness witness and full
-  BOUNDARY remain open.
-- `getrandom` dependency intake complete, `cargo deny`/`cargo audit` clean; no
+- F3 serving completeness witness and full BOUNDARY remain open; exact
+  candidates above are proven for relay/shutdown, never a blanket claim.
+- `getrandom` intake complete; `cargo deny`/`cargo audit` clean; no
   product-wide zero-alloc claim is made.

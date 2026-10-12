@@ -125,20 +125,11 @@ buffers); throughput conditional per-direction — encoded in arch §6 / Slice 7
 | U7 | Boot allocation inventory sum (G1) | container-size accounting incl. outside-budget items; 128 MiB traffic-only + RSS split | arch §6 | artifact |
 | U8 | Parser-fuzz corpus ownership | checked-in corpus/inputs/seed/hashes; crashes resolved before done-claim | build-plan F4 | gate |
 
-## 6. Named design decisions (D1–D7) and resolved tensions
+## 6. Named decisions (pointers)
 
-- **D1** response-begin boundary (T4) — arch §4. **D2** two barriers — arch §4.
-  **D3** gate-opening transition (L32; crossing-H `X`; atomic open) — arch §4.
-  **D4** early-activity rule — arch §4. **D5** ordered successful-write
-  accounting; **D5a** per-family storage (2 counters/tunnel);
-  **D5b** traffic-buffer reuse — arch §4. **D6** 64 KiB/16-op work budget;
-  **D7** duplicate-free app ready queue — arch §3.
-- **F0** exact static-Linux toolchain proof; **F1** alloc+dealloc witness;
-  **F2** scripted fault injection; **F3** mio matrix before first DNS op;
-  **F4** parser fuzzing with owned corpus — build-plan §2.
-- **T1** boot boundary; **T3** 128 MiB = tunnel traffic only — arch §6.
-- **T2/G4** mio dependency seam — arch §6 + build-plan F3.
-- **G1/G2/G3** generation artifact statuses — arch §5.
+Design decisions D1–D7 and the state machine: `docs/architecture.md` §3/§4.
+Gates F0–F4: `docs/build-plan.md` §2. Storage/boot and generation domains
+(T1/T2/T3, G1–G4): `docs/architecture.md` §5/§6.
 
 No ADR has been required: the documents restate the spec, no policy change.
 The planning documents are committed and maintained alongside the

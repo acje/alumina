@@ -834,7 +834,7 @@ boundary_phase1() {
     identity_snapshot "$IDENTITY_AFTER"
     identity_compare "$IDENTITY_BEFORE" "$IDENTITY_AFTER"
     artifact_identity target/release/alumina || exit 1
-    echo "F3 mio operation matrix: IMPLEMENTED (tests/mio_matrix.rs: 8 tests incl. linux_epoll_operation_matrix with poll/register/reregister/deregister + alloc-witness controls; recorded native release evidence README:63-70, z9m0/po3c); current-serving completeness witness still OPEN (cnrd T3) - not 'unbuilt matrix', not 'complete'"
+    echo "F3 mio operation matrix: IMPLEMENTED (tests/mio_matrix.rs: 8 tests incl. linux_epoll_operation_matrix with poll/register/reregister/deregister + alloc-witness controls; recorded native release evidence README.md#native-proofs-scoped-exact-input, z9m0/po3c); current-serving completeness witness still OPEN (cnrd T3) - not 'unbuilt matrix', not 'complete'"
     echo "NotImplemented: DNS wire parser fuzz (Slice 2)"
     echo "NotImplemented: CONNECT/ClientHello parser fuzz (Slices 3-4)"
     echo "NotImplemented: log-record encoding fuzz (Slice 6)"

@@ -11,24 +11,9 @@ defines a boundary the spec leaves open, it is a **named design decision
 
 ## 1. Governing invariants (invariant-led design)
 
-Each invariant names the design element that enforces it; reverse mapping in
-[traceability.md](traceability.md).
-
-| Invariant | Cited | Design element that upholds it |
-|---|---|---|
-| I-1 Destination-Binding | `:200` | Tunnel addresses only from `cache` current entries; per-attempt revalidation; strict retirement; fixed peer |
-| I-2 Authorization-Before-Forwarding | `:201`,`:32` | Two barriers (A client→upstream, B upstream→client); gate opens only on successful-write accounting |
-| I-3 Fail-Closed | `:202` | No permissive fallback; only bounded stale grace tolerates DNS failure |
-| II-1 Zero-Allocation | `:206` | Boot allocation inventory (§6); allocator witnesses (F1); scoped dependency seam |
-| II-2 Resource-Bounds | `:207` | Fixed compile-time limits; exhaustion rejects; never grows |
-| III-1 Ownership | `:211` | Single owner loop owns tunnel/DNS/timers/cache; no shared mutable cache |
-| III-2 Generation-Isolation | `:212` | Four domains (G1–G4, §5); slot reuse generation-scoped |
-| III-3 Bounded-Work | `:213` | Per-turn budgets (D6); reschedule-without-loss; timer recheck |
-| IV-1 State-Transition | `:217` | Exhaustive enum; every I/O outcome has a transition; readiness ≠ success |
-| IV-2 Stream-Parsing | `:218` | Incremental parsers with residual state; parse independent of read boundaries |
-| IV-3 Non-Decrypting | `:219` | No TLS keys, no CA management; metadata validator + bit-pipe |
-| IV-4 Byte-Conservation | `:220` | Ordered prefix forwarding; coalesced trailing bytes preserved |
-| IV-5 Deadline | `:221` | Monotonic; earliest enforced even under delayed timers; expiry never renews a phase |
+The fixed-profile invariants I-1…IV-5 name the design element each enforces;
+the full invariant → design-element/proof-status matrix is owned by
+[traceability.md §2](traceability.md#2-invariant-matrix-all-13).
 
 ## 2. Module & ownership decomposition
 
@@ -182,13 +167,6 @@ queries, multi-worker data paths, control plane / readiness / metrics surface,
 DNS64/NAT64 compatibility, upstream auth or cert verification, automatic
 fallback (`:19,49,63,71,72,97,144,149`).
 
-## 10. Unresolved proof obligations (explicit, honest)
-
-1. mio/dependency zero-alloc — pinned version + op matrix + Linux witnesses (F3).
-2. generation/window-id non-reuse — artifact only (G1/G4).
-3. gate-ordering online proof — F2 campaigns on the real dispatcher; serving runtime is wired, the campaigns are not (Slice 4).
-4. stack bound derived, not measured.
-5. throughput 1–10 Gbps + Linux epoll/alloc/confinement unverified at runtime until release gates pass (`:185,236,233-236`).
-
-Cross-map: [build-plan.md](build-plan.md) for slice/gate execution;
-[traceability.md](traceability.md) for the complete matrix.
+Cross-map: [build-plan.md](build-plan.md) for slice/gate execution and the
+open qualification gates; [traceability.md](traceability.md) for the complete
+matrix and unresolved-evidence ledger.

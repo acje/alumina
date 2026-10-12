@@ -11,39 +11,23 @@ Traceability: [traceability.md](traceability.md). Canonical requirements:
 
 ## 0. Sequencing status
 
-This plan's gate-first ordering (§2) owns **qualification and release**. A
-subset of the serving-parser layer was implemented product-first as
-**provisional** increments (mission `alumina-26l1` + repair directives) and has
-not passed the qualification gates this plan names.
+This plan's gate-first ordering (§2) owns **qualification and release**.
+Implemented so far: DNS classification, CONNECT parsing, TLS 1.3 ClientHello
+inspection and normalized hostname — **provisional**, correct-by-construction
+inputs to later slices, not qualified serving code. The startup-DNS transport
+is reviewed and approved (bd `alumina-c14m`) and wired into `main`. Deferred
+(required before any serving done-claim): F1 serving-phase witness, F2
+fault-injection campaigns, F3 current-serving completeness witness (matrix
+implemented, `tests/mio_matrix.rs`; witness open per `cnrd` T3), F4 fuzz
+campaign receipts, **full stable-candidate BOUNDARY**, and E2E
+deployment/release gates (Slice 7).
 
-- **Implemented (provisional, instrument-free):** DNS classification
-  (`dns.rs`), CONNECT parsing (`connect.rs`), TLS 1.3 ClientHello inspection
-  (`client_hello.rs`), normalized hostname (`config.rs` `FixedHostname`) —
-  fixed-storage, with focused falsifier/positive tests; DNS parse additionally
-  carries feature-gated `alloc-witness` controls. **Provisional is precise:**
-  correct-by-construction inputs to later slices, not servable functionality.
-- **Transport reviewed + wired:** the startup-DNS transport (`startup_dns.rs`)
-  was independently reviewed — `alumina-4z6b` (round 1, NEEDS WORK) answered,
-  then **`alumina-c14m` closed APPROVE (round 2)** — and is wired into `main`
-  (preallocate → startup window → attach listener → `Runtime::serve`;
-  `runtime.rs` starts due exchanges in the shared turn). Its **serving
-  qualification** (F1 serving-phase alloc witness, F2 gate-transition
-  campaigns, F4 fuzz, BOUNDARY) is still open.
-- **Deferred (required before any serving done-claim):** F1 allocator witness
-  on the serving phase (boot/startup-DNS/shutdown already carry `alloc-witness`
-  controls; the current-serving completeness witness is open), F2 deterministic
-  fault injection across the remaining gate transitions, **F3 current-serving
-  completeness witness** (the mio operation matrix is **implemented** —
-  `tests/mio_matrix.rs`, 8 tests incl. `linux_epoll_operation_matrix` with
-  alloc-witness controls, native release evidence; per `cnrd` T3 the label was
-  stale: the matrix is built, the completeness witness for the current
-  serving/SIGTERM op set is the open item), F4 parser-fuzzing campaigns
-  (scaffold `src/fuzz.rs` exists, no campaign receipts), Linux MID/BOUNDARY
-  (MID `mid foundations`/`mid boot` and `fixtures boot` green natively;
-  `boundary phase1` BLOCKED pending open gates + review), E2E
-  deployment/confinement and release gates (Slice 7). `getrandom` intake
-  complete (build.rs source-reviewed; deny/audit clean). No product-wide
-  zero-alloc claim from focused parser tests alone.
+Exact-input Linux MID (`mid foundations`/`mid boot`) and `fixtures boot`
+already passed **natively at recorded candidates** (`1538a1b`/`579b9ce`/HEAD;
+receipts in README "Native proofs", docs/harness-evaluation.md and bd
+`alumina-ucxi`) — scoped exact-candidate proofs, not fresh current-input
+execution, and they do not cover the open BOUNDARY. No product-wide zero-alloc
+claim from focused parser tests alone.
 
 ## 1. Guiding principles
 
@@ -52,10 +36,6 @@ not passed the qualification gates this plan names.
 2. Every claim is proof-gated: a design artifact ≠ an implementation
    demonstration; never label a proof gap resolved because the design is
    written down.
-3. Vertical slices: each slice is a bounded sub-mission with independently
-   verifiable increments.
-4. Three-tier verification cadence (INNER/MID/BOUNDARY), §5.
-5. No Tokio/async runtime; mio + epoll single-worker per `alumina.md:140,147`.
 
 ## 2. Early Linux feasibility and dependency gates
 
