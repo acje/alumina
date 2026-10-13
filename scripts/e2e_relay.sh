@@ -11,9 +11,12 @@
 # podman command owns the whole lifecycle (outer command stays foreground, no
 # leaked background servers).
 #
-# The harness image name is recorded alongside its expected parent (the pinned
-# base sha); the gate fails closed if the image or its parent identity is
-# missing, so the exact-base provenance of every executed run is receipted.
+# The harness image immutable ID (recorded by the verify.sh e2e receipt) is
+# re-verified against its mutable tag and its expected parent (the pinned base
+# sha) on the rootful connection; the gate fails closed if the image or its
+# parent identity is missing, or if the tag no longer resolves to the recorded
+# immutable ID, so the exact-base provenance of every executed run is receipted
+# and the executed image is the recorded immutable ID.
 set -eu
 
 ROOT="$(pwd)"
@@ -83,15 +86,33 @@ podman --connection "$CONN" info >/dev/null 2>&1 || {
     echo "E2E-RELAY-BLOCKED: rootful podman connection $CONN unreachable" >&2
     exit 1
 }
-podman --connection "$CONN" image exists "$E2E_IMAGE" || {
-    echo "E2E-RELAY-BLOCKED: harness image $E2E_IMAGE absent on $CONN (provision from pinned base first)" >&2
-    exit 1
-}
-parent=$(podman --connection "$CONN" image inspect "$E2E_IMAGE" --format '{{.Parent}}' 2>/dev/null || echo "?")
+# Harness image: run the exact immutable ID the e2e receipt recorded when
+# verify.sh exported E2E_IMAGE_ID (resolved on the recorded rootful connection,
+# E2E_ROOT_CONN). On THIS consumer connection the mutable tag must still resolve
+# to that same immutable ID, then the container runs the ID itself -- a retag
+# between receipt and run can never swap the executed image. Parent (pinned
+# base) provenance is preserved for both paths. Standalone (no E2E_IMAGE_ID)
+# keeps the previous tag-based selection.
+HARNESS_IMAGE="${E2E_IMAGE:-localhost/alumina-e2e:e2e-20261011}"
+if [ -n "${E2E_IMAGE_ID:-}" ]; then
+    tag_id=$(podman --connection "$CONN" image inspect "$HARNESS_IMAGE" --format '{{.Id}}' 2>/dev/null || echo "?")
+    [ "$tag_id" = "$E2E_IMAGE_ID" ] || {
+        echo "E2E-RELAY-BLOCKED: harness tag '$HARNESS_IMAGE' on $CONN resolves to '$tag_id', not the receipt's immutable $E2E_IMAGE_ID; refusing a retagged image" >&2
+        exit 1
+    }
+    HARNESS_IMAGE="$E2E_IMAGE_ID"
+else
+    podman --connection "$CONN" image exists "$HARNESS_IMAGE" || {
+        echo "E2E-RELAY-BLOCKED: harness image $HARNESS_IMAGE absent on $CONN (provision from pinned base first)" >&2
+        exit 1
+    }
+fi
+parent=$(podman --connection "$CONN" image inspect "$HARNESS_IMAGE" --format '{{.Parent}}' 2>/dev/null || echo "?")
 [ "$parent" = "$BASE_ID" ] || {
     echo "E2E-RELAY-BLOCKED: harness image parent mismatch (got $parent, want $BASE_ID); base provenance not tied to pinned $BASE" >&2
     exit 1
 }
+echo "E2E-RELAY-HARNESS-IMAGE: executed image $HARNESS_IMAGE (tag ${E2E_IMAGE:-localhost/alumina-e2e:e2e-20261011}, conn $CONN)"
 [ -x "$ROOT/$BIN" ] || {
     echo "E2E-RELAY-BLOCKED: production static binary missing ($BIN); run 'verify.sh e2e relay' which rebuilds it first" >&2
     exit 1
@@ -257,7 +278,7 @@ podman --connection "$CONN" run --rm --pull=never \
     --user 0:0 \
     -e E2E_TARGET="${E2E_TARGET}" \
     -e E2E_DNS_TS="${E2E_DNS_TS:-}" \
-    "$E2E_IMAGE" sh -c "$stage_snippet
+    "$HARNESS_IMAGE" sh -c "$stage_snippet
 $run" || rcc=$?
 
 if [ "$rcc" -eq 0 ]; then

@@ -357,30 +357,43 @@ class DnsResponder:
                     params += f" t={datetime.datetime.now().isoformat(timespec='milliseconds')}"
                 print(f"E2E-DNS-QUERY: {params}", file=sys.stderr, flush=True)
 
+                ip = self.answers.get(qname.lower())
+                if ip is None:
+                    # unknown NAME -> NXDOMAIN for any type (whole-name
+                    # nonexistence, the runtime's name-wide eviction), never a
+                    # fake positive
+                    self._reply(conn, tid, question, 3)
+                    continue
                 if qtype == 1:  # A
-                    ip = self.answers.get(qname.lower())
-                    if ip is None:
-                        # unknown name -> NXDOMAIN, never a fake positive
-                        self._reply(conn, tid, question, 3)
-                        continue
                     ancount = 1
                     rcode = 0
+                    nscount = 0
+                    ns_rr = b""
                     rr = qname_literal(qname) + b"\x00\x01\x00\x01"
                     rr += (60).to_bytes(4, "big")
                     rr += (4).to_bytes(2, "big")
                     rr += ip
                 else:
-                    # AAAA and anything else: validated negative (NXDOMAIN)
+                    # existing name, non-A type (AAAA/...): validated NODATA.
+                    # The name EXISTS for A, so a type-absence answer must be
+                    # NOERROR with zero answers plus a covering SOA (RFC 2308),
+                    # never a whole-name NXDOMAIN. NODATA lets the runtime evict
+                    # only the queried family (src/dns.rs classify_soa,
+                    # src/cache.rs evict_nodata), keeping the A binding, so a
+                    # query of the other family cannot take an existing
+                    # IPv4-only name down.
                     ancount = 0
-                    rcode = 3
+                    rcode = 0
+                    nscount = 1
+                    ns_rr = soa_record(qname, 300, 60)
                     rr = b""
                 flags = (0x8000 | 0x0100 | (rcode & 0x0F))
                 hdrw = tid + flags.to_bytes(2, "big")
                 hdrw += (1).to_bytes(2, "big")
                 hdrw += (ancount).to_bytes(2, "big")
+                hdrw += (nscount).to_bytes(2, "big")
                 hdrw += (0).to_bytes(2, "big")
-                hdrw += (0).to_bytes(2, "big")
-                resp = hdrw + question + rr
+                resp = hdrw + question + rr + ns_rr
                 print(f"E2E-DNS-TX: {resp.hex()}", file=sys.stderr, flush=True)
                 conn.sendall(len(resp).to_bytes(2, "big") + resp)
         except OSError:
@@ -414,6 +427,25 @@ def qname_literal(qname):
         out += label
     out += bytes([0])
     return bytes(out)
+
+
+def soa_record(owner, ttl, minimum):
+    """A synthetic single-name authoritative-zone SOA covering `owner`. The
+    zone apex of the queried name is the queried name itself, so the owner
+    always covers it -- exactly what the runtime's NODATA classification
+    requires (src/dns.rs classify_soa/soa_covers)."""
+    mname = qname_literal(b"ns1.example.org")
+    rname = qname_literal(b"hostmaster.example.org")
+    rdata_len = len(mname) + len(rname) + 20
+    m = qname_literal(owner)
+    m += b"\x00\x06\x00\x01"  # type SOA, class IN
+    m += ttl.to_bytes(4, "big")
+    m += rdata_len.to_bytes(2, "big")
+    m += mname
+    m += rname
+    for v in (1, 3600, 600, 86400, minimum):  # serial refresh retry expire minimum
+        m += v.to_bytes(4, "big")
+    return m
 
 
 # --------------------------------------------------------------------------

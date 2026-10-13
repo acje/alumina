@@ -162,6 +162,50 @@ mid_boot() {
     echo "BOOT-MID-OK"
 }
 
+# Boundary-only union of the `mid foundations` and `mid boot` command sets
+# (same input union), executed once each so the boundary never runs the
+# highest-value native common commands twice (release build, static gate,
+# foundations+boot tests with and without alloc-witness, fmt, clippy both
+# variants, whitespace gate). The standalone `mid foundations` / `mid boot`
+# selectors are unchanged and remain dispatchable on their own.
+#
+# Ordering: the clippy pair keeps the exact adjacency proven green by the
+# standalone foundation selector (alloc-witness clippy immediately after
+# production clippy, with the alloc-witness lib last built by the witness
+# tests). The boot tests are intentionally deferred until AFTER the clippy
+# block (diverging from `mid boot`, which runs them before clippy) so the
+# alloc-witness boot tests never precede the alloc-witness clippy phase. That
+# deliberate reorder avoids an aw-clippy-after-aw-boot-test adjacency in one
+# cargo invocation, which can otherwise trip a clippy-per-target fingerprint
+# E0463 (can't find crate for `alumina`) on the alloc-witness-only mio_matrix
+# test over the shared persistent target dir.
+mid_union() {
+    [ "$(uname -s)" = "Linux" ] || {
+        echo "mid union requires Linux execution" >&2
+        exit 1
+    }
+    closure_metadata
+    echo "PRODUCTION-RELEASE-BUILD (boundary union, no alloc-witness):"
+    cargo +${TOOLCHAIN} build --locked --release
+    static_gate "target/release/alumina"
+    echo "WITNESS-TESTS (--features alloc-witness):"
+    cargo +${TOOLCHAIN} atest -p alumina --locked --features alloc-witness --test foundations
+    echo "WITNESS-OFF-TESTS (F2/F4 subset):"
+    cargo +${TOOLCHAIN} atest -p alumina --locked --test foundations
+    echo "FMT:"
+    cargo +${TOOLCHAIN} fmt --check
+    echo "CLIPPY (production, no alloc-witness):"
+    cargo +${TOOLCHAIN} aclippy -p alumina --locked --all-targets -- -D warnings
+    echo "CLIPPY (test-harness with alloc-witness):"
+    cargo +${TOOLCHAIN} aclippy -p alumina --locked --all-targets --features alloc-witness -- -D warnings
+    echo "BOOT-TESTS (strict parser + validated types + storage inventory):"
+    cargo +${TOOLCHAIN} atest -p alumina --locked --test boot
+    echo "BOOT-TESTS-WITNESS (alloc retention bound):"
+    cargo +${TOOLCHAIN} atest -p alumina --locked --features alloc-witness --test boot
+    whitespace_gate
+    echo "UNION-MID-OK"
+}
+
 # Linux kernel privilege fixtures. The proof-only `fixture-facts` feature build
 # is executed (a clearly-separate variant artifact under target/fixture-facts;
 # the production target/release artifact is left untouched, with before/after
@@ -224,6 +268,12 @@ boot_fixtures() {
     }
     variant_sha=$(sha256_digest file "$VARBIN") || exit 1
     release_sha_after=$(sha256_digest file "$ROOT/$BIN") || exit 1
+    # In-run fresh-variant marker: record the exact variant this run built next
+    # to the artifact so qa-package/validate.sh can prove the exercised binary
+    # has current-run provenance (never a stale by-existing pass). Written every
+    # run, unconditionally, after the rebuild.
+    printf '%s\n' "$variant_sha" > "$ROOT/target/fixture-facts/release/variant.sha256"
+    echo "  fresh-variant marker (in-run build): $ROOT/target/fixture-facts/release/variant.sha256 = $variant_sha"
     echo "  fixture-facts variant sha256 $variant_sha"
     # Production before/after equality is an explicit gate, never a printed
     # observation: the proof-only variant build must not touch the production
@@ -825,7 +875,7 @@ command -v git >/dev/null 2>&1 || apk add --no-cache git >/dev/null 2>&1 || true
 boundary_phase1() {
     echo "phase1 boundary (owner seam H1): host sole coordinator; Linux MID via existing flock-vm dispatch"
     identity_snapshot "$IDENTITY_BEFORE"
-    linux_dispatch 'sh scripts/verify.sh mid foundations && sh scripts/verify.sh mid boot'
+    linux_dispatch 'sh scripts/verify.sh mid union'
     boot_fixtures
     docslink_check
     git diff --check
@@ -844,14 +894,105 @@ boundary_phase1() {
     echo "FINAL-PHASE1-COMPLETION: BLOCKED — pending fixture/doc/Rust repairs and review approval before any phase1 done-claim (no E2E equivalence claimed)"
 }
 
-# Real-IO CONNECT/SNI opaque-relay gate against the ACTUAL production binary
-# rebuilt from the exact current source (never a stale artifact): native Linux
-# release build (or container dispatch on a non-Linux host), then
-# scripts/e2e_relay.sh runs it in a fully network-isolated container. The
-# source/binary identity receipt is mandatory so the executed artifact is tied
-# to the reviewed candidate, and every e2e case must exit hard zero.
-e2e_relay() {
+# Real-IO CONNECT/SNI opaque-relay and native SIGTERM shutdown gates against the
+# ACTUAL production binary rebuilt from the exact current source (never a stale
+# artifact): native Linux release build (or container dispatch on a non-Linux
+# host), then the gate's harness script runs it in a fully network-isolated
+# container. The source/binary identity receipt is mandatory so the executed
+# artifact is tied to the reviewed candidate, and every e2e case must exit hard
+# zero.
+#
+# e2e_build_receipt is the single shared build/receipt owner for BOTH gates. It
+# rebuilds the exact candidate ONCE per invocation, checks producer exits and
+# source/artifact correspondence through execution (never a masked pipeline,
+# never a framework), and prints the identity line; each standalone selector
+# (e2e/relay, e2e/shutdown) stays independently dispatchable and runs only its
+# own harness after the shared receipt.
+# Exact-candidate input digest record (pre/post-build and after the executed
+# harness): HEAD + dirty diff + untracked harness py/sh + gate script. The diff
+# producer exit is checked SEPARATELY (never a masked pipeline); the untracked
+# harness scripts are hashed explicitly (git diff excludes them). Requires $TGT.
+e2e_receipt_fields() {
+    _gate="$1"
+    _harness_py="$2"
+    _harness_sh="$3"
+    rcd=0
+    git diff HEAD >"$TGT/$_gate-diff.$$" 2>&1 || rcd=$?
+    [ "$rcd" -eq 0 ] || {
+        echo "E2E-$_gate-BLOCKED: git diff HEAD exit $rcd (unreadable diff, not a receipt)" >&2
+        exit 1
+    }
+    rgh=0
+    head=$(git rev-parse --verify HEAD 2>&1) || rgh=$?
+    [ "$rgh" -eq 0 ] && [ -n "$head" ] || {
+        echo "E2E-$_gate-BLOCKED: git rev-parse --verify HEAD exit $rgh (unreadable HEAD, not a receipt)" >&2
+        exit 1
+    }
+    diffhash=$(sha256_digest file "$TGT/$_gate-diff.$$") || exit 1
+    harness1=$(sha256_digest file "$_harness_py") || exit 1
+    harness2=$(sha256_digest file "$_harness_sh") || exit 1
+    shellhash=$(sha256_digest file "scripts/verify.sh") || exit 1
+    printf '%s %s %s %s %s\n' "$head" "$diffhash" "$harness1" "$harness2" "$shellhash"
+}
+
+# B3 through-execution correspondence: after the harness has consumed the
+# binary from the live read-only checkout mount, re-derive the exact same input
+# digest record plus the binary digest and refuse certification if either
+# changed. Endpoint-stability assurance is scoped to the serial, actual-checkout
+# owner: a durable source or artifact change observed before the post-execution
+# re-hash is attributed to this invocation and refuses certification; this does
+# not claim to detect a transient replacement that is restored before the final
+# hash. The verdict therefore remains tied to the stable candidate this run
+# actually executed.
+e2e_verify_stable() {
+    _gate="$1"
+    _harness_py="$2"
+    _harness_sh="$3"
+    prev_inputs=$(cat "$TGT/.e2e-$_gate-inputs" 2>/dev/null) || {
+        echo "E2E-$_gate-BLOCKED: e2e receipt inputs file missing ($TGT/.e2e-$_gate-inputs); certification impossible" >&2
+        exit 1
+    }
+    prev_bin=$(cat "$TGT/.e2e-$_gate-binhash" 2>/dev/null) || {
+        echo "E2E-$_gate-BLOCKED: e2e receipt binhash file missing ($TGT/.e2e-$_gate-binhash); certification impossible" >&2
+        exit 1
+    }
+    now_inputs=$(e2e_receipt_fields "$_gate" "$_harness_py" "$_harness_sh") || exit 1
+    now_bin=$(sha256_digest file "$ROOT/$BIN") || exit 1
+    if [ "$now_inputs" != "$prev_inputs" ]; then
+        echo "E2E-$_gate-BLOCKED: source inputs changed across harness execution (receipt no longer corresponds); refusing certification" >&2
+        echo "  before=$prev_inputs" >&2
+        echo "  now   =$now_inputs" >&2
+        exit 1
+    fi
+    if [ "$now_bin" != "$prev_bin" ]; then
+        echo "E2E-$_gate-BLOCKED: executed binary changed across harness execution ($prev_bin -> $now_bin); refusing certification" >&2
+        exit 1
+    fi
+    echo "E2E-$_gate-CORRESPONDENCE-OK: inputs+binary unchanged across harness execution"
+}
+
+e2e_build_receipt() {
+    _gate="$1"
+    _harness_py="$2"
+    _harness_sh="$3"
     ROOT="$(pwd)"
+    # B3: observation and build must share one actual connection. linux_dispatch
+    # (the sole sanctioned build dispatch) hardcodes flock-vm with the pinned
+    # builder image; a PODMAN_CONNECTION override would make the probe observe a
+    # different owner than the build runs, so any value other than flock-vm is
+    # rejected BEFORE any probe/build effect.
+    case "${PODMAN_CONNECTION:-flock-vm}" in
+        flock-vm) ;;
+        *)
+            echo "E2E-$_gate-BLOCKED: unsupported PODMAN_CONNECTION override '${PODMAN_CONNECTION}' (build dispatch hardcodes flock-vm; probe would observe a different owner); unset it or use flock-vm" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$(uname -s)" = "Linux" ]; then
+        _builder="native-host"
+    else
+        _builder="flock-vm"
+    fi
     # R1: the artifact PROFILE is explicitly observed from the build owner (the
     # native host triple under which the release build actually runs), not
     # guessed from --target-dir. The identical triple is carried into the cargo
@@ -868,8 +1009,8 @@ e2e_relay() {
     observe_build_target() {
         _probe_out="$("$@" 2>&1)" || _probe_rc=$?
         if [ "${_probe_rc:-0}" -ne 0 ]; then
-            printf 'E2E-RELAY-BLOCKED: build target probe failed before parse (exit %s):\n%s\n' \
-                "$_probe_rc" "$_probe_out" >&2
+            printf 'E2E-%s-BLOCKED: build target probe failed before parse (exit %s):\n%s\n' \
+                "$_gate" "$_probe_rc" "$_probe_out" >&2
             exit 1
         fi
         printf '%s\n' "$_probe_out"
@@ -886,7 +1027,7 @@ e2e_relay() {
     E2E_TARGET=$(printf '%s\n' "$_probe_buf" | sed -n 's/^host: //p')
     case "$E2E_TARGET" in
         "" | *$'\n'* | *" "*)
-            echo "E2E-RELAY-BLOCKED: could not observe native build target profile ('${E2E_TARGET}')" >&2
+            echo "E2E-$_gate-BLOCKED: could not observe native build target profile ('${E2E_TARGET}')" >&2
             exit 1
             ;;
     esac
@@ -894,26 +1035,10 @@ e2e_relay() {
     TGT="$ROOT/target"
     BIN="target/${E2E_TARGET}/release/alumina"
     closure_metadata
-    # Pre-build source-input stability record: the diff producer exit is
-    # checked SEPARATELY (never a masked pipeline -- a failing `git diff` must
-    # fail the receipt, not be swallowed by a successful hasher), and the
-    # untracked harness scripts are hashed explicitly (git diff excludes them).
-    before_status() {
-        rcd=0
-        git diff HEAD >"$TGT/e2e-diff.$$" 2>&1 || rcd=$?
-        [ "$rcd" -eq 0 ] || {
-            echo "E2E-RELAY-BLOCKED: git diff HEAD exit $rcd (unreadable diff, not a receipt)" >&2
-            exit 1
-        }
-        diffhash=$(sha256_digest file "$TGT/e2e-diff.$$") || exit 1
-        harness1=$(sha256_digest file "scripts/e2e_relay.py") || exit 1
-        harness2=$(sha256_digest file "scripts/e2e_relay.sh") || exit 1
-        shellhash=$(sha256_digest file "scripts/verify.sh") || exit 1
-        printf '%s %s %s %s %s\n' "$(git rev-parse --verify HEAD 2>/dev/null || true)" \
-            "$diffhash" "$harness1" "$harness2" "$shellhash"
-    }
+    # Pre-build source-input stability record (exact-candidate inputs hashed by
+    # the shared owner; explicitly includes the untracked harness scripts).
     mkdir -p "$TGT"
-    before=$(before_status)
+    before=$(e2e_receipt_fields "$_gate" "$_harness_py" "$_harness_sh") || exit 1
     if [ "$(uname -s)" = "Linux" ]; then
         echo "PRODUCTION-RELEASE-BUILD (native Linux, exact current source, target=${E2E_TARGET}):"
         cargo +${TOOLCHAIN} build --locked --release --target "$E2E_TARGET" --target-dir "$TGT"
@@ -921,119 +1046,78 @@ e2e_relay() {
         echo "PRODUCTION-RELEASE-BUILD (native Linux via container dispatch; host $(uname -s), target=${E2E_TARGET}):"
         linux_dispatch "cargo +1.99.0 build --locked --release --target ${E2E_TARGET} --target-dir /app/target"
     fi
-    after=$(before_status)
+    after=$(e2e_receipt_fields "$_gate" "$_harness_py" "$_harness_sh") || exit 1
     # Pre/post build source-input stability: the candidate inputs (HEAD +
     # dirty diff + untracked harness + gate script) must be unchanged across
     # the build, or a mid-build source change would detach the receipt from the
     # executed binary.
     if [ "$before" != "$after" ]; then
-        echo "E2E-RELAY-BLOCKED: source inputs changed during the build (receipt would not correspond)" >&2
+        echo "E2E-$_gate-BLOCKED: source inputs changed during the build (receipt would not correspond)" >&2
         echo "  before=$before" >&2
         echo "  after =$after" >&2
         exit 1
     fi
     [ -x "$ROOT/$BIN" ] || {
-        echo "E2E-RELAY-BLOCKED: production static binary missing after rebuild ($BIN for target $E2E_TARGET)" >&2
+        echo "E2E-$_gate-BLOCKED: production static binary missing after rebuild ($BIN for target $E2E_TARGET)" >&2
         exit 1
     }
-    echo "e2e/relay identity (executed binary tied to exact candidate):"
+    echo "e2e/$_gate identity (executed binary tied to exact candidate):"
     head=$(git rev-parse --verify HEAD 2>&1) || {
-        echo "E2E-RELAY-BLOCKED: git rev-parse HEAD failed" >&2
+        echo "E2E-$_gate-BLOCKED: git rev-parse HEAD failed" >&2
         exit 1
     }
     binhash=$(sha256_digest file "$ROOT/$BIN") || exit 1
+    # B3/R1: resolve the ACTUAL harness-image tag + immutable ID from the
+    # rootful connection the harness consumers open (e2e_relay.sh/e2e_shutdown.sh
+    # use ${PODMAN_ROOT_CONNECTION:-flock-vm-root}). An unresolvable ID is a
+    # blocker. The immutable ID is EXPORTED to the consumers, which must
+    # re-check that the tag still resolves to this ID on their connection and
+    # then run the ID itself (R1: the receipt's image is the image executed).
+    E2E_IMAGE="${E2E_IMAGE:-localhost/alumina-e2e:e2e-20261011}"
+    E2E_ROOT_CONN="${PODMAN_ROOT_CONNECTION:-flock-vm-root}"
+    harness_id=$(podman --connection "$E2E_ROOT_CONN" image inspect --format '{{.Id}}' "$E2E_IMAGE" 2>/dev/null) \
+        || harness_id=""
+    if [ -z "$harness_id" ]; then
+        echo "E2E-$_gate-BLOCKED: harness image '$E2E_IMAGE' id unresolvable on ${E2E_ROOT_CONN}: ${E2E_ROOT_CONN}" >&2
+        exit 1
+    fi
+    export E2E_IMAGE E2E_IMAGE_ID="$harness_id" E2E_ROOT_CONN
+    # Durable through-execution receipt (consumed by e2e_verify_stable after
+    # the harness runs): exact-candidate inputs + executed binary digest.
+    printf '%s\n' "$after" >"$TGT/.e2e-$_gate-inputs"
+    printf '%s\n' "$binhash" >"$TGT/.e2e-$_gate-binhash"
     printf '  HEAD=%s target=%s dirty-diff-sha256=%s harness-py-sha256=%s harness-sh-sha256=%s binary-sha256=%s\n' \
         "$head" "$E2E_TARGET" "$(printf '%s' "$after" | cut -d' ' -f2)" \
         "$(printf '%s' "$after" | cut -d' ' -f3)" "$(printf '%s' "$after" | cut -d' ' -f4)" "$binhash"
+    printf '  builder=%s builder-image=%s harness-image=%s harness-image-id=%s harness-conn=%s\n' \
+        "$_builder" "docker.io/library/rust@sha256:484dce463db97ee3b9c3dbeb82ac48408091573ec2da1ce9ccd84c823642779a" \
+        "$E2E_IMAGE" "$harness_id" "$E2E_ROOT_CONN"
+}
+
+e2e_relay() {
+    e2e_build_receipt relay scripts/e2e_relay.py scripts/e2e_relay.sh
     sh scripts/e2e_relay.sh
+    e2e_verify_stable relay scripts/e2e_relay.py scripts/e2e_relay.sh
 }
 
 # Native SIGTERM shutdown gate against the ACTUAL production binary, rebuilt
-# from the exact current source with the same identity receipt as e2e_relay
-# (source/binary correspondence is mandatory so the executed artifact is tied
-# to the reviewed candidate). The gate drives real SIGTERM into the served
-# binary: idle wake, no-self-exit, pre-serving observation, early drain,
-# deadline-forced closure (repeat-signal no-extension), stalled stdout and
-# silent DNS cooperation. Every case child is supervised foreground.
+# from the exact current source behind the same identity receipt as the relay
+# gate via the shared e2e_build_receipt owner (source/binary correspondence is
+# mandatory so the executed artifact is tied to the reviewed candidate). The
+# gate drives real SIGTERM into the served binary: idle wake, no-self-exit,
+# pre-serving observation, early drain, deadline-forced closure (repeat-signal
+# no-extension), stalled stdout and silent DNS cooperation. Every case child is
+# supervised foreground.
 e2e_shutdown() {
-    ROOT="$(pwd)"
-    observe_build_target() {
-        _probe_out="$("$@" 2>&1)" || _probe_rc=$?
-        if [ "${_probe_rc:-0}" -ne 0 ]; then
-            printf 'E2E-SHUTDOWN-BLOCKED: build target probe failed before parse (exit %s):\n%s\n' \
-                "$_probe_rc" "$_probe_out" >&2
-            exit 1
-        fi
-        printf '%s\n' "$_probe_out"
-    }
-    if [ "$(uname -s)" = "Linux" ]; then
-        _probe_buf=$(observe_build_target rustc +${TOOLCHAIN} -vV) || exit 1
-    else
-        _probe_buf=$(observe_build_target \
-            podman --connection "${PODMAN_CONNECTION:-flock-vm}" run --rm --pull=never \
-            docker.io/library/rust@sha256:484dce463db97ee3b9c3dbeb82ac48408091573ec2da1ce9ccd84c823642779a \
-            sh -c 'rustc -vV') || exit 1
-    fi
-    E2E_TARGET=$(printf '%s\n' "$_probe_buf" | sed -n 's/^host: //p')
-    case "$E2E_TARGET" in
-        "" | *$'\n'* | *" "*)
-            echo "E2E-SHUTDOWN-BLOCKED: could not observe native build target profile ('${E2E_TARGET}')" >&2
-            exit 1
-            ;;
-    esac
-    export E2E_TARGET
-    TGT="$ROOT/target"
-    BIN="target/${E2E_TARGET}/release/alumina"
-    closure_metadata
-    before_status() {
-        rcd=0
-        git diff HEAD >"$TGT/shutdown-diff.$$" 2>&1 || rcd=$?
-        [ "$rcd" -eq 0 ] || {
-            echo "E2E-SHUTDOWN-BLOCKED: git diff HEAD exit $rcd (unreadable diff, not a receipt)" >&2
-            exit 1
-        }
-        diffhash=$(sha256_digest file "$TGT/shutdown-diff.$$") || exit 1
-        harness1=$(sha256_digest file "scripts/e2e_shutdown.py") || exit 1
-        harness2=$(sha256_digest file "scripts/e2e_shutdown.sh") || exit 1
-        shellhash=$(sha256_digest file "scripts/verify.sh") || exit 1
-        printf '%s %s %s %s %s\n' "$(git rev-parse --verify HEAD 2>/dev/null || true)" \
-            "$diffhash" "$harness1" "$harness2" "$shellhash"
-    }
-    mkdir -p "$TGT"
-    before=$(before_status)
-    if [ "$(uname -s)" = "Linux" ]; then
-        echo "PRODUCTION-RELEASE-BUILD (native Linux, exact current source, target=${E2E_TARGET}):"
-        cargo +${TOOLCHAIN} build --locked --release --target "$E2E_TARGET" --target-dir "$TGT"
-    else
-        echo "PRODUCTION-RELEASE-BUILD (native Linux via container dispatch; host $(uname -s), target=${E2E_TARGET}):"
-        linux_dispatch "cargo +1.99.0 build --locked --release --target ${E2E_TARGET} --target-dir /app/target"
-    fi
-    after=$(before_status)
-    if [ "$before" != "$after" ]; then
-        echo "E2E-SHUTDOWN-BLOCKED: source inputs changed during the build (receipt would not correspond)" >&2
-        echo "  before=$before" >&2
-        echo "  after =$after" >&2
-        exit 1
-    fi
-    [ -x "$ROOT/$BIN" ] || {
-        echo "E2E-SHUTDOWN-BLOCKED: production static binary missing after rebuild ($BIN for target $E2E_TARGET)" >&2
-        exit 1
-    }
-    echo "e2e/shutdown identity (executed binary tied to exact candidate):"
-    head=$(git rev-parse --verify HEAD 2>&1) || {
-        echo "E2E-SHUTDOWN-BLOCKED: git rev-parse HEAD failed" >&2
-        exit 1
-    }
-    binhash=$(sha256_digest file "$ROOT/$BIN") || exit 1
-    printf '  HEAD=%s target=%s dirty-diff-sha256=%s harness-py-sha256=%s harness-sh-sha256=%s binary-sha256=%s\n' \
-        "$head" "$E2E_TARGET" "$(printf '%s' "$after" | cut -d' ' -f2)" \
-        "$(printf '%s' "$after" | cut -d' ' -f3)" "$(printf '%s' "$after" | cut -d' ' -f4)" "$binhash"
+    e2e_build_receipt shutdown scripts/e2e_shutdown.py scripts/e2e_shutdown.sh
     sh scripts/e2e_shutdown.sh
+    e2e_verify_stable shutdown scripts/e2e_shutdown.py scripts/e2e_shutdown.sh
 }
 
 case "$TIER/$SCOPE" in
     mid/foundations) mid_foundations ;;
     mid/boot) mid_boot ;;
+    mid/union) mid_union ;;
     fixtures/boot) boot_fixtures ;;
     boundary/phase1) boundary_phase1 ;;
     e2e/relay) e2e_relay ;;

@@ -41,10 +41,20 @@ Cases (each exercises the ACTUAL shipped shutdown path):
     STALLED-STDOUT            stalled relay + stdout GENUINELY FULL in a 4 KiB
                               pipe (supervised nonblocking fill reaches EAGAIN):
                               the sink must not delay shutdown -> exit 70 on time
-    SILENT-DNS-NO-REFRESH     stalled relay + responder dead from session 2:
-                              no post-startup refresh admission is observed
-                              (negative), so the concluded DNS transport leaves
-                              no deadline that delays the drain -> exit 70 on time
+    SILENT-DNS-REFRESH-DRAIN
+                              stalled relay; the real current AAAA due-refresh
+                              is served and its response TRANSMITTED
+                              (responder-side transmission witness, not owner
+                              consumption); the SIBLING next-due AAAA exchange
+                              is then genuinely accepted/queried but left
+                              UNANSWERED (responder silent from session 3, a
+                              dead-resolver serving negative), and only then is
+                              SIGTERM delivered: the forced drain closes in the
+                              first-deadline window with that query pending.
+                              Handled-signal DNS suppression is claimed by the
+                              native owner witness (src/runtime.rs
+                              sigterm_stops_due_refresh_flow), not from this
+                              fixture's accept roster.
     SIMULTANEOUS-COMPLETION-NOBIND
                               SIGTERM while the final allowlist answer is held:
                               completion that races a signal must never win a
@@ -257,18 +267,17 @@ class DnsResponder:
     """Authority for the allowlist names. Modes:
     `delay_first`: sleep before answering the first accepted session's queries
         (keeps the startup window blocked so PRE-SERVING can signal mid-window).
-    `silent_after_first_session`: answer every query on the first accepted
-        connection; on later connections accept and never answer (a dead,
-        silent resolver for refreshes).
+    `silent_after_session`: serve session N and before; accept and never answer
+        from session N+1 on (a dead, silent resolver for any later refresh).
     `silent_always`: accept every query and never answer (a fully silent
         resolver used to hold the startup window open in Receiving)."""
 
-    def __init__(self, addr, answers, delay_first=0.0, silent_after_first_session=False,
+    def __init__(self, addr, answers, delay_first=0.0, silent_after_session=None,
                  silent_always=False, hold_final=False):
         self.addr = addr
         self.answers = answers
         self.delay_first = delay_first
-        self.silent_after_first_session = silent_after_first_session
+        self.silent_after_session = silent_after_session
         self.silent_always = silent_always
         self.hold_final = hold_final
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -280,6 +289,7 @@ class DnsResponder:
         self._lock = threading.Lock()
         self.sessions = 0
         self.queries = 0
+        self.session_times = []  # (session, time.monotonic() accept instant)
         self.thread = threading.Thread(target=self._run, name="dns", daemon=True)
         self._handlers = []
         # Set once every configured allowlist name has received a positive
@@ -293,6 +303,18 @@ class DnsResponder:
         self.release_final = threading.Event()
         self._final_held = False
         self._answered = set()
+        # AAAA-refresh TRANSMISSION witness: set only AFTER the responder's
+        # sendall of an AAAA NODATA answer on a serving session (>= 2) returns,
+        # so a cancelled/failed send can never publish it. It proves the
+        # responder transmitted the answer, never that the owner consumed or
+        # published the result (owner-side publication is native-witness
+        # territory, src/runtime.rs sigterm_stops_due_refresh_flow).
+        self.aaaa_refresh_sent = threading.Event()
+        # Dead-resolver serving negative: set when a silent-zone serving
+        # connection has been accepted AND its DNS query read while the
+        # responder intentionally leaves it unanswered (a genuine next-due
+        # exchange going unanswered, not a decorative branch in a passing path).
+        self.silent_accept = threading.Event()
 
     def start(self):
         self.thread.start()
@@ -325,9 +347,16 @@ class DnsResponder:
             with self._lock:
                 self.sessions += 1
                 session = self.sessions
-            print(f"DNS-TRACE: accepted connection session={session} silent_after_first={self.silent_after_first_session} silent_always={self.silent_always}", flush=True)
-            silent = self.silent_always or (self.silent_after_first_session and session > 1)
-            t = threading.Thread(target=self._serve, args=(conn, silent), daemon=True)
+                self.session_times.append((session, time.monotonic()))
+            silent = self.silent_always or (
+                self.silent_after_session is not None and session > self.silent_after_session
+            )
+            print(
+                f"DNS-TRACE: accepted connection session={session} t={time.monotonic():.3f} "
+                f"silent_after_session={self.silent_after_session} silent_always={self.silent_always}",
+                flush=True,
+            )
+            t = threading.Thread(target=self._serve, args=(conn, session, silent), daemon=True)
             with self._lock:
                 self._handlers.append(t)
             t.start()
@@ -346,7 +375,7 @@ class DnsResponder:
             pos += 1 + ln
         return b".".join(labels), pos
 
-    def _serve(self, conn, silent):
+    def _serve(self, conn, session, silent):
         try:
             conn.settimeout(5.0)
             while not self._stop:
@@ -374,7 +403,7 @@ class DnsResponder:
                 qtype = int.from_bytes(msg[qpos:qpos + 2], "big")
                 with self._lock:
                     self.queries += 1
-                    if self.sessions == 1 and self.delay_first > 0:
+                    if session == 1 and self.delay_first > 0:
                         delay = self.delay_first
                         self.delay_first = 0.0
                     else:
@@ -382,20 +411,38 @@ class DnsResponder:
                 if delay:
                     time.sleep(delay)
                 if silent:
-                    print(f"DNS-TRACE: query {qname!r} qtype={qtype} -> SILENT (no answer)", flush=True)
-                    # never answer; keep the connection open (a stalled resolver)
+                    print(f"DNS-TRACE: query {qname!r} qtype={qtype} t={time.monotonic():.3f} -> SILENT (no answer)", flush=True)
+                    # never answer; keep the connection open (a stalled resolver).
+                    # The query was read on a silent-zone session: published as
+                    # accepted/queried-and-unanswered DNS. Observation scope only:
+                    # any query on a silent session sets the event (no per-query
+                    # qtype/qname assertion); the due-family expectation comes
+                    # from the fixture's fixed inputs, not from this event.
+                    self.silent_accept.set()
                     time.sleep(1.0)
                     continue
                 question = msg[12:qpos + 4]
                 ip = self.answers.get(qname.lower())
                 final_answer = False
-                if ip is not None and qtype == 1:
+                transmitted_refresh = False
+                if ip is None:
+                    # unknown NAME -> NXDOMAIN for any type (whole-name
+                    # nonexistence, the runtime's name-wide eviction), never a
+                    # fake positive
+                    rr = b""
+                    ancount = 0
+                    nscount = 0
+                    ns_rr = b""
+                    rcode = 3
+                elif qtype == 1:
                     rr = qname_literal(qname) + b"\x00\x01\x00\x01"
                     rr += (120).to_bytes(4, "big")
                     rr += (4).to_bytes(2, "big")
                     rr += ip
                     ancount = 1
                     rcode = 0
+                    nscount = 0
+                    ns_rr = b""
                     with self._lock:
                         self._answered.add(qname.lower())
                         if all(k in self._answered for k in self.answers):
@@ -404,9 +451,22 @@ class DnsResponder:
                                 self._final_held = True
                                 final_answer = True
                 else:
+                    # existing name, non-A type (the serving AAAA due-refresh:
+                    # startup never attempts AAAA, its slot stays due and the
+                    # owner's due-refresh re-queries it right after the
+                    # listener binds). Type-specific absence: NOERROR with zero
+                    # answers plus a covering SOA (RFC 2308), so only the
+                    # queried family is treated absent and A survives -- never a
+                    # whole-name NXDOMAIN. On a serving session (>= 2) the
+                    # transmitted AAAA answer is the real current-refresh
+                    # witness; the event is published below only after sendall
+                    # returns (B1).
                     rr = b""
                     ancount = 0
-                    rcode = 3
+                    rcode = 0
+                    nscount = 1
+                    ns_rr = soa_record(qname, 300, 60)
+                    transmitted_refresh = session >= 2 and qtype == 28
                 if final_answer:
                     # Withhold the final answer until the case has delivered a
                     # SIGTERM, so the startup window is provably still resolving
@@ -419,9 +479,13 @@ class DnsResponder:
                 hdrw = tid + flags.to_bytes(2, "big")
                 hdrw += (1).to_bytes(2, "big")
                 hdrw += (ancount).to_bytes(2, "big")
+                hdrw += (nscount).to_bytes(2, "big")
                 hdrw += (0).to_bytes(2, "big")
-                hdrw += (0).to_bytes(2, "big")
-                conn.sendall(len(resp_bytes(hdrw, question, rr)).to_bytes(2, "big") + resp_bytes(hdrw, question, rr))
+                resp = hdrw + question + rr + ns_rr
+                print(f"DNS-TRACE: query {qname!r} qtype={qtype} t={time.monotonic():.3f} -> TX {resp.hex()}", flush=True)
+                conn.sendall(len(resp).to_bytes(2, "big") + resp)
+                if transmitted_refresh:
+                    self.aaaa_refresh_sent.set()
         except OSError:
             return
         finally:
@@ -430,9 +494,23 @@ class DnsResponder:
             except OSError:
                 pass
 
-
-def resp_bytes(hdr, question, rr):
-    return hdr + question + rr
+def soa_record(owner, ttl, minimum):
+    """A synthetic single-name authoritative-zone SOA covering `owner`. The
+    zone apex of the queried name is the queried name itself, so the owner
+    always covers it -- exactly what the runtime's NODATA classification
+    requires (src/dns.rs classify_soa/soa_covers)."""
+    mname = qname_literal(b"ns1.example.org")
+    rname = qname_literal(b"hostmaster.example.org")
+    rdata_len = len(mname) + len(rname) + 20
+    m = qname_literal(owner)
+    m += b"\x00\x06\x00\x01"  # type SOA, class IN
+    m += ttl.to_bytes(4, "big")
+    m += rdata_len.to_bytes(2, "big")
+    m += mname
+    m += rname
+    for v in (1, 3600, 600, 86400, minimum):  # serial refresh retry expire minimum
+        m += v.to_bytes(4, "big")
+    return m
 
 
 def qname_literal(qname):
@@ -654,10 +732,10 @@ def spawn_binary(stdout_target=None, stderr_target=None, preexec_dup2=None):
     return subprocess.Popen(argv, stdout=stdout_target, stderr=stderr_target)
 
 
-def setup_dns(answers, delay_first=0.0, silent_after_first_session=False, silent_always=False,
+def setup_dns(answers, delay_first=0.0, silent_after_session=None, silent_always=False,
               hold_final=False):
     dns = DnsResponder(("127.0.0.1", 53), answers, delay_first,
-                       silent_after_first_session, silent_always, hold_final).start()
+                       silent_after_session, silent_always, hold_final).start()
     return dns
 
 
@@ -1208,18 +1286,27 @@ def case_stalled_stdout(fixtures):
 
 
 def case_silent_dns(fixtures):
-    """Stalled relay while the DNS responder answers session 1 (startup
-    resolves, listener binds, relay establishes) and accepts-but-never-answers
-    from session 2 on. Honest negative refresh witness: the shipped runtime
-    never admits a post-startup DNS refresh (no refresh driver exists), so no
-    silent-refresh query ever opens a second session and a dead resolver cannot
-    delay a drain that never contacts it; the concluded startup transport leaves
-    no outstanding DNS deadline. The case asserts session==1 throughout and
-    that the forced closure lands in the first-deadline window."""
-    name = "SILENT-DNS-NO-REFRESH"
+    """Stalled relay + the REAL current DNS refresh profile, honestly scoped.
+    Startup resolves both A families on session 1 and never attempts AAAA (their
+    slots stay due), so the serving owner's due-refresh re-queries AAAA right
+    after the listener binds. The harness SERVES the first such refresh on
+    session 2 (the responder-side TRANSMISSION witness, set only after sendall
+    returns; proves the responder sent the answer, not that the owner consumed
+    it), then the SIBLING next-due AAAA exchange on session 3 is genuinely
+    ACCEPTED, its query read, and left UNANSWERED (the responder goes silent
+    from session 3); the case REQUIRES that accepted/queried-but-unanswered
+    observation BEFORE delivering SIGTERM. The forced drain must then still
+    close in the first-deadline window with that pending dead-resolver serving
+    query outstanding. Observed session counts are printed as an observation
+    only: handled-SIGTERM DNS SUPPRESSION is NOT claimed from this fixture's
+    accept roster -- it is the native owner witness (src/runtime.rs
+    sigterm_stops_due_refresh_flow re-arms A+AAAA due after a real self-pipe
+    SIGTERM and asserts no new DNS initiation), run separately with its
+    no-signal negative control."""
+    name = "SILENT-DNS-REFRESH-DRAIN"
     dns = setup_dns({b"drain.example.org": bytes([8, 8, 8, 8]),
                      b"force.example.org": bytes([208, 67, 222, 220])},
-                    silent_after_first_session=True)
+                    silent_after_session=2)
     fixtures.append(dns)
     silent = SilentUpstream(("208.67.222.220", 443)).start()
     fixtures.append(silent)
@@ -1235,36 +1322,40 @@ def case_silent_dns(fixtures):
         time.sleep(0.3)
         if silent.bytes_received() == 0:
             proc.kill(); proc.wait(); fail(name, "no hello bytes upstream (relay not established)"); return
-        # negative refresh observation: a refresh admission would open a second,
-        # unanswered (silent) session; the binary must never issue one
-        # post-startup, so the dead resolver is provably never contacted.
-        refresh_window = time.time() + 0.7
-        while time.time() < refresh_window:
-            with dns._lock:
-                sess = dns.sessions
-            if sess != 1:
-                proc.kill(); proc.wait()
-                fail(name, f"post-startup DNS refresh admitted (session {sess}); not the no-refresh profile")
-                return
-            time.sleep(0.05)
-        t0 = time.time()
+        # Current-refresh transmission witness: the first due-refresh AAAA answer
+        # must actually be SENT on a serving session (event published only after
+        # sendall returns), not merely admitted or assembled.
+        if not dns.aaaa_refresh_sent.wait(10.0):
+            proc.kill(); proc.wait()
+            fail(name, "current AAAA refresh answer never transmitted on a post-startup session (fixture premise of a real refresh violated)")
+            return
+        # Dead-resolver serving negative: the SIBLING next-due AAAA exchange
+        # must be genuinely accepted, its query read, and left unanswered on a
+        # silent-zone session (>= 3) BEFORE the signal -- a real stalled
+        # serving DNS query pending at signal time, not an unreachable branch.
+        if not dns.silent_accept.wait(10.0):
+            proc.kill(); proc.wait()
+            fail(name, "next due serving DNS query was never accepted/queried-and-left-unanswered on a silent-zone session before the signal (dead-resolver serving negative premise violated)")
+            return
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
-        rc = bounded_wait(proc, t0 + 12.5, name)
+        t_wall0 = time.time()
+        rc = bounded_wait(proc, t_wall0 + 12.5, name)
         if rc is None:
             return
+        elapsed = time.time() - t_wall0
         with dns._lock:
-            sess = dns.sessions
-        elapsed = time.time() - t0
-        if sess != 1:
-            fail(name, f"DNS session touched during shutdown ({sess})")
-        elif rc != 70:
+            sess_exit = dns.sessions
+            timeline = list(dns.session_times)
+            queries = dns.queries
+        if rc != 70:
             fail(name, f"silent-DNS forced closure must exit 70, got {rc} after {elapsed:.2f}s")
         elif elapsed < GRACE_LO:
             fail(name, f"silent-DNS forced closure too early: {elapsed:.2f}s")
         elif elapsed > GRACE_HI:
-            fail(name, f"concluded DNS left a deadline that delayed the forced closure: {elapsed:.2f}s (> {GRACE_HI:.1f}s first-deadline window)")
+            fail(name, f"DNS left a deadline that delayed the forced closure: {elapsed:.2f}s (> {GRACE_HI:.1f}s first-deadline window)")
         else:
-            pass_(name, f"no post-startup DNS refresh admitted (session 1 only; responder silent from session 2) and no DNS deadline delayed the drain: forced exit 70 in {elapsed:.2f}s within the first-deadline window")
+            pass_(name, f"current AAAA refresh answer TRANSMITTED on a post-startup serving session (responder-side witness) and a next-due serving DNS query accepted/queried-and-left-unanswered on a silent-zone serving session before the signal (dead-resolver serving negative; responder-observed, due-family scheduling from fixed inputs); {queries} queries over {sess_exit} sessions observed (timeline {[(s, f'{t:.2f}') for s, t in timeline]} rel. signal {t0:.2f}); forced exit 70 in {elapsed:.2f}s within the first-deadline window with that query pending. Session counts are an observation only; owner-side active-cancellation and suppression are covered natively by src/runtime.rs runtime_self_pipe_sigterm_cancels_active_receiving + sigterm_stops_due_refresh_flow (run separately), not claimed from this fixture's accept roster")
     finally:
         if s is not None:
             try:
