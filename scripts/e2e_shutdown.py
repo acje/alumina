@@ -45,12 +45,14 @@ Cases (each exercises the ACTUAL shipped shutdown path):
                               stalled relay; the real current AAAA due-refresh
                               is served and its response TRANSMITTED
                               (responder-side transmission witness, not owner
-                              consumption); the SIBLING next-due AAAA exchange
-                              is then genuinely accepted/queried but left
-                              UNANSWERED (responder silent from session 3, a
-                              dead-resolver serving negative), and only then is
-                              SIGTERM delivered: the forced drain closes in the
-                              first-deadline window with that query pending.
+                              consumption); a next-due serving DNS exchange
+                              (sibling AAAA-family by fixed inputs) is genuinely
+                              accepted, its query read, and left UNANSWERED
+                              (responder silent from session 3, a dead-resolver
+                              serving negative), and only then is SIGTERM
+                              delivered: the forced drain closes in the
+                              first-deadline window with that accepted/read/
+                              unanswered observation before signal.
                               Handled-signal DNS suppression is claimed by the
                               native owner witness (src/runtime.rs
                               sigterm_stops_due_refresh_flow), not from this
@@ -123,7 +125,7 @@ def bounded_wait(proc, deadline, name):
     """Wait for `proc` within `deadline`; on timeout kill and return None.
     A timed-out child is reaped (killed) so no case leaks a live binary."""
     try:
-        rc = proc.wait(timeout=max(0.0, deadline - time.time()))
+        rc = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         return rc
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -185,7 +187,7 @@ def wait_reachable(deadline):
     """Wait until the listener is reachable. Returns ("reachable", None) on a
     successful connect, ("timeout", None) when the deadline lapses, or
     ("error", exc) on an operational probe error (never treated as absence)."""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         kind, exc = connect_probe()
         if kind == "reachable":
             return ("reachable", None)
@@ -199,7 +201,7 @@ def require_reachable(name, proc, timeout=20.0):
     """Require the startup listener to become reachable. Reaps the binary and
     FAILs with the exact reason on timeout or an operational probe error;
     operational errors are never read as listener absence."""
-    kind, exc = wait_reachable(time.time() + timeout)
+    kind, exc = wait_reachable(time.monotonic() + timeout)
     if kind == "reachable":
         return True
     proc.kill()
@@ -219,7 +221,7 @@ def probe_refused_sampled(deadline, name, proc):
     authoritatively REFUSED. A connect that succeeds (admission stayed open) or
     an operational probe error both FAIL, so a broken observation boundary can
     never green the no-bind claim. Returns True once refused."""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         kind, exc = connect_probe()
         if kind == "refused":
             return True
@@ -241,9 +243,9 @@ def wait_log_marker(name, marker, timeout=8.0):
     except OSError:
         return False
     try:
-        end = time.time() + timeout
+        end = time.monotonic() + timeout
         buf = b""
-        while time.time() < end:
+        while time.monotonic() < end:
             try:
                 chunk = os.read(logfd, 65536)
             except OSError:
@@ -328,11 +330,11 @@ class DnsResponder:
             pass
 
     def join(self, deadline):
-        end = time.time() + deadline
-        self.thread.join(max(0.0, end - time.time()))
+        end = time.monotonic() + deadline
+        self.thread.join(max(0.0, end - time.monotonic()))
         pending = list(self._handlers)
         for t in pending:
-            t.join(max(0.0, end - time.time()))
+            t.join(max(0.0, end - time.monotonic()))
         self._handlers = [t for t in self._handlers if t.is_alive()]
         return not any(t.is_alive() for t in pending) and not self.thread.is_alive()
 
@@ -554,11 +556,11 @@ class _BoundServer:
             pass
 
     def join(self, deadline):
-        end = time.time() + deadline
-        self.thread.join(max(0.0, end - time.time()))
+        end = time.monotonic() + deadline
+        self.thread.join(max(0.0, end - time.monotonic()))
         pending = list(self._handlers)
         for t in pending:
-            t.join(max(0.0, end - time.time()))
+            t.join(max(0.0, end - time.monotonic()))
         self._handlers = [t for t in self._handlers if t.is_alive()]
         return not any(t.is_alive() for t in pending) and not self.thread.is_alive()
 
@@ -796,12 +798,12 @@ def case_idle_sigterm(fixtures):
             return
         if proc.poll() is not None:
             fail(name, f"binary exited on its own before SIGTERM (rc {proc.returncode})"); return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
-        rc = bounded_wait(proc, time.time() + 5.0, name)
+        rc = bounded_wait(proc, time.monotonic() + 5.0, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 0:
             fail(name, f"idle drain must exit 0, got {rc} after {elapsed:.2f}s")
         elif elapsed >= 3.0:
@@ -825,12 +827,12 @@ def case_neg_no_self_exit(fixtures):
         time.sleep(2.0)
         if proc.poll() is not None:
             fail(name, f"process self-exited with no signal (rc {proc.returncode})"); return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
-        rc = bounded_wait(proc, time.time() + 5.0, name)
+        rc = bounded_wait(proc, time.monotonic() + 5.0, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 0:
             fail(name, f"SIGTERM after 2s idle must exit 0, got {rc}")
         else:
@@ -857,8 +859,8 @@ def case_pre_serving(fixtures):
         # Wait until the startup DNS window has begun (>=1 query observed):
         # the boot-armed handler is installed before run_startup, at that
         # moment the exchange is in Receiving against the silent resolver.
-        probe_deadline = time.time() + 5.0
-        while time.time() < probe_deadline and dns.queries == 0:
+        probe_deadline = time.monotonic() + 5.0
+        while time.monotonic() < probe_deadline and dns.queries == 0:
             time.sleep(0.02)
         if dns.queries == 0:
             proc.kill(); proc.wait()
@@ -875,20 +877,20 @@ def case_pre_serving(fixtures):
             return
         if proc.poll() is not None:
             fail(name, f"process exited before the pre-serving SIGTERM (rc {proc.returncode})"); return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
         # interval-wide no-bind: from the first signal to process exit the
         # listener port must NEVER become reachable (no bind at any point
         # across the whole observation interval, not just at signal time);
         # operational probe errors fail the case rather than green an absence.
-        while proc.poll() is None and time.time() - t0 < 12.0:
+        while proc.poll() is None and time.monotonic() - t0 < 12.0:
             if not sample_no_bind(name, proc):
                 return
             time.sleep(0.02)
-        rc = bounded_wait(proc, time.time() + 12.0, name)
+        rc = bounded_wait(proc, time.monotonic() + 12.0, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 0:
             fail(name, f"pre-serving SIGTERM must terminate the owner with exit 0, got {rc} after {elapsed:.2f}s")
         elif elapsed >= 6.0:
@@ -930,7 +932,7 @@ def case_retry_backoff_storm(fixtures):
             proc.kill(); proc.wait()
             fail(name, f"operational connect error before the signal (indeterminate, not absence): {exc}")
             return
-        t0 = time.time()
+        t0 = time.monotonic()
         # Storm with error-aware no-bind probes interleaved from the FIRST
         # signal: a bind during the backoff is observed between signals, not
         # only after all six have fired, so the interval-wide no-bind claim
@@ -943,14 +945,14 @@ def case_retry_backoff_storm(fixtures):
                 return
             time.sleep(0.05)
         # post-signal no-bind, error-aware, across the whole interval to exit
-        while proc.poll() is None and time.time() - t0 < 10.0:
+        while proc.poll() is None and time.monotonic() - t0 < 10.0:
             if not sample_no_bind(name, proc):
                 return
             time.sleep(0.02)
-        rc = bounded_wait(proc, time.time() + 10.0, name)
+        rc = bounded_wait(proc, time.monotonic() + 10.0, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 0:
             fail(name, f"SIGTERM storm during retry backoff must exit 0, got {rc} after {elapsed:.2f}s")
         elif elapsed >= 6.0:
@@ -986,7 +988,7 @@ def case_storm_during_drain(fixtures):
         time.sleep(0.3)
         if silent.bytes_received() == 0:
             proc.kill(); proc.wait(); fail(name, "no hello bytes upstream (relay not established)"); return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
         # storm of repeat signals during the drain: none may move the deadline
         time.sleep(1.0)
@@ -997,7 +999,7 @@ def case_storm_during_drain(fixtures):
             return
         # live-before the first-deadline window: still draining at its edge
         hold_until = t0 + GRACE_LO - 0.3
-        now = time.time()
+        now = time.monotonic()
         if now < hold_until:
             time.sleep(hold_until - now)
         if proc.poll() is not None:
@@ -1006,7 +1008,7 @@ def case_storm_during_drain(fixtures):
         rc = bounded_wait(proc, t0 + 12.5, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 70:
             fail(name, f"storm drain must exit 70, got {rc} after {elapsed:.2f}s")
         elif elapsed < GRACE_LO:
@@ -1092,7 +1094,7 @@ def case_early_drain(fixtures):
             proc.kill(); proc.wait()
             fail(name, f"early-drain relay CONNECT/send failed: {exc}")
             return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
         # client half-close right after the signal: the relay drains and closes
         try:
@@ -1100,10 +1102,10 @@ def case_early_drain(fixtures):
         except OSError:
             pass
         stream = recv_through_eof(s, timeout=9.0, seed=seed)
-        rc = bounded_wait(proc, time.time() + 9.0, name)
+        rc = bounded_wait(proc, time.monotonic() + 9.0, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 0:
             fail(name, f"early drain must exit 0 (established tunnel closed), got {rc} after {elapsed:.2f}s")
         elif stream is None:
@@ -1145,7 +1147,7 @@ def case_forced_repeat_noadmit(fixtures):
         time.sleep(0.3)  # let the hello bytes reach the upstream -> Relay stage
         if silent.bytes_received() == 0:
             proc.kill(); proc.wait(); fail(name, "no hello bytes observed upstream (relay not established)"); return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
         # no admissions after the first signal: the listener must be dropped
         # (error-aware sampling; an operational probe error never reads as
@@ -1165,7 +1167,7 @@ def case_forced_repeat_noadmit(fixtures):
         rc = bounded_wait(proc, t0 + 12.5, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 70:
             fail(name, f"deadline-forced closure must exit 70, got {rc} after {elapsed:.2f}s")
         elif elapsed < GRACE_LO:
@@ -1256,12 +1258,12 @@ def case_stalled_stdout(fixtures):
             proc.kill(); proc.wait()
             fail(name, f"retained pipe not at exact full occupancy: a single-byte nonblocking write still succeeded after the 4096-fill EAGAIN ({filled}+{one_filled} bytes against capacity {cap}); stall not genuine")
             return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
         rc = bounded_wait(proc, t0 + 12.5, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 70:
             fail(name, f"stalled-stdout forced closure must exit 70, got {rc} after {elapsed:.2f}s")
         elif elapsed < GRACE_LO:
@@ -1292,12 +1294,15 @@ def case_silent_dns(fixtures):
     after the listener binds. The harness SERVES the first such refresh on
     session 2 (the responder-side TRANSMISSION witness, set only after sendall
     returns; proves the responder sent the answer, not that the owner consumed
-    it), then the SIBLING next-due AAAA exchange on session 3 is genuinely
-    ACCEPTED, its query read, and left UNANSWERED (the responder goes silent
-    from session 3); the case REQUIRES that accepted/queried-but-unanswered
-    observation BEFORE delivering SIGTERM. The forced drain must then still
-    close in the first-deadline window with that pending dead-resolver serving
-    query outstanding. Observed session counts are printed as an observation
+    it), then a next-due serving DNS exchange on a silent-zone session (>= 3,
+    sibling AAAA-family by fixed inputs) is genuinely ACCEPTED, its query read,
+    and left UNANSWERED (the responder goes silent from session 3); the case
+    REQUIRES that responder-observed accepted/read/unanswered observation
+    BEFORE delivering SIGTERM (the sticky event asserts neither qtype nor
+    continued owner activity). The forced drain must then still close in the
+    first-deadline window with that accepted/read/unanswered serving query
+    observed before signal. Observed session counts are printed as an
+    observation
     only: handled-SIGTERM DNS SUPPRESSION is NOT claimed from this fixture's
     accept roster -- it is the native owner witness (src/runtime.rs
     sigterm_stops_due_refresh_flow re-arms A+AAAA due after a real self-pipe
@@ -1329,21 +1334,22 @@ def case_silent_dns(fixtures):
             proc.kill(); proc.wait()
             fail(name, "current AAAA refresh answer never transmitted on a post-startup session (fixture premise of a real refresh violated)")
             return
-        # Dead-resolver serving negative: the SIBLING next-due AAAA exchange
-        # must be genuinely accepted, its query read, and left unanswered on a
-        # silent-zone session (>= 3) BEFORE the signal -- a real stalled
-        # serving DNS query pending at signal time, not an unreachable branch.
+        # Dead-resolver serving negative: some serving DNS query must be
+        # genuinely accepted, its query read, and left unanswered on a
+        # silent-zone session (>= 3) BEFORE the signal -- a responder-observed
+        # accepted/read/unanswered serving query (sibling AAAA-family by fixed
+        # inputs; asserts neither qtype nor continued owner activity), not an
+        # unreachable branch.
         if not dns.silent_accept.wait(10.0):
             proc.kill(); proc.wait()
             fail(name, "next due serving DNS query was never accepted/queried-and-left-unanswered on a silent-zone session before the signal (dead-resolver serving negative premise violated)")
             return
         t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
-        t_wall0 = time.time()
-        rc = bounded_wait(proc, t_wall0 + 12.5, name)
+        rc = bounded_wait(proc, t0 + 12.5, name)
         if rc is None:
             return
-        elapsed = time.time() - t_wall0
+        elapsed = time.monotonic() - t0
         with dns._lock:
             sess_exit = dns.sessions
             timeline = list(dns.session_times)
@@ -1355,7 +1361,7 @@ def case_silent_dns(fixtures):
         elif elapsed > GRACE_HI:
             fail(name, f"DNS left a deadline that delayed the forced closure: {elapsed:.2f}s (> {GRACE_HI:.1f}s first-deadline window)")
         else:
-            pass_(name, f"current AAAA refresh answer TRANSMITTED on a post-startup serving session (responder-side witness) and a next-due serving DNS query accepted/queried-and-left-unanswered on a silent-zone serving session before the signal (dead-resolver serving negative; responder-observed, due-family scheduling from fixed inputs); {queries} queries over {sess_exit} sessions observed (timeline {[(s, f'{t:.2f}') for s, t in timeline]} rel. signal {t0:.2f}); forced exit 70 in {elapsed:.2f}s within the first-deadline window with that query pending. Session counts are an observation only; owner-side active-cancellation and suppression are covered natively by src/runtime.rs runtime_self_pipe_sigterm_cancels_active_receiving + sigterm_stops_due_refresh_flow (run separately), not claimed from this fixture's accept roster")
+            pass_(name, f"current AAAA refresh answer TRANSMITTED on a post-startup serving session (responder-side witness) and a next-due serving DNS query accepted/queried-and-left-unanswered on a silent-zone serving session before the signal (dead-resolver serving negative; responder-observed, due-family scheduling from fixed inputs); {queries} queries over {sess_exit} sessions observed (timeline {[(s, f'{t:.2f}') for s, t in timeline]} rel. signal {t0:.2f}); forced exit 70 in {elapsed:.2f}s within the first-deadline window with that accepted/read/unanswered serving DNS query observed before signal (responder-observed; sibling AAAA-family by fixed inputs, asserts neither qtype nor continued owner activity). Session counts are an observation only; owner-side active-cancellation and suppression are covered natively by src/runtime.rs runtime_self_pipe_sigterm_cancels_active_receiving + sigterm_stops_due_refresh_flow (run separately), not claimed from this fixture's accept roster")
     finally:
         if s is not None:
             try:
@@ -1390,7 +1396,7 @@ def case_simultaneous_completion(fixtures):
             proc.kill(); proc.wait()
             fail(name, "responder never held the final allowlist answer")
             return
-        t0 = time.time()
+        t0 = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
         # Release the withheld answer only after the signal has had a beat to
         # arrive in the self-pipe, so the settlement recheck races an
@@ -1399,14 +1405,14 @@ def case_simultaneous_completion(fixtures):
         # readinesses into a single poll of the separate process's loop.
         time.sleep(0.05)
         dns.release_final.set()
-        while proc.poll() is None and time.time() - t0 < 10.0:
+        while proc.poll() is None and time.monotonic() - t0 < 10.0:
             if not sample_no_bind(name, proc):
                 return
             time.sleep(0.02)
-        rc = bounded_wait(proc, time.time() + 10.0, name)
+        rc = bounded_wait(proc, time.monotonic() + 10.0, name)
         if rc is None:
             return
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         if rc != 0:
             fail(name, f"simultaneous-completion SIGTERM must terminate with exit 0, got {rc} after {elapsed:.2f}s")
         elif elapsed >= 6.0:
