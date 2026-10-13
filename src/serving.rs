@@ -1677,37 +1677,41 @@ impl Serving {
                     return Ok(());
                 }
             }
-            let mut scratch = [0u8; CHUNK];
             let room = self.io_room(index, CHUNK);
-            let n = match self.slots[index].client.as_mut() {
-                None => return Ok(()),
-                Some(client) => match client.read(&mut scratch[..room]) {
-                    Ok(0) => {
-                        self.note_op(index, 0);
-                        if self.slots[index].stage == Stage::Relay {
-                            return self.observe_up_eof(index);
-                        }
-                        self.close_slot(index);
-                        return Ok(());
+            let n = {
+                let ws = &mut self.slots[index];
+                let len = ws.buf_len;
+                match ws.client.as_mut() {
+                    None => return Ok(()),
+                    Some(client) => client.read(&mut ws.buf[len..len + room]),
+                }
+            };
+            let n = match n {
+                Ok(0) => {
+                    self.note_op(index, 0);
+                    if self.slots[index].stage == Stage::Relay {
+                        return self.observe_up_eof(index);
                     }
-                    Ok(n) => n,
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        self.note_op(index, 0);
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        self.note_op(index, 0);
-                        self.close_slot(index);
-                        return Ok(());
-                    }
-                },
+                    self.close_slot(index);
+                    return Ok(());
+                }
+                Ok(n) => n,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.note_op(index, 0);
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.note_op(index, 0);
+                    self.close_slot(index);
+                    return Ok(());
+                }
             };
             self.note_op(index, n);
             match self.slots[index].stage {
-                Stage::ReadingConnect => self.buffer_and_parse(index, &scratch[..n])?,
-                Stage::ValidatingHello => self.buffer_and_validate(index, &scratch[..n])?,
+                Stage::ReadingConnect => self.buffer_and_parse(index, n)?,
+                Stage::ValidatingHello => self.buffer_and_validate(index, n)?,
                 Stage::Relay => {
-                    self.append_client_bytes(index, &scratch[..n]);
+                    self.commit_retained(index, n);
                     self.flush_client_upstream(index)?;
                 }
                 _ => return Ok(()),
@@ -1730,6 +1734,13 @@ impl Serving {
         }
     }
 
+    fn commit_retained(&mut self, index: usize, added: usize) {
+        let ws = &mut self.slots[index];
+        debug_assert!(ws.buf_len + added <= HOLD_CAP);
+        ws.buf_len += added;
+    }
+
+    #[cfg(test)]
     fn append_client_bytes(&mut self, index: usize, bytes: &[u8]) {
         let ws = &mut self.slots[index];
         if ws.buf_len + bytes.len() > HOLD_CAP {
@@ -1740,8 +1751,8 @@ impl Serving {
         ws.buf_len += bytes.len();
     }
 
-    fn buffer_and_parse(&mut self, index: usize, bytes: &[u8]) -> Result<(), ServeError> {
-        self.append_client_bytes(index, bytes);
+    fn buffer_and_parse(&mut self, index: usize, added: usize) -> Result<(), ServeError> {
+        self.commit_retained(index, added);
         let head = {
             let ws = &mut self.slots[index];
             let start = ws.parse_rel;
@@ -1969,9 +1980,9 @@ impl Serving {
         }
     }
 
-    fn buffer_and_validate(&mut self, index: usize, bytes: &[u8]) -> Result<(), ServeError> {
-        if !bytes.is_empty() {
-            self.append_client_bytes(index, bytes);
+    fn buffer_and_validate(&mut self, index: usize, added: usize) -> Result<(), ServeError> {
+        if added > 0 {
+            self.commit_retained(index, added);
         }
         let inspection = {
             let ws = &mut self.slots[index];
@@ -2024,7 +2035,7 @@ impl Serving {
     /// pipelined before the CONNECT response completes is validated without
     /// waiting for a fresh readable edge.
     fn enter_validating_hello(&mut self, index: usize) -> Result<(), ServeError> {
-        self.buffer_and_validate(index, &[])?;
+        self.buffer_and_validate(index, 0)?;
         if self.slots[index].stage == Stage::ValidatingHello {
             self.client_readable(index)?;
         }
@@ -2197,31 +2208,34 @@ impl Serving {
             if self.slots[index].down_len + CHUNK > DOWN_CAP {
                 return Ok(());
             }
-            let mut scratch = [0u8; CHUNK];
             let room = self.io_room(index, CHUNK);
-            let n = match self.slots[index].upstream.as_mut() {
-                None => return Ok(()),
-                Some(up) => match up.read(&mut scratch[..room]) {
-                    Ok(0) => {
-                        self.note_op(index, 0);
-                        return self.observe_down_eof(index);
-                    }
-                    Ok(n) => n,
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        self.note_op(index, 0);
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        self.note_op(index, 0);
-                        self.close_slot(index);
-                        return Ok(());
-                    }
-                },
+            let n = {
+                let ws = &mut self.slots[index];
+                let len = ws.down_len;
+                match ws.upstream.as_mut() {
+                    None => return Ok(()),
+                    Some(up) => up.read(&mut ws.down[len..len + room]),
+                }
+            };
+            let n = match n {
+                Ok(0) => {
+                    self.note_op(index, 0);
+                    return self.observe_down_eof(index);
+                }
+                Ok(n) => n,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.note_op(index, 0);
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.note_op(index, 0);
+                    self.close_slot(index);
+                    return Ok(());
+                }
             };
             self.note_op(index, n);
             {
                 let ws = &mut self.slots[index];
-                ws.down[ws.down_len..ws.down_len + n].copy_from_slice(&scratch[..n]);
                 ws.down_len += n;
             }
             self.flush_down(index);
@@ -2820,7 +2834,7 @@ mod tests {
         ws.gate.on_upstream_connected();
         ws.gate.on_response_ok();
         serving
-            .buffer_and_validate(index, &[])
+            .buffer_and_validate(index, 0)
             .expect("drive hello validation");
     }
 
@@ -3883,6 +3897,171 @@ mod tests {
                 got,
                 b"!AZ".to_vec(),
                 "an upstream sink drain must resume the paused client read without a new edge"
+            );
+        });
+    }
+
+    #[test]
+    fn direct_tail_up_read_commits_read_count_once_at_tail_offset() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+            let _ = sink_stream.set_nonblocking(true);
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            let payload = test_offset_pattern(137, 17);
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                ws.buf[..CHUNK].fill(0xA5);
+                ws.buf_len = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            peer_stream
+                .write_all(&payload)
+                .expect("write direct-read payload");
+            let avail = Instant::now() + Duration::from_secs(2);
+            while serving.slots[index]
+                .client
+                .as_ref()
+                .expect("client present")
+                .peek(&mut [0u8; 1])
+                .is_err()
+            {
+                assert!(
+                    Instant::now() < avail,
+                    "the direct-read payload never became readable"
+                );
+                std::thread::yield_now();
+            }
+
+            serving
+                .client_readable(index)
+                .expect("direct up read visit");
+
+            let n = {
+                let ws = &serving.slots[index];
+                let n = ws.buf_len;
+                assert!(
+                    (1..=payload.len()).contains(&n),
+                    "the retained up tail must advance by exactly the returned read count, got {n}"
+                );
+                assert_eq!(
+                    &ws.buf[..n],
+                    &payload[..n],
+                    "the payload must reside at the retained ustream tail offset, once, \
+                     unduplicated"
+                );
+                assert_eq!(
+                    ws.buf[n], 0xA5,
+                    "the byte immediately after the committed read count must be untouched: \
+                     a second commit would overwrite it"
+                );
+                n
+            };
+
+            let mut got = Vec::new();
+            let mut tmp = [0u8; 64];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while got.len() < n && Instant::now() < deadline {
+                match sink_stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(m) => got.extend_from_slice(&tmp[..m]),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(_) => break,
+                }
+            }
+            assert_eq!(
+                got,
+                payload[..n],
+                "the directly-read payload must reach the upstream sink byte-exact"
+            );
+        });
+    }
+
+    #[test]
+    fn direct_tail_down_read_commits_read_count_once_at_tail_offset() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let origin_l = StdListener::bind("127.0.0.1:0").expect("origin bind");
+            let origin_addr = origin_l.local_addr().expect("origin addr");
+            let up = mio::net::TcpStream::connect(origin_addr).expect("upstream connect");
+            let mut origin = origin_l.accept().expect("accept origin side").0;
+            origin.set_nonblocking(true).expect("origin nonblocking");
+
+            let index = 0;
+            let payload = test_offset_pattern(137, 29);
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                ws.client = None;
+                ws.down[..CHUNK].fill(0xA5);
+                ws.down_len = 0;
+                ws.down_off = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            origin.write_all(&payload).expect("write down payload");
+            let avail = Instant::now() + Duration::from_secs(2);
+            while serving.slots[index]
+                .upstream
+                .as_ref()
+                .expect("upstream present")
+                .peek(&mut [0u8; 1])
+                .is_err()
+            {
+                assert!(
+                    Instant::now() < avail,
+                    "the down payload never became readable"
+                );
+                std::thread::yield_now();
+            }
+
+            serving
+                .relay_upstream_to_client(index)
+                .expect("direct down read visit");
+
+            let ws = &serving.slots[index];
+            let n = ws.down_len;
+            assert!(
+                (1..=payload.len()).contains(&n),
+                "the retained down tail must advance by exactly the returned read count, got {n}"
+            );
+            assert_eq!(
+                &ws.down[..n],
+                &payload[..n],
+                "the payload must reside at the retained down tail offset, once, unduplicated"
+            );
+            assert_eq!(
+                ws.down[n], 0xA5,
+                "the byte immediately after the committed down count must be untouched: a \
+                 second commit would overwrite it"
+            );
+            assert!(
+                serving.slots[index].upstream.is_some(),
+                "a stalled down flush must keep the upstream socket and the tunnel open"
             );
         });
     }
