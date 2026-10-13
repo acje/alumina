@@ -1,0 +1,22 @@
+{
+  "tool": "qryg_runner",
+  "candidate": "envoy",
+  "kind": "timed",
+  "stamp": "qryg-envoy-timed-20261014T012343Z-66851",
+  "client_mode": "via-proxy",
+  "harness_image_id": "9191d288353391e4751525e83196e8127884d73daa395ced6fafc4a96d71564f",
+  "candidate_image_id": "a084f595b889eb2e7c9af1abcc7565a9520fd45b63a7653f5181a55dd2cc9735",
+  "candidate_manifest_digest": "sha256:ce82b213b2c9190aa9fa2fc76678743a690681cbd668de32dd749e3e4da52862",
+  "native_config": "envoy_connect.yaml",
+  "native_config_sha256": "e6fb9ef7355ec0ce016de5a23bcb03428184ca3ee2e933f0235899245e0469b0",
+  "proxy_pid_in_namespace": 14,
+  "candidate_threads": 7,
+  "candidate_threads_reason": "",
+  "candidate_was_running_at_stop": true,
+  "candidate_wait_rc": 0,
+  "candidate_classification": "ok",
+  "driver_rc": 0,
+  "harness_job_rc": 0,
+  "session_exit": 0,
+  "seam_report": "/Users/anders.jensen/code/alumina-proxy/.ooda/benchmarks/qryg-native/qryg-envoy-timed-20261014T012343Z-66851.json"
+}

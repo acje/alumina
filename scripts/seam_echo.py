@@ -1239,7 +1239,7 @@ class ClientRun:
         """Unknown CPU evidence on a required subject invalidates the run."""
         if self.sampler.window_summary("client", self.warmup_end, self.window_end)["unknown"]:
             self.failures["unknown-cpu"] = True
-        if self.args.mode == "via-proxy":
+        if self.args.mode in ("via-proxy", "direct-proxy"):
             if not self.args.proxy_pid:
                 self.failures["unknown-cpu"] = True
             elif self.sampler.window_summary("proxy", self.warmup_end,
@@ -2094,6 +2094,49 @@ stop "$ALU" 1 >> "$O8" 2>&1 || rc=$?
     check("f3-failed-probe-unknown",
           w3p["unknown"], "unknown=%r reason=%r" % (w3p["unknown"], w3p["reason"]))
 
+    # --- direct-proxy (qryg.9 native runner): opaque-proxy route sampling. The
+    # route carries direct TLS to the proxy (no CONNECT handshake) yet the proxy
+    # remains a required CPU subject, reported under a neutral label distinct
+    # from via-proxy and proxyless. ---
+    r12, _c12 = _mk_run()
+    r12.args.mode = "direct-proxy"
+    r12.args.proxy_pid = 0
+    r12.sampler.unknown["client"] = "injected"
+    r12._apply_cpu_verdict()
+    check("direct-proxy-no-pid-invalid",
+          r12.failures.get("unknown-cpu") is True,
+          "failures=%r" % r12.failures)
+    check("direct-proxy-target-is-proxy",
+          route_target_addr("direct-proxy", "127.0.0.1", 8080, "8.8.8.8", 443)
+          == ("127.0.0.1", 8080) and
+          route_target_addr("via-proxy", "127.0.0.1", 8080, "8.8.8.8", 443)
+          == ("127.0.0.1", 8080) and
+          route_target_addr("proxyless", "127.0.0.1", 8080, "8.8.8.8", 443)
+          == ("8.8.8.8", 443),
+          "route target must track the client mode")
+    r13, _c13 = _mk_run()
+    r13.args.mode = "direct-proxy"
+    r13.args.proxy_pid = 4242
+    sf3b = ProcSampler([("proxy", 4242), ("client", os.getpid())])
+    sf3b.samples["proxy"] = [
+        _f3rec(4.0, 1_000_000),
+        _f3rec(5.0, 1_010_000, boundary="start", cores=5.0, dt_s=0.2),
+        _f3rec(30.0, 1_090_000, cores=5.0, dt_s=0.2),
+        _f3rec(60.0, 1_150_000, cores=5.0, dt_s=0.2),
+        _f3rec(65.0, 1_200_000, boundary="end"),
+    ]
+    sf3b.samples["client"] = list(sf3b.samples["proxy"])
+    r13.sampler = sf3b
+    r13.sampler.unknown = {}
+    r13._apply_cpu_verdict()
+    check("direct-proxy-cpu-required-known",
+          r13.failures.get("unknown-cpu") is None,
+          "failures=%r" % r13.failures)
+    w13 = sf3b.window_summary("proxy", 5.0, 65.0)
+    check("direct-proxy-proxy-sampled",
+          not w13.get("unknown") and w13.get("cores_mean") is not None,
+          "summary=%r" % w13)
+
     # --- F4 (alumina-45g9): strict supervision fails the session on a forced
     # SIGKILL for every required child label. Exercises the ACTUAL stop()
     # body extracted from scripts/seam_echo.sh, not a copy. ---
@@ -2195,6 +2238,12 @@ def _nonfinite(v):
         return True
 
 
+def route_target_addr(mode, proxy_host, proxy_port, backend_addr, backend_port):
+    if mode == "proxyless":
+        return (backend_addr, backend_port)
+    return (proxy_host, proxy_port)
+
+
 def _build_client_ctx(cafile):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -2206,7 +2255,8 @@ def main(argv):
     ap = argparse.ArgumentParser(prog=TOOL_NAME, description=__doc__)
     ap.add_argument("--role", required=True,
                     choices=["backend", "client", "dns-responder", "selftest"])
-    ap.add_argument("--mode", choices=["proxyless", "via-proxy"], default="proxyless")
+    ap.add_argument("--mode", choices=["proxyless", "via-proxy", "direct-proxy"],
+                    default="proxyless")
     ap.add_argument("--backend-addr", default="127.0.0.1")
     ap.add_argument("--backend-port", type=int, default=443)
     ap.add_argument("--proxy-host", default="127.0.0.1")
@@ -2277,14 +2327,14 @@ def main(argv):
         return 0
 
     if args.role == "client":
-        if args.mode == "via-proxy" and not args.proxy_pid:
-            print("seam-err: via-proxy measurement requires --proxy-pid "
-                  "(CPU evidence for the proxy subject)", file=sys.stderr)
+        if args.mode != "proxyless" and not args.proxy_pid:
+            print("seam-err: %s measurement requires --proxy-pid "
+                  "(CPU evidence for the proxy subject)" % args.mode,
+                  file=sys.stderr)
             return 3
-        if args.mode == "via-proxy":
-            args.target_addr = (args.proxy_host, args.proxy_port)
-        else:
-            args.target_addr = (args.backend_addr, args.backend_port)
+        args.target_addr = route_target_addr(
+            args.mode, args.proxy_host, args.proxy_port,
+            args.backend_addr, args.backend_port)
         try:
             args.ctx = _build_client_ctx(args.cafile)
         except Exception as exc:

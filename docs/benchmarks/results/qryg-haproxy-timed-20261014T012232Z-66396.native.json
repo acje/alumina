@@ -1,0 +1,22 @@
+{
+  "tool": "qryg_runner",
+  "candidate": "haproxy",
+  "kind": "timed",
+  "stamp": "qryg-haproxy-timed-20261014T012232Z-66396",
+  "client_mode": "direct-proxy",
+  "harness_image_id": "9191d288353391e4751525e83196e8127884d73daa395ced6fafc4a96d71564f",
+  "candidate_image_id": "d483b7896ae82de219b492b77ba57c5c5e6306562f74e063c25c6de37e15339b",
+  "candidate_manifest_digest": "sha256:3947a5423cb51b6cc2e165ec0c3b8575e622c46bf39a247d065eff15ab8fa9da",
+  "native_config": "haproxy.cfg",
+  "native_config_sha256": "35cf35dfd2b65c350b16d7c7fb4e03384e2e42e89c4df22b917987fadec5a94b",
+  "proxy_pid_in_namespace": 14,
+  "candidate_threads": 1,
+  "candidate_threads_reason": "",
+  "candidate_was_running_at_stop": true,
+  "candidate_wait_rc": 0,
+  "candidate_classification": "ok",
+  "driver_rc": 0,
+  "harness_job_rc": 0,
+  "session_exit": 0,
+  "seam_report": "/Users/anders.jensen/code/alumina-proxy/.ooda/benchmarks/qryg-native/qryg-haproxy-timed-20261014T012232Z-66396.json"
+}
