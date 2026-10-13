@@ -12,7 +12,7 @@
 //!
 //! Setup (10 s) and per-attempt connect (2 s) deadlines are anchored on the
 //! precise monotonic clock ([`Deadline`]) so a fractional-second initiation is
-//! never truncated toward an earlier whole second (alumina.md:169,189;
+//! never truncated toward an earlier whole second (docs/alumina-proxy.md:169,189;
 //! 1cws M2r). The DNS cache clock is whole seconds, derived from the same
 //! anchor only through the explicit [`WorkerClock::cache_secs`] conversion.
 //!
@@ -23,12 +23,12 @@
 //! owns the counts, so one owner can never release capacity on behalf of
 //! another (9pac H1; 1cws H1r).
 //!
-//! Family alternation (alumina.md:82) is driven by the *Connecting lifecycle*
+//! Family alternation (docs/alumina-proxy.md:82) is driven by the *Connecting lifecycle*
 //! previous-family transition input, never by a family bit stored in
 //! [`AttemptCounts`]: the tunnel still stores exactly its two per-family
 //! attempt counters (oracle alumina-ufrw; docs D5a). Each per-attempt connect
 //! deadline is freshly clipped to the absolute setup deadline at the attempt
-//! it initiates (alumina.md:189).
+//! it initiates (docs/alumina-proxy.md:189).
 
 use std::time::{Duration, Instant};
 
@@ -38,27 +38,27 @@ use crate::connect::{CONNECT_LIMIT, ConnectRequest};
 use crate::eligibility::NumericAddr;
 use crate::inventory::{BUFFER_BYTES, TUNNEL_SLOTS};
 
-/// Maximum concurrent tunnels, including pending setups (alumina.md:160).
+/// Maximum concurrent tunnels, including pending setups (docs/alumina-proxy.md:160).
 pub const MAX_TUNNELS: usize = TUNNEL_SLOTS;
 
-/// Maximum concurrent pending (in-setup) tunnels; never 160 (alumina.md:160).
+/// Maximum concurrent pending (in-setup) tunnels; never 160 (docs/alumina-proxy.md:160).
 pub const MAX_PENDING_SETUPS: usize = 32;
 
-/// Sequential upstream connection attempts per tunnel (alumina.md:82).
+/// Sequential upstream connection attempts per tunnel (docs/alumina-proxy.md:82).
 pub const MAX_UPSTREAM_ATTEMPTS: usize = 4;
 
-/// Absolute setup deadline after accept, never reset (alumina.md:169,189).
+/// Absolute setup deadline after accept, never reset (docs/alumina-proxy.md:169,189).
 pub const SETUP_DEADLINE_SECS: u64 = 10;
 
 /// Per-attempt upstream connect deadline, clipped to the setup deadline
-/// (alumina.md:169,82).
+/// (docs/alumina-proxy.md:169,82).
 pub const CONNECT_DEADLINE_SECS: u64 = 2;
 
-/// CONNECT request-head bound reused from the parser (alumina.md:163).
+/// CONNECT request-head bound reused from the parser (docs/alumina-proxy.md:163).
 pub const CONNECT_HEAD_LIMIT: usize = CONNECT_LIMIT;
 
 /// One directional traffic buffer handed to a tunnel from boot storage
-/// (alumina.md:183). Sized here so the worker owns the storage contract;
+/// (docs/alumina-proxy.md:183). Sized here so the worker owns the storage contract;
 /// instances live in the boot pool, never on this core's stack.
 pub type TrafficBuffer = [u8; BUFFER_BYTES];
 
@@ -101,7 +101,7 @@ impl WorkerClock {
     }
 }
 
-/// Per-family upstream connection attempt counts for one tunnel (alumina.md:82).
+/// Per-family upstream connection attempt counts for one tunnel (docs/alumina-proxy.md:82).
 ///
 /// The tunnel stores only these two counts, never addresses or cache
 /// references, so a cache replacement between attempts takes effect at the
@@ -150,7 +150,7 @@ impl AttemptCounts {
 /// A fixed, saturating deadline on the precise monotonic clock. Computed once
 /// from its `Instant` anchor; expiry is evaluated against `now` exactly, so
 /// delayed timer processing can never extend an authorization window
-/// (alumina.md:82,189) and a connect deadline initiated mid-second expires a
+/// (docs/alumina-proxy.md:82,189) and a connect deadline initiated mid-second expires a
 /// full 2.0 s later, never after 1.x s of whole-second truncation (1cws M2r).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadline {
@@ -159,7 +159,7 @@ pub struct Deadline {
 
 impl Deadline {
     /// The absolute setup deadline: 10 s after successful accept, never reset
-    /// (alumina.md:169,189). Saturates to the accept instant on clock
+    /// (docs/alumina-proxy.md:169,189). Saturates to the accept instant on clock
     /// overflow, leaving an unrepresentable deadline already expired.
     pub fn setup(accepted: Instant) -> Deadline {
         match accepted.checked_add(Duration::from_secs(SETUP_DEADLINE_SECS)) {
@@ -169,7 +169,7 @@ impl Deadline {
     }
 
     /// A fresh per-attempt upstream connect deadline: 2 s from `now`, clipped
-    /// to the setup deadline (alumina.md:169,189). Created at the initiation of
+    /// to the setup deadline (docs/alumina-proxy.md:169,189). Created at the initiation of
     /// the attempt it bounds, so an earlier attempt's expired deadline is never
     /// carried into this one and cannot be mistaken for the setup deadline
     /// (9pac M1).
@@ -215,13 +215,13 @@ pub enum ConnectPhase {
     Forbidden,
     /// Allowlisted but the name currently has no eligible non-retired binding
     /// at any outstanding per-family cursor: never resolved, or all remaining
-    /// addresses are retired (HTTP 502, "no resolved addresses"; alumina.md:43).
+    /// addresses are retired (HTTP 502, "no resolved addresses"; docs/alumina-proxy.md:43).
     NoBinding,
     /// The absolute setup deadline has passed before the forwarding gate
-    /// opened (HTTP 504; alumina.md:43,189).
+    /// opened (HTTP 504; docs/alumina-proxy.md:43,189).
     DeadlineExhausted,
     /// All allowed upstream attempts were consumed (HTTP 502, "upstream
-    /// connection failed"; alumina.md:43). Distinct from [`ConnectPhase::NoBinding`]
+    /// connection failed"; docs/alumina-proxy.md:43). Distinct from [`ConnectPhase::NoBinding`]
     /// so the two 502 reasons and bodies are never conflated (9pac M5).
     CandidatesExhausted,
     /// Proceed: dial this eligible destination for this family within the
@@ -235,7 +235,7 @@ pub enum ConnectPhase {
 }
 
 impl ConnectPhase {
-    /// The canonical fixed status for this phase (alumina.md:43,
+    /// The canonical fixed status for this phase (docs/alumina-proxy.md:43,
     /// architecture.md:65): 403 not-allowlisted, 502 for both
     /// no-binding and candidates-exhausted, 504 setup deadline, 200 for an
     /// authorized `Peer`. HTTP 503 is capacity-only and lives in
@@ -301,7 +301,7 @@ pub enum AdmissionError {
 
 /// The single-owner slot table for the fixed tunnel budget: at most
 /// [`MAX_TUNNELS`] occupied slots including at most [`MAX_PENDING_SETUPS`]
-/// pending setups; established work is never evicted (alumina.md:160,193).
+/// pending setups; established work is never evicted (docs/alumina-proxy.md:160,193).
 /// The worker owns the table (not a detachable counter object) and the single
 /// clock authority; busy/pending are derived from the slot states, so the
 /// accounting can never be copied out or underflow. It owns no sockets and no
@@ -362,7 +362,7 @@ impl Worker {
     ///
     /// Returns `SlotCapacity` at [`MAX_TUNNELS`] occupied slots and
     /// `PendingCapacity` at [`MAX_PENDING_SETUPS`] pending setups; both are
-    /// HTTP 503 + close (alumina.md:193).
+    /// HTTP 503 + close (docs/alumina-proxy.md:193).
     pub(crate) fn admit(&mut self, now: Instant) -> Result<SlotIndex, AdmissionError> {
         if self.occupied() >= MAX_TUNNELS {
             return Err(AdmissionError::SlotCapacity);
@@ -492,7 +492,7 @@ pub enum DecideError {
 /// view, never a free (config, cache, clock) triple, so an allowlist ordinal
 /// can never index a different name in a mismatched cache and a decision can
 /// never evaluate the cache on a foreign clock (1cws M4r + M2r;
-/// destination-binding, alumina.md:145). The only construction seam is
+/// destination-binding, docs/alumina-proxy.md:145). The only construction seam is
 /// crate-internal, so no public route can pair unrelated fields.
 #[derive(Clone, Copy)]
 pub struct WorkerView<'a> {
@@ -583,7 +583,7 @@ pub(crate) fn next_phase(
     }
 }
 
-/// Selects the next upstream peer from the current cache (alumina.md:82).
+/// Selects the next upstream peer from the current cache (docs/alumina-proxy.md:82).
 ///
 /// Reads the current A and AAAA entries afresh and ignores any that are empty,
 /// retired, exhausted at their current per-family attempt count, or whose

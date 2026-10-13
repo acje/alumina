@@ -232,7 +232,7 @@ impl Cache {
 
     /// Constructs a cache whose name count exactly matches the validated
     /// allowlist of `config`, so allowlist ordinals index the same names in
-    /// the cache (destination-binding, alumina.md:145). The single
+    /// the cache (destination-binding, docs/alumina-proxy.md:145). The single
     /// running-path constructor: a worker never pairs a config with an
     /// independently sized cache (9pac M4).
     ///

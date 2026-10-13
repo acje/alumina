@@ -16,12 +16,26 @@ TOOLCHAIN="1.99.0"
 
 INTENDED="Cargo.toml Cargo.lock rust-toolchain.toml deny.toml scripts/verify.sh scripts/cargo_config_probe.py scripts/fixture_metadata_probe.py README.md src/lib.rs src/main.rs src/alloc.rs src/fault.rs src/fuzz.rs src/config.rs src/resolver.rs src/preflight.rs src/inventory.rs src/boot.rs tests/foundations.rs tests/boot.rs"
 
+# docslink gate roots: the exact nonempty argv docslink_check consumes. Shared
+# with the identity snapshot so the boundary content identity covers precisely
+# the bytes docslink_check reads (drift-proof by construction).
+DOCSLINK_ROOTS="docs/alumina-proxy.md docs/architecture.md docs/build-plan.md docs/traceability.md docs/verification.md docs/qa-package/README.md README.md"
+
 # B1: every relevant before/after identity input consumed by the boundary run:
-# source/config/lock/toolchain/deny plus the approved docs and .gitignore that
+# source/config/lock/toolchain/deny plus the docs and .gitignore that
 # docslink_check and the working-tree view consume. Changing build outputs (the
 # compiled artifact) are intentionally excluded from this stability set and are
-# recorded separately at executed output.
-IDENTITY_FILES="$INTENDED .gitignore alumina.md docs/architecture.md docs/build-plan.md docs/traceability.md scripts/docs_check/check.mjs scripts/docs_check/package.json scripts/docs_check/package-lock.json scripts/docs_check/test.mjs"
+# recorded separately at executed output. README.md is already covered by
+# INTENDED; the remaining DOCSLINK_ROOTS are added here so a gate-root edit
+# cannot silently drop an identity input.
+GATE_ROOT_EXTRAS=""
+for root in $DOCSLINK_ROOTS; do
+    case " $INTENDED " in
+        *" $root "*) ;;
+        *) GATE_ROOT_EXTRAS="$GATE_ROOT_EXTRAS $root" ;;
+    esac
+done
+IDENTITY_FILES="$INTENDED .gitignore$GATE_ROOT_EXTRAS scripts/docs_check/check.mjs scripts/docs_check/package.json scripts/docs_check/package-lock.json scripts/docs_check/test.mjs"
 
 # Snapshot locations live under target/ (gitignored) so they never alter the
 # working-tree scope recorded in the status snapshot.
@@ -269,7 +283,7 @@ boot_fixtures() {
     variant_sha=$(sha256_digest file "$VARBIN") || exit 1
     release_sha_after=$(sha256_digest file "$ROOT/$BIN") || exit 1
     # In-run fresh-variant marker: record the exact variant this run built next
-    # to the artifact so qa-package/validate.sh can prove the exercised binary
+    # to the artifact so docs/qa-package/validate.sh can prove the exercised binary
     # has current-run provenance (never a stale by-existing pass). Written every
     # run, unconditionally, after the rebuild.
     printf '%s\n' "$variant_sha" > "$ROOT/target/fixture-facts/release/variant.sha256"
@@ -576,7 +590,7 @@ docslink_check() {
     }
     node_env_preflight
     drc=0
-    node scripts/docs_check/check.mjs alumina.md docs/architecture.md docs/build-plan.md docs/traceability.md || drc=$?
+    node scripts/docs_check/check.mjs $DOCSLINK_ROOTS || drc=$?
     case "$drc" in
         0) ;;
         1)
@@ -884,7 +898,7 @@ boundary_phase1() {
     identity_snapshot "$IDENTITY_AFTER"
     identity_compare "$IDENTITY_BEFORE" "$IDENTITY_AFTER"
     artifact_identity target/release/alumina || exit 1
-    echo "F3 mio operation matrix: IMPLEMENTED (tests/mio_matrix.rs: 8 tests incl. linux_epoll_operation_matrix with poll/register/reregister/deregister + alloc-witness controls; recorded native release evidence README.md#native-proofs-scoped-exact-input, z9m0/po3c); current-serving completeness witness still OPEN (cnrd T3) - not 'unbuilt matrix', not 'complete'"
+    echo "F3 mio operation matrix: IMPLEMENTED (tests/mio_matrix.rs: 8 tests incl. linux_epoll_operation_matrix with poll/register/reregister/deregister + alloc-witness controls; recorded native release evidence docs/verification.md#native-proofs-scoped-exact-input, z9m0/po3c); current-serving completeness witness still OPEN (cnrd T3) - not 'unbuilt matrix', not 'complete'"
     echo "NotImplemented: DNS wire parser fuzz (Slice 2)"
     echo "NotImplemented: CONNECT/ClientHello parser fuzz (Slices 3-4)"
     echo "NotImplemented: log-record encoding fuzz (Slice 6)"

@@ -50,7 +50,7 @@ pub enum ServingMode {
 }
 
 /// The terminal startup-readiness decision from the canonical rule
-/// (alumina.md:65): open the listener when the unresolved count is at most the
+/// (docs/alumina-proxy.md:65): open the listener when the unresolved count is at most the
 /// configured allowance, else exit with status 75; a first-observed SIGTERM
 /// short-circuits the window as [`Self::Terminated`], which never binds or
 /// attaches a listener.
@@ -148,7 +148,7 @@ impl ServeStorage {
     /// The single owned config/cache/clock view used for CONNECT decisions: a
     /// [`crate::worker::WorkerView`] bound to this storage's own config, cache,
     /// and clock authority, so no code can pair an unrelated config or clock
-    /// with this cache (1cws M4r/M2r; destination-binding, alumina.md:145).
+    /// with this cache (1cws M4r/M2r; destination-binding, docs/alumina-proxy.md:145).
     pub fn work_view(&self) -> WorkerView<'_> {
         WorkerView::new(&self.config, &self.cache, self.worker.clock())
     }
@@ -223,7 +223,7 @@ impl ServeStorage {
     }
 
     /// Whole-record log drops so far, saturating at `u64::MAX`: the
-    /// documented dropped-record metric (alumina.md:193).
+    /// documented dropped-record metric (docs/alumina-proxy.md:193).
     pub fn log_dropped(&self) -> u64 {
         self.logs.dropped()
     }
@@ -238,7 +238,7 @@ impl ServeStorage {
     /// Emits one stdout-only fatal record and performs one bounded drain, then
     /// lets the process exit: the only post-sink-switch channel for a
     /// process-fatal failure, so an attach/serve/listener failure never blocks
-    /// on a separate stalled stderr descriptor (alumina.md:149, B1). The
+    /// on a separate stalled stderr descriptor (docs/alumina-proxy.md:149, B1). The
     /// message is formatted directly into the fixed slot, so a fatal path
     /// performs no heap allocation beyond what the slot itself already owns.
     ///
@@ -318,7 +318,7 @@ impl ServeStorage {
     /// # Errors
     ///
     /// `SlotCapacity` or `PendingCapacity`, mapped to HTTP 503 + close
-    /// (alumina.md:193).
+    /// (docs/alumina-proxy.md:193).
     pub(crate) fn accept(&mut self, now: Instant) -> Result<SlotIndex, AdmissionError> {
         self.worker.admit(now)
     }
@@ -511,12 +511,12 @@ impl ServeStorage {
 
     /// Emits the startup log records through the boot-owned log store and
     /// drains it once. The single final result record carries every unresolved
-    /// name embedded inline (alumina.md:193); the final result is never fanned
+    /// name embedded inline (docs/alumina-proxy.md:193); the final result is never fanned
     /// out into per-name records (corrected T2). The first-failure warning is
     /// NOT replayed here: the window seam (startup_dns.rs resolve_window)
     /// enqueues exactly one warning at the first counted exchange failure
     /// inside the window, so emitting again at end-of-window would duplicate it
-    /// (no end-window replay, alumina.md:67).
+    /// (no end-window replay, docs/alumina-proxy.md:67).
     fn emit_startup_records(
         &mut self,
         secs: u64,
@@ -577,7 +577,7 @@ impl ServeStorage {
 }
 
 /// A name is usable when either family holds an eligible non-retired positive
-/// binding (canonical alumina.md:65); validated negatives and unattempted
+/// binding (canonical docs/alumina-proxy.md:65); validated negatives and unattempted
 /// names are unresolved.
 fn usable_name(cache: &Cache, name: NameIndex, now: u64) -> Result<bool, CacheError> {
     for family in Family::ALL {

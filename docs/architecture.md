@@ -4,7 +4,7 @@
 (foundation, boot, wired single-owner serving runtime; provisional parser
 layer). This document is **not** runtime proof — qualification is gated on the
 Linux acceptance gates in [build-plan.md](build-plan.md) and the proof matrix
-in [traceability.md](traceability.md). **Canonical source:** `alumina.md` is
+in [traceability.md](traceability.md). **Canonical source:** `docs/alumina-proxy.md` is
 the sole governing specification (no accepted ADRs). Where this document
 defines a boundary the spec leaves open, it is a **named design decision
 (D1…Dn)**, never a policy change or security relaxation.

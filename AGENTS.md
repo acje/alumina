@@ -6,13 +6,14 @@ specification, not feature growth.
 
 ## Rules
 
-- `alumina.md` (repository root) is the sole, byte-canonical governing
+- `docs/alumina-proxy.md` is the sole, byte-canonical governing
   specification (sha256 `322b68ee…5b836`). Never edit it; documents only
   restate or cite it.
 - Status is a scoped local testQA candidate — not production-qualified;
   serving-qualification gates stay open (`docs/build-plan.md` owns them).
 - Native verification entry point, QA run and prerequisite ownership are
-  `qa-package/README.md`; the verify command set is in README "Verification".
+  `docs/qa-package/README.md`; the verify command set is in
+  `docs/verification.md`.
   Doc-only changes: `sh scripts/verify.sh docs`.
 - `mid` selectors are Linux-only and fail closed off-Linux (reach them via
   `sh scripts/verify.sh boundary phase1` on macOS); `fixtures boot` and the

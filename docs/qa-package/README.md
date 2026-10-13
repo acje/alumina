@@ -3,16 +3,16 @@
 This is the **local, isolated** static native QA package for the `alumina`
 resolver at the current candidate: HEAD `bbda19f` with the approved
 serde-removal manifest/lock diff and the native verification consolidation
-diff applied (canonical `alumina.md` byte-unchanged). The exercised
+diff applied (canonical `docs/alumina-proxy.md` byte-unchanged). The exercised
 fixture-facts variant is built from the exact current source in-run by
 `validate.sh`. It bundles run/validation instructions, a non-secret example
 configuration, and an artifact/source identity record. It makes **no external
 deployment** and contains **no secrets**.
 
 The repository is a **scoped testQA-ready candidate**, not a
-production-qualified or externally-deployed system (four-claim ledger in
-[../README.md](../README.md); measured harness fitness in
-[../docs/harness-evaluation.md](../docs/harness-evaluation.md)).
+production-qualified or externally-deployed system (qualification gates in
+[../build-plan.md](../build-plan.md); measured harness fitness in
+[../harness-evaluation.md](../harness-evaluation.md)).
 
 ## Package contents
 
@@ -113,7 +113,7 @@ claim), and this repo never provisions VMs, connections or images.
   `python3` (config-candidate observation); `cargo-audit` + `cargo-deny`.
   **Never invokes the e2e selectors**; exit-zero coordination is not release
   qualification.
-- `docs` (`verify.sh docs`) — offline four-doc link gate: requires Node with
+- `docs` (`verify.sh docs`) — offline link gate (canonical + moved/new roots): requires Node with
   **`NODE_OPTIONS`/`NODE_PATH` unset** and `scripts/docs_check/check.mjs`
   present; runs no network.
 
@@ -140,7 +140,7 @@ loopback-only, so nothing in this package ever dials an external host.
 ## Validating the package
 
 ```sh
-sh qa-package/validate.sh
+sh docs/qa-package/validate.sh
 ```
 
 1. Mandatory prerequisites fail **before any gate effect** (`git rev-parse`,
@@ -163,5 +163,5 @@ sh qa-package/validate.sh
   `tests/mio_matrix.rs`; build-plan §0).
 - F4 parser-fuzzing campaigns not shipped.
 - Deployment confinement, external validation, production qualification out of
-  scope (four-claim ledger); `RELEASE-NOT-READY` stays the honest boundary
+  scope; `RELEASE-NOT-READY` stays the honest boundary
   diagnostic — never converted to a release clean.

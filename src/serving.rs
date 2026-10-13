@@ -64,7 +64,7 @@ const LISTENER: Token = Token(0);
 /// coalesced tunnel bytes up to the ClientHello inspection cap, reused as a
 /// recycling relay pending buffer. Allocated once before the postboot phase and
 /// reused across connections. The mandated directional profile is two 512 KiB
-/// buffers per tunnel (alumina.md:161-164,:183; RF-008): 128 slots x 1 MiB =
+/// buffers per tunnel (docs/alumina-proxy.md:161-164,:183; RF-008): 128 slots x 1 MiB =
 /// 128 MiB traffic storage, not total RSS.
 const HOLD_CAP: usize = crate::inventory::BUFFER_BYTES;
 
@@ -73,17 +73,17 @@ const HOLD_CAP: usize = crate::inventory::BUFFER_BYTES;
 const DOWN_CAP: usize = crate::inventory::BUFFER_BYTES;
 
 /// Idle deadline for an established tunnel once the gate has opened, reset on
-/// every successful tunnel-byte write (alumina.md:190,:147). Readiness alone
+/// every successful tunnel-byte write (docs/alumina-proxy.md:190,:147). Readiness alone
 /// never extends it.
 const IDLE_SECS: Duration = Duration::from_secs(300);
 
 /// The first orderly EOF starts a drain deadline that is never reset
-/// (alumina.md:191; RF-003); the slot closes at both-EOF-drained or here.
+/// (docs/alumina-proxy.md:191; RF-003); the slot closes at both-EOF-drained or here.
 const DRAIN_SECS: Duration = Duration::from_secs(5);
 
 /// The fixed shutdown grace from the first observed SIGTERM: establish-alone
 /// drains close their tunnels under this deadline, forced closure after is a
-/// failure (alumina.md:181,220; oracle b3nx B12/B16).
+/// failure (docs/alumina-proxy.md:181,220; oracle b3nx B12/B16).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 
 /// Bounded re-arm backoff after a transient accept failure (e.g. EMFILE).
@@ -136,7 +136,7 @@ pub enum Shutdown {
 
 /// The typed process exit decision once shutdown settles: a clean drain of
 /// every established tunnel exits 0; a deadline-forced closure of remaining
-/// sockets is a failure and exits `EX_SOFTWARE` (70) (alumina.md:220).
+/// sockets is a failure and exits `EX_SOFTWARE` (70) (docs/alumina-proxy.md:220).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ShutdownExit {
     Drained,

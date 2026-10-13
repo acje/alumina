@@ -6,7 +6,7 @@
 //! terminating newline framing) is dropped whole and counted. Enqueue and
 //! drain are allocation-free and nonblocking; a stalled stdout sink yields
 //! with its partial write cursor retained and never delays traffic, DNS, or
-//! deadlines (alumina.md:178-179,193-194).
+//! deadlines (docs/alumina-proxy.md:178-179,193-194).
 //!
 //! Grammar: `level=<warn|info|error> kind=<kind> <key>=<value>...\n`.
 //! Text values are double-quoted; `\` and `"` are backslash-escaped and every
@@ -31,7 +31,7 @@ use crate::startup_dns::NameOutcome;
 pub(crate) const QUEUE_SLOTS: usize = 256;
 pub(crate) const SLOT_BYTES: usize = 8 * 1024;
 /// Per-turn sink budget: at most this many write calls or this many bytes,
-/// whichever is exhausted first (alumina.md:178,194,146).
+/// whichever is exhausted first (docs/alumina-proxy.md:178,194,146).
 pub(crate) const SINK_MAX_OPS: usize = 16;
 pub(crate) const SINK_MAX_BYTES: usize = 64 * 1024;
 /// The bounded retry deadline after a WouldBlock: the sink cannot accept more
@@ -42,7 +42,7 @@ const LOG_RETRY: Duration = Duration::from_millis(100);
 
 const QUEUE_MASK: usize = QUEUE_SLOTS - 1;
 /// Threshold edges: attempt an error record when usage first exceeds 80%,
-/// and again when it falls below 70% (alumina.md:193).
+/// and again when it falls below 70% (docs/alumina-proxy.md:193).
 const HIGH_PCT_NUMBER: u64 = 80;
 const LOW_PCT_NUMBER: u64 = 70;
 
@@ -57,7 +57,7 @@ pub(crate) enum Level {
     Error,
 }
 
-/// The fixed reason vocabulary for a rejected connection (alumina.md:193).
+/// The fixed reason vocabulary for a rejected connection (docs/alumina-proxy.md:193).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectReason {
     Capacity,
@@ -82,7 +82,7 @@ impl RejectReason {
 }
 
 /// The fixed reason vocabulary for a tunnel closed for early upstream
-/// activity (alumina.md:193).
+/// activity (docs/alumina-proxy.md:193).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityKind {
     Data,
@@ -101,7 +101,7 @@ impl ActivityKind {
 }
 
 /// The fixed occupancy dimension a capacity threshold edge reports
-/// (alumina.md:193).
+/// (docs/alumina-proxy.md:193).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Dimension {
     Slots,
@@ -184,7 +184,7 @@ impl StartupStatus {
 /// The typed terminal outcome of a SIGTERM shutdown drain: a clean drain of
 /// every established tunnel (or an empty drain with no tunnels) exits 0; a
 /// deadline-forced closure of remaining sockets is a failure and exits
-/// `EX_SOFTWARE` (70) (alumina.md:220). Emitted as the single shutdown record
+/// `EX_SOFTWARE` (70) (docs/alumina-proxy.md:220). Emitted as the single shutdown record
 /// before the owner exits so a forced closure is never silently lost.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownStatus {
@@ -701,7 +701,7 @@ impl LogStore {
     }
 
     /// The startup first-failure warning: exactly one attempt across all
-    /// names and record types (alumina.md:67), enqueued at the time of the
+    /// names and record types (docs/alumina-proxy.md:67), enqueued at the time of the
     /// first counted exchange failure inside the startup window.
     pub(crate) fn startup_warning(&mut self, secs: u64, name: &str, family: Family) {
         self.set_now(secs);
@@ -761,7 +761,7 @@ impl LogStore {
     /// One error record for a process-fatal post-sink failure: emitted on the
     /// boot-owned stdout store before the owner exits, so an attach/serve/
     /// listener failure never writes to a stderr that could block a separate
-    /// blocked descriptor (alumina.md:149, B1). The message is formatted
+    /// blocked descriptor (docs/alumina-proxy.md:149, B1). The message is formatted
     /// directly into the fixed slot (no heap String) and escaped by the same
     /// deterministic grammar as a `Str` field; an oversize record is dropped
     /// whole and counted.
@@ -791,7 +791,7 @@ impl LogStore {
         self.note_queue_usage();
     }
 
-    /// One warn per rejected connection (alumina.md:193): `reason` selects the
+    /// One warn per rejected connection (docs/alumina-proxy.md:193): `reason` selects the
     /// fixed vocabulary; the hostname is included only when valid.
     pub(crate) fn reject(
         &mut self,
@@ -810,7 +810,7 @@ impl LogStore {
         self.enqueue(Level::Warn, Kind::Reject, &fields);
     }
 
-    /// One warn per tunnel closed for early upstream activity (alumina.md:193):
+    /// One warn per tunnel closed for early upstream activity (docs/alumina-proxy.md:193):
     /// the peer address and whether data, EOF, or reset was observed.
     pub(crate) fn early_activity(
         &mut self,
@@ -832,7 +832,7 @@ impl LogStore {
     /// The single typed shutdown record emitted before the owner exits on a
     /// SIGTERM: `status` names whether the drain finished clean or was
     /// deadline-forced, so a forced closure is never silently lost to the
-    /// immediate `process::exit` that follows (alumina.md:220). The caller
+    /// immediate `process::exit` that follows (docs/alumina-proxy.md:220). The caller
     /// drains once after this, and the drain is bounded/nonblocking so a
     /// stalled stdout can never delay the exit verdict.
     pub(crate) fn shutdown_final(&mut self, secs: u64, status: ShutdownStatus) {
@@ -845,7 +845,7 @@ impl LogStore {
     }
 
     /// Evaluates the 80%/70% capacity thresholds for tunnel slots and pending
-    /// setups (alumina.md:193). Call after any occupancy transition.
+    /// setups (docs/alumina-proxy.md:193). Call after any occupancy transition.
     pub(crate) fn note_capacity(&mut self, secs: u64, occupied: usize, pending: usize) {
         self.secs = secs;
         if let Some(edge) = note_usage(&mut self.slots_wm, occupied, crate::worker::MAX_TUNNELS) {

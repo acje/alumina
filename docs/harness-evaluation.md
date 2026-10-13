@@ -3,8 +3,8 @@
 Dated findings for the repository-native harness, measured at exact candidate
 `579b9ce` on 2026-10-12 and **kept at HEAD `8934adb` for reference only** —
 receipts are scoped to that exact input, not a fresh-run or a qualification
-upgrade. Repo status: scoped testQA candidate (README four-claim ledger;
-qa-package/README.md).
+upgrade. Repo status: scoped testQA candidate (docs/qa-package/README.md;
+AGENTS.md).
 
 ## Conditions (every measurement)
 
@@ -24,7 +24,7 @@ plus harness/docs/package deltas at that revision.
 | INNER `fmt --check` / `aclippy -D warnings` | formatting; clippy | 0.5 s / 0.7 s, exit 0 |
 | MID `verify.sh mid foundations` + `mid boot` | static ELF + whitespace + witness tests | 5.4 s combined (fresh registry; release hit target cache), exit 0 |
 | MID `verify.sh fixtures boot` | supervised typed-terminated positive + exit-78 negatives + kernel facts + xattr absence | 14.4 s first / 13.3 s four-step, exit 0 |
-| MID `verify.sh docs` | four-doc offline link gate (`check.mjs`) | exit 0 (`DOCSLINK-CHECK-OK`) |
+| MID `verify.sh docs` | offline link gate (`check.mjs`) | exit 0 (`DOCSLINK-CHECK-OK`) |
 | MID/BOUNDARY `deny check` + `audit` | advisories/bans/licenses + 28 locked deps | 6.3 s / 4.3 s, exit 0 (warm advisory DB) |
 | BOUNDARY `e2e relay` + `e2e shutdown` | byte-exact + effect + distinct-timeout; SIGTERM grace + drain | **reused** from `alumina-ucxi` receipts — not re-run; timing in those receipts |
 
@@ -55,4 +55,4 @@ plus harness/docs/package deltas at that revision.
 Timings are single-host, serial, warm-target/fresh-container, dated
 2026-10-12 — a point measurement, not an aggregate benchmark. Rows are
 gate-scoped at the exact candidate and never claim production qualification
-(README four-claim ledger).
+(docs/qa-package/README.md).

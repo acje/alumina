@@ -3,11 +3,12 @@
 **Status:** implementation + qualification owner — *what is built and proved,
 in what order*, and the gates that own qualification/release. A large subset is
 **implemented and correctness-tested**; the repository is a **scoped testQA-
-ready candidate** (README four-claim ledger), **not** production-qualified or
+ready candidate** (scoped status owner AGENTS.md;
+[qa-package/README.md](qa-package/README.md)), **not** production-qualified or
 externally deployed. Every gate not yet run remains open; this document does
 not claim completion. Architecture: [architecture.md](architecture.md).
 Traceability: [traceability.md](traceability.md). Canonical requirements:
-`alumina.md` (sole governing specification; no ADRs exist).
+`docs/alumina-proxy.md` (sole governing specification; no ADRs exist).
 
 ## 0. Sequencing status
 
@@ -52,7 +53,7 @@ process/kernel memory separately from the 128 MiB traffic budget.
 **F2 — Deterministic fault-injection seam.** Scripted I/O outcomes (partial
 reads/writes, `WouldBlock`, combined readiness, readiness-without-data,
 injected data/EOF/reset, controlled timer expiry) — not randomized; pins the
-dispatcher's gate transitions (`alumina.md:226-227`). Evidence exact-input
+dispatcher's gate transitions (`docs/alumina-proxy.md:226-227`). Evidence exact-input
 (script hash + build + machine).
 **F3 — mio operation matrix.** Pin enumerated operations (Poll, reg/re-reg/
 dereg, Events, error/close); source-review; allocator-instrument the
@@ -118,7 +119,7 @@ MID done-claim; MID. *Spec:* `:178-179,193-194,231`, `:160,177,193`,
 
 **Slice 7 — Release gates + deployment readiness**
 - **Security release gates (blocking):** deployment confinement
-  (`alumina.md:233`): approved calls succeed, unapproved rejected, direct
+  (`docs/alumina-proxy.md:233`): approved calls succeed, unapproved rejected, direct
   paths denied incl. IPv4/IPv6/alternate ports/UDP/QUIC/private/provider/
   alternate proxies, proxy-ignoring clients get no direct egress, workload
   cannot alter controls, unauthorized sources cannot reach the listener,
@@ -172,12 +173,12 @@ deadline continue.
 
 | Gate type | Blocking conditions | Spec citation |
 |---|---|---|
-| Security: dependency intake | un-pinned/un-reviewed dep; mio op outside F3; unread build.rs/proc-macro | `alumina.md:206,230` |
-| Security: forwarding gate | any early-activity path forwarding/logging upstream bytes; readiness mistaken for success | `alumina.md:201,226` |
-| Security: runtime surface | control/health/metrics/reconfig surface; config reload; SIGTERM extension | `alumina.md:149,192,235` |
-| Resource: allocation | any alloc **or dealloc** in a named post-boot phase | `alumina.md:206,230` |
-| Performance | 1–10 Gbps unmeasured/unreported per `:236`; payload double-counted | `alumina.md:236` |
-| Deployment | confinement not demonstrated; image contents deviate from the fixed set | `alumina.md:233-235` |
+| Security: dependency intake | un-pinned/un-reviewed dep; mio op outside F3; unread build.rs/proc-macro | `docs/alumina-proxy.md:206,230` |
+| Security: forwarding gate | any early-activity path forwarding/logging upstream bytes; readiness mistaken for success | `docs/alumina-proxy.md:201,226` |
+| Security: runtime surface | control/health/metrics/reconfig surface; config reload; SIGTERM extension | `docs/alumina-proxy.md:149,192,235` |
+| Resource: allocation | any alloc **or dealloc** in a named post-boot phase | `docs/alumina-proxy.md:206,230` |
+| Performance | 1–10 Gbps unmeasured/unreported per `:236`; payload double-counted | `docs/alumina-proxy.md:236` |
+| Deployment | confinement not demonstrated; image contents deviate from the fixed set | `docs/alumina-proxy.md:233-235` |
 
 ## 7. Explicit build non-goals and unresolved risks
 

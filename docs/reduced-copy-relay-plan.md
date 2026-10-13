@@ -2,7 +2,7 @@
 
 > **STATUS: PROPOSED DESIGN — NOT IMPLEMENTED.** This is a document-only plan.
 > It changes no runtime code, no dependency, and no line of the canonical
-> specification `alumina.md` (sha256 `322b68ee…5b836`, byte-unchanged at HEAD
+> specification `docs/alumina-proxy.md` (sha256 `322b68ee…5b836`, byte-unchanged at HEAD
 > `aa92329`). Every proposed edit listed here is a *seam-level proposal* cited
 > against the current checkout at `aa92329`; none has been applied, and no
 > implementation or benchmark execution is claimed. Diagrams labelled
@@ -28,7 +28,7 @@ accounting rule, and outcome unchanged.
 
 **Alignment with what already exists.** Bimodality and typed teardown are
 **already-realised, as-built** design, not something this plan creates. The
-Stage-gated relay pipeline at HEAD `aa92329` (canonical `alumina.md:34,50,147,
+Stage-gated relay pipeline at HEAD `aa92329` (canonical `docs/alumina-proxy.md:34,50,147,
 219,220`):
 
 - **Typed setup (validated metadata, original bytes preserved).** CONNECT is
@@ -45,7 +45,7 @@ Stage-gated relay pipeline at HEAD `aa92329` (canonical `alumina.md:34,50,147,
   `append_client_bytes` + `flush_client_upstream`, and for the reverse flow raw
   `down` copy + `flush_down` (`src/serving.rs:1335-1389,1710-1744,1791-1868`).
   No parser/inspector is invoked post-gate; the proxy never decrypts payload or
-  inspects TLS records (`alumina.md:50,219`).
+  inspects TLS records (`docs/alumina-proxy.md:50,219`).
 - **Typed transport teardown (no encrypted-TLS inspection).** `classify_read`
   maps `Ok(0)`→`Activity::Eof`, `ConnectionReset`→`Reset`, `WouldBlock`→`Wait`,
   `Interrupted`→`Retry`, other→`Failed` (`src/serving.rs:222-233`). First EOF
@@ -73,9 +73,9 @@ stack `scratch` and then copy into the retained buffer:
 - The parser-owned fixed-array copies that remain (see §5): direct-tail reads
   remove the scratch → retained copy **only**; the pipeline is not copy-free.
 - Fixed resource profile: 128 slots × 2 × 512 KiB retained buffers = 128 MiB
-  traffic storage (`src/inventory.rs:9-12`; `alumina.md:183`), ≤ 64 KiB or 16
-  I/O ops per read loop per direction (`src/serving.rs:96-100`; `alumina.md:146`),
-  zero post-boot heap alloc/dealloc incl. dependencies (`alumina.md:206`).
+  traffic storage (`src/inventory.rs:9-12`; `docs/alumina-proxy.md:183`), ≤ 64 KiB or 16
+  I/O ops per read loop per direction (`src/serving.rs:96-100`; `docs/alumina-proxy.md:146`),
+  zero post-boot heap alloc/dealloc incl. dependencies (`docs/alumina-proxy.md:206`).
 - Successful-write gate accounting (`committed = buf_base + fwd − head_len`,
   advance only on `Ok(n)`), coalesced tails, partial I/O, backpressure, fixed
   storage, single boot/serving owner: all preserved.
@@ -89,7 +89,7 @@ requirement; no force push or history rewrite.
 
 ## 2. Current state (as-built at HEAD aa92329)
 
-Single-owner, single-threaded event loop (`src/serving.rs`; `alumina.md:
+Single-owner, single-threaded event loop (`src/serving.rs`; `docs/alumina-proxy.md:
 140,146,147`), per-slot `SlotWorkspace` (`src/serving.rs:312-340`). Each tunnel
 slot owns two boot-retained 512 KiB buffers moved in by value from the boot
 store (`src/serving.rs:343-373,494-500`):
@@ -138,7 +138,7 @@ in one burst; `flush_client_upstream` then reports the cumulative projection
 ONCE per burst via `gate.upstream_write(committed)` (`:1746-1760`). D3 hence
 locates the gate opening in this **worker accounting transition — before any
 subsequent upstream read — not inside a single write syscall**
-(`docs/architecture.md:75-79`; `alumina.md:147`). `upstream_write` returns
+(`docs/architecture.md:75-79`; `docs/alumina-proxy.md:147`). `upstream_write` returns
 `GateOpened { crossing, relay_from_open }` where `relay_from_open =
 cumulative − hello_len` counts the **accepted** trailing bytes only
 (`src/gate.rs:228-235`). No second byte count exists.
@@ -196,7 +196,7 @@ downstream writes are stalled. Client FIN **arrival/readiness** merely makes the
 must flush first (`:1356-1360`), so an orderly EOF may not be **observed** until
 those bytes drain. On a real `Ok(0)`: `classify_read` maps it to
 `Activity::Eof` (`:222-233`) — a typed **TCP stream signal**, never a
-close-notify or encrypted-record inspection (`alumina.md:219`).
+close-notify or encrypted-record inspection (`docs/alumina-proxy.md:219`).
 
 - `observe_up_eof` sets up-side EOF and starts the once-only 5 s drain deadline
   if not already running (`src/serving.rs:1947-1958`).
@@ -209,7 +209,7 @@ close-notify or encrypted-record inspection (`alumina.md:219`).
   and the down buffer drains, the client write side is half-closed; both
   half-closed states make `maybe_close_drained` close the slot exactly once
   (`:2013-2046`). Expiry with pending bytes is failure, not normal completion
-  (`alumina.md:191,220`).
+  (`docs/alumina-proxy.md:191,220`).
 
 Distinguish TCP arrival/readiness from **observed** read EOF and from the
 deadline start; `SideEof` carries the explicit state, and cursor checks
@@ -235,7 +235,7 @@ Replace `src/serving.rs:1363-1376` + `:1405-1413`:
 2. Read directly into a bounded tail slice
    `&mut ws.buf[buf_len .. buf_len + CHUNK]` (length `CHUNK`, sound because the
    guard guarantees ≥ `CHUNK` free). The `CHUNK` clamp preserves the 64 KiB /
-   16-op-per-read-loop bound exactly (`:96-100`, `alumina.md:146`).
+   16-op-per-read-loop bound exactly (`:96-100`, `docs/alumina-proxy.md:146`).
 3. **Commit only the returned `n`** (a read count): `buf_len += n`.
    `WouldBlock` commits nothing.
 4. Feed the parser/inspector from already-retained bytes
@@ -366,23 +366,23 @@ DOWN  held [.. down_len)   written [.. down_off)
 
 | Element | Value / rule | Source |
 |---|---|---|
-| Retained per-slot store | 2 × 512 KiB (`buf`+`down`), 128 slots, 128 MiB | `inventory.rs:9-12`; `alumina.md:161-164,183` |
-| Boot ownership | single boot owner, buffers moved in by value, no post-boot heap alloc/dealloc | `serving.rs:343-373,494-500`; `alumina.md:150,206` |
-| Read-loop IO budget | ≤ 64 KiB or 16 ops per direction loop, direct tail read clamped to `CHUNK` | `serving.rs:96-100`; `alumina.md:146,213` (see §7.5 open gap) |
-| Setup caps | CONNECT 8 KiB; ClientHello ≤ 64 KiB, record payload 16 KiB; serving buffers are the coarser backstop | `connect.rs:8,131-152`; `client_hello.rs:6-9,238-249`; `alumina.md:163-164` |
-| Gate accounting | `committed = buf_base + fwd − head_len`; advance only on successful writes; **no second byte count** | `serving.rs:1756-1759`; `gate.rs:208-240`; `alumina.md:147,220` |
+| Retained per-slot store | 2 × 512 KiB (`buf`+`down`), 128 slots, 128 MiB | `inventory.rs:9-12`; `docs/alumina-proxy.md:161-164,183` |
+| Boot ownership | single boot owner, buffers moved in by value, no post-boot heap alloc/dealloc | `serving.rs:343-373,494-500`; `docs/alumina-proxy.md:150,206` |
+| Read-loop IO budget | ≤ 64 KiB or 16 ops per direction loop, direct tail read clamped to `CHUNK` | `serving.rs:96-100`; `docs/alumina-proxy.md:146,213` (see §7.5 open gap) |
+| Setup caps | CONNECT 8 KiB; ClientHello ≤ 64 KiB, record payload 16 KiB; serving buffers are the coarser backstop | `connect.rs:8,131-152`; `client_hello.rs:6-9,238-249`; `docs/alumina-proxy.md:163-164` |
+| Gate accounting | `committed = buf_base + fwd − head_len`; advance only on successful writes; **no second byte count** | `serving.rs:1756-1759`; `gate.rs:208-240`; `docs/alumina-proxy.md:147,220` |
 | Gate open | one `gate.upstream_write` per burst + immediate second drain on open; opens before subsequent upstream read; coalesced `X` retained, never duplicated | `gate.rs:213-240`; `serving.rs:1710-1785`; D3 |
-| Barriers | no client bytes before full validation; no upstream bytes before gate open; pre-open upstream activity terminates | `gate.rs:245-252`; `alumina.md:201` |
-| Down reset/backpressure | full-drain reset; full tail → no read, stall/re-arm; fixed 200/refusal bodies | `serving.rs:1826-1830,1842`; `alumina.md:185` |
-| Drain/closure | first EOF starts never-reset 5 s drain; directional half-close only when drained; both-EOF+drained closes exactly once | `serving.rs:1985-2046`; `alumina.md:190-191` |
-| Parser workspace copies | CONNECT 8 KiB + ClientHello 64 KiB input/flatten copies **remain** (not copy-free) | §5.1; `serving.rs:1415-1472`; `alumina.md:206` |
+| Barriers | no client bytes before full validation; no upstream bytes before gate open; pre-open upstream activity terminates | `gate.rs:245-252`; `docs/alumina-proxy.md:201` |
+| Down reset/backpressure | full-drain reset; full tail → no read, stall/re-arm; fixed 200/refusal bodies | `serving.rs:1826-1830,1842`; `docs/alumina-proxy.md:185` |
+| Drain/closure | first EOF starts never-reset 5 s drain; directional half-close only when drained; both-EOF+drained closes exactly once | `serving.rs:1985-2046`; `docs/alumina-proxy.md:190-191` |
+| Parser workspace copies | CONNECT 8 KiB + ClientHello 64 KiB input/flatten copies **remain** (not copy-free) | §5.1; `serving.rs:1415-1472`; `docs/alumina-proxy.md:206` |
 | Compaction | `compact()` relay-only (pre-gate `fwd == 0`), `buf_base` lockstep, cumulative invariant preserved | `serving.rs:379-388`; D5 |
 
 ## 7. Ranked seam assessment, workload model, measurement plan
 
 This section is assessment, not an implementation decision; the commander
 chooses among retaining current implementation and any future seam. None of this
-has been executed; no measured-benefit claim is made (`alumina.md:185,236`
+has been executed; no measured-benefit claim is made (`docs/alumina-proxy.md:185,236`
 throughput targets are unverified).
 
 ### 7.1 Ranked optimization seams (assessment)
@@ -437,11 +437,11 @@ runtime rerun here.
 | H4 — cold parser metadata warrants physical layout separation. | No cold-cache/stride contribution in the target profile, or measured field offsets/access footprint show adequate locality. |
 
 H1/H2 compete on CPU attribution, H3 on throughput attribution, H4 on layout;
-none is a measured performance verdict (`alumina.md:185,236` targets unverified).
+none is a measured performance verdict (`docs/alumina-proxy.md:185,236` targets unverified).
 
 ### 7.5 Open qualification gap (documented, no runtime fix)
 
-`alumina.md:146` bounds total per-connection I/O, but the source read loops carry
+`docs/alumina-proxy.md:146` bounds total per-connection I/O, but the source read loops carry
 `MAX_OPS` counters (`src/serving.rs:96-100,1328-1366,1833-1868`), while the
 write drains `drain_to_upstream` (`:1710-1744`) and `flush_down` (`:1791-1831`)
 have no local write-operation counters and dispatch can invoke several arms
@@ -475,7 +475,7 @@ future TDD cycle.
    injection API is **optional**, not mandated (§4.3). The pre-open activity
    path keeps its count-only `test_reads` semantics.
 2. **Implement now vs measure first.** The change is optimization-motivated with
-   no measured throughput gate; the stored-profile mandate (`alumina.md:183`)
+   no measured throughput gate; the stored-profile mandate (`docs/alumina-proxy.md:183`)
    binds storage, not CPU. The comparable before/after measurement (§7.3) should
    precede committing to the borrow-risk surface; if the measured CPU delta is
    negligible, the plan can be closed as not-worth-implementing with evidence
@@ -487,7 +487,7 @@ future TDD cycle.
   `docs/reduced-copy-relay-plan.md` and the ignored local visual
   `.ooda/show-me-reduced-copy-relay.html` (gitignored under `.ooda/`), which
   follow the on-disk show-me guidance and agree with this plan. No runtime/
-  canonical/dependency edits; canonical `alumina.md` sha256 `322b68ee…5b836` is
+  canonical/dependency edits; canonical `docs/alumina-proxy.md` sha256 `322b68ee…5b836` is
   byte-unchanged; HEAD `aa92329` clean-main identity.
 - **Review gate.** An independent generic (non-Rust) read-level review of the
   plan against actual source, oracle constraints, and the exact offline gates
@@ -505,7 +505,7 @@ future TDD cycle.
 
 ## 11. References
 
-- `alumina.md` (canonical, sha256 `322b68ee…5b836`): scheduling/I-O model
+- `docs/alumina-proxy.md` (canonical, sha256 `322b68ee…5b836`): scheduling/I-O model
   (`:146-147`), runtime prerequisites (`:150`), fixed limits (`:154,160-164`),
   traffic storage/reuse/backpressure (`:183,185`), lifecycle (`:190-191`),
   invariants (`:198,201,206,213,220`), verification (`:223`).

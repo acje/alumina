@@ -1,4 +1,4 @@
-//! Startup DNS-over-TCP transport (alumina.md:62-68, 82, 171, 180): a single
+//! Startup DNS-over-TCP transport (docs/alumina-proxy.md:62-68, 82, 171, 180): a single
 //! reusable connection with one outstanding query, transaction ids drawn from
 //! the OS CSPRNG, and publication of only fully validated outcomes into the
 //! cache and schedule.
@@ -15,7 +15,7 @@
 //! [`StartupDns::exchange_deadline`] and [`StartupDns::wait_dns_readiness`]
 //! export the deadline and a wakeup the owner folds into its one combined
 //! wait, so the shared reactor can observe traffic, log, and shutdown
-//! readiness without DNS-internal blocking (alumina.md:146).
+//! readiness without DNS-internal blocking (docs/alumina-proxy.md:146).
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -181,7 +181,7 @@ struct ActiveExchange {
 
 /// The stage of one outstanding exchange, advanced by at most one stage each
 /// cooperative turn by [`StartupDns::advance_exchange`]. Turns never wait for
-/// readiness (alumina.md:146); the owner decides when to advance again.
+/// readiness (docs/alumina-proxy.md:146); the owner decides when to advance again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExchangeStep {
     /// A nonblocking connect is in progress toward the exchange deadline; the
@@ -1599,7 +1599,7 @@ impl StartupDns {
     /// waits: it performs at most one nonblocking I/O attempt and at most one
     /// stage transition, re-checks the absolute exchange deadline, and
     /// otherwise returns [`TurnResult::Pending`] so the single owner keeps
-    /// control of all waiting (alumina.md:146).
+    /// control of all waiting (docs/alumina-proxy.md:146).
     ///
     /// # Errors
     ///

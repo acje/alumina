@@ -4,8 +4,8 @@
 section, invariant, resource row, and verification requirement to its design
 home ([architecture.md](architecture.md)), execution plan
 ([build-plan.md](build-plan.md)), and proof status. Canonical source:
-`alumina.md` (lines 1–236). The repository is a **scoped testQA-ready
-candidate** at HEAD `8934adb` (README four-claim ledger): an implemented and
+`docs/alumina-proxy.md` (lines 1–236). The repository is a **scoped testQA-ready
+candidate** at HEAD `8934adb` (scoped status owner AGENTS.md): an implemented and
 correctness-tested subset carries local runtime evidence, while external
 deployment validation and full production qualification remain open.
 
@@ -18,7 +18,7 @@ audit, docs — scoped to that exact candidate, never a production or deployment
 claim); **external** (deployment/operator obligation); **out-of-scope**
 (architecture §9 / build-plan §7).
 
-## 1. Section matrix (all `alumina.md` sections)
+## 1. Section matrix (all `docs/alumina-proxy.md` sections)
 
 | Spec ref | Section / requirement | Design home | Proof status |
 |---|---|---|---|
@@ -65,7 +65,7 @@ claim); **external** (deployment/operator obligation); **out-of-scope**
 | IV-4 Byte-Conservation | L220 | ordered prefix; coalesced preserved | designed → gate |
 | IV-5 Deadline | L221 | monotonic; earliest-enforced; no renewal after expiry | designed → gate |
 
-## 3. Resource-row matrix (all `alumina.md:158-182`, notes 183–185)
+## 3. Resource-row matrix (all `docs/alumina-proxy.md:158-182`, notes 183–185)
 
 | Resource | Limit | Design home | Status |
 |---|---|---|---|
@@ -97,7 +97,7 @@ Notes 183–185: 128 MiB decomposition; buffer reuse without discarding;
 outside-budget accounting (DNS storage, metadata, stacks, executable, kernel
 buffers); throughput conditional per-direction — encoded in arch §6 / Slice 7.
 
-## 4. Verification-requirement matrix (all `alumina.md:225-236`)
+## 4. Verification-requirement matrix (all `docs/alumina-proxy.md:225-236`)
 
 | Spec verify requirement | Where planned | Owner | Status |
 |---|---|---|---|
@@ -136,4 +136,4 @@ The planning documents are committed and maintained alongside the
 implementation; this matrix stays the single requirement→design→proof map, and
 every `verified-local` status is scoped to the exact candidate it ran against
 (exact-input identity receipts; never a blanket test-completion or production
-claim). Canonical `alumina.md` is unmodified.
+claim). Canonical `docs/alumina-proxy.md` is unmodified.

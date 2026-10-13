@@ -3,7 +3,7 @@
 //! capability sets, and `no_new_privs`; any unmet prerequisite fails as
 //! EX_CONFIG (78).
 //!
-//! Binding constraints (oracle `alumina-b1x` C10, T-privilege; `alumina.md:58,
+//! Binding constraints (oracle `alumina-b1x` C10, T-privilege; `docs/alumina-proxy.md:58,
 //! :150, :235`). A single zero UID among the four is rejected: a root saved or
 //! filesystem UID with a non-root effective UID is a privilege regain path and
 //! is never accepted. The kernel facts are read from `/proc/self/status` (a

@@ -1,5 +1,5 @@
 #!/bin/sh
-# qa-package/validate.sh — local static native QA package identity + smoke.
+# docs/qa-package/validate.sh — local static native QA package identity + smoke.
 # Records source/artifact identity and runs the repo-native local candidate
 # gate (Linux MID, fixtures boot positives + negatives, audit/deny, docs).
 # Hard-0 policy: mandatory prerequisites fail-BEFORE-EFFECT — a prerequisite
@@ -19,7 +19,7 @@
 set -u
 set -o pipefail
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$ROOT" || { echo "QA-PACKAGE-ERROR: cannot cd to repo root" >&2; exit 1; }
 
 fail=0

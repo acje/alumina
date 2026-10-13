@@ -1,5 +1,5 @@
 //! The pure two-barrier forwarding gate for one tunnel (architecture D1-D5b;
-//! alumina.md:32,201). This is the *authority* over byte flow across the two
+//! docs/alumina-proxy.md:32,201). This is the *authority* over byte flow across the two
 //! forwarding barriers; the byte buffers themselves live in the boot-owned
 //! per-slot workspace, so the gate is a small fixed-offset state machine with
 //! no sockets and no I/O, deterministic and unit-testable.
