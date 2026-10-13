@@ -37,6 +37,18 @@ assertions):
     POS-FIN-HALFCLOSE        client half-close observed, relay drains + echo
                              returns intact
     POS-LARGE-ECHO           4 MiB byte-exact echo (multi-chunk backpressure)
+    POS-RETAINED-EDGE-SILENT peer writes a >1 complete-visit burst, half-closes,
+                             then stays silent; echoed byte-exact across the
+                             budget splits (multi-budget blackbox smoke; the
+                             re-arm-resumption contract is proven by the Linux
+                             serving-seam unit tests, docs/alumina-proxy.md:146)
+    POS-NO-NEW-EDGE-RETAINED a 256 KiB multi-budget up-flow (head + hello +
+                             payload) sent in one burst before the 200 is read
+                             and echoed byte-exact across >=3 complete-visit
+                             budget splits through a post-setup write-side FIN
+                             (multi-budget byte-exact blackbox smoke; kernel
+                             receipt / no-new-edge isolation is not claimed
+                             from this socket)
     NEG-DISALLOWED-CONNECT   non-allowlisted CONNECT -> 403, no upstream dial
     NEG-SNI-MISMATCH         allowlisted CONNECT, wrong SNI -> hello reject,
                              zero bytes forwarded, TCP close (EOF/reset) not timeout
@@ -690,6 +702,42 @@ def case_relay_tls13():
             proc.wait()
 
 
+def recv_until_complete_eof(sock, rest, expected_len, name, timeout=20.0):
+    """Receive until orderly EOF, rejecting timeout, transport error and every
+    surplus byte; returns the complete stream on success, else records a
+    failure and returns None. Stopping at the exact expected length would pass
+    a stream that later duplicates bytes or never completes the tunnel, so EOF
+    delivery is part of the completion contract (normal drain / byte
+    conservation, docs/alumina-proxy.md:191,220).
+    """
+    got = rest
+    sock.settimeout(timeout)
+    while True:
+        try:
+            chunk = sock.recv(1 << 20)
+        except socket.timeout:
+            fail(name, "stream not completed to EOF within deadline (no reverse half-close)")
+            sock.close()
+            return None
+        except OSError as exc:
+            fail(name, f"transport error before stream completion: {exc.errno}")
+            sock.close()
+            return None
+        if not chunk:
+            break  # orderly EOF == full stream delivered and drained
+        got += chunk
+        if len(got) > expected_len:
+            fail(
+                name,
+                f"stream has extra bytes beyond expected {expected_len}B (got {len(got)}B), "
+                f"tail or duplication leaked: {got[expected_len:expected_len+32]!r}",
+            )
+            sock.close()
+            return None
+    sock.close()
+    return got
+
+
 def case_raw_echo(host, chunks_each, total_bytes, name, coalesce_hello=False):
     """Valid matching ClientHello through the proxy to the raw echo upstream.
 
@@ -738,31 +786,9 @@ def case_raw_echo(host, chunks_each, total_bytes, name, coalesce_hello=False):
     # proxy must drain the whole expected stream AND deliver the reverse
     # half-close (EOF); stopping at the exact expected length would pass a
     # stream that later duplicates bytes or never completes the tunnel.
-    got = rest
-    s.settimeout(20.0)
-    while True:
-        try:
-            chunk = s.recv(1 << 20)
-        except socket.timeout:
-            fail(name, "stream not completed to EOF within deadline (no reverse half-close)")
-            s.close()
-            return
-        except OSError as exc:
-            fail(name, f"transport error before stream completion: {exc.errno}")
-            s.close()
-            return
-        if not chunk:
-            break  # orderly EOF == full stream delivered and drained
-        got += chunk
-        if len(got) > len(expected):
-            fail(
-                name,
-                f"stream has extra bytes beyond expected {len(expected)}B (got {len(got)}B), "
-                f"tail or duplication leaked: {got[len(expected):len(expected)+32]!r}",
-            )
-            s.close()
-            return
-    s.close()
+    got = recv_until_complete_eof(s, rest, len(expected), name)
+    if got is None:
+        return
     if got != expected:
         # report WHERE the stream diverges to distinguish dropped-middle from
         # tail-only and dropped-tail
@@ -790,6 +816,72 @@ def case_fin_halfclose(host):
         512,
         "POS-FIN-HALFCLOSE",
     )
+
+
+def case_no_new_edge_retained(host):
+    """Blackbox smoke: a multi-budget up-flow echoed byte-exact after a
+    write-side FIN that arrives only AFTER valid setup. The CONNECT head,
+    validated hello and a 256 KiB offset-distinguishing payload (four 64 KiB
+    chunks, each under a distinct seed) are sent in ONE burst before the 200
+    is read and echoed byte-exact across multiple complete-visit budget
+    splits; once the write side is FIN'd (a stated peer transition, not
+    silence) the relay must conclude the drain byte-exact on the clean EOF.
+    Kernel-receipt or no-new-edge isolation is NOT claimed from this blackbox
+    - a lone client socket cannot honestly observe kernel receipt - and lives
+    in the Linux serving-seam unit tests
+    (preloaded_hold_drains_across_budget_splits_with_quiescent_sink_relying_on_rearm /
+     preloaded_hold_drains_across_budget_splits_byte_exact_with_consuming_sink, and the native Linux
+     read_direction_held_peer_drains_across_budget_splits_without_new_edges held-peer falsifier).
+    A pre-200 FIN is not used: a setup-stage FIN is the distinct clean-rejection
+    path, not the retained-relay property under smoke here.
+    """
+    hello = client_hello(host)
+    chunk = 64 * 1024
+    # Offset-distinguishing model: consecutive bytes are distinct and each
+    # 64 KiB complete-visit chunk carries its own seed, so a stranded budget
+    # split would be locatable by byte position, not length alone.
+    payload = b"".join(
+        bytes((j * 2654435761 + 100 + c) % 256 for j in range(chunk))
+        for c in range(4)
+    )
+    s = proxy_socket()
+    head = f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode()
+    # Full burst in one send BEFORE reading the 200: observed behavior is a
+    # multi-budget echo; kernel-receipt timing is not asserted from this side.
+    s.sendall(head + hello + payload)
+    resp, rest, complete = recv_http_response(s)
+    if not complete or http_status_code(resp) != 200:
+        fail(
+            "POS-NO-NEW-EDGE-RETAINED",
+            f"no completed exact-200 head for {host}: complete={complete} {resp!r}",
+        )
+        s.close()
+        return
+    # Write-side FIN only after valid setup: marks the end of the up-flow so
+    # the echo concludes on the clean EOF, never on a timeout race.
+    s.shutdown(socket.SHUT_WR)
+    expected = hello + payload
+    got = recv_until_complete_eof(s, rest, len(expected), "POS-NO-NEW-EDGE-RETAINED")
+    if got is None:
+        return
+    if got != expected:
+        diverges = next(
+            (i for i in range(min(len(got), len(expected))) if got[i] != expected[i]),
+            min(len(got), len(expected)),
+        )
+        fail(
+            "POS-NO-NEW-EDGE-RETAINED",
+            f"preloaded-drain stream not byte-exact: want {len(expected)}B got {len(got)}B, "
+            f"first divergence at {diverges}",
+        )
+        return
+    pass_(
+        "POS-NO-NEW-EDGE-RETAINED",
+        f"offset-distinguishing 256 KiB preloaded echo byte-exact to clean EOF "
+        f"through a post-setup write-side FIN; isolation contract owned by the "
+        f"serving-seam unit tests, not this blackbox",
+    )
+
 
 
 def read_close_after(sock, timeout):
@@ -999,6 +1091,25 @@ def main():
                 "POS-LARGE-ECHO",
                 coalesce_hello=True,
             )
+            # retained-edge smoke: 192 KiB (>3 complete-visit budgets) from a
+            # peer that half-closes then stays fully silent, echoed byte-exact.
+            # A single lost retained edge would strand the relay tail at ~64 KiB;
+            # this case exercises the reregister resumption path as blackbox
+            # smoke, while the isolation contract itself is proven by the Linux
+            # serving-seam unit tests (docs/alumina-proxy.md:146 MEDIUM-3).
+            case_raw_echo(
+                "echo.example.org",
+                {"head": None, "hello_chunks": [len(client_hello("echo.example.org"))]},
+                192 * 1024,
+                "POS-RETAINED-EDGE-SILENT",
+                coalesce_hello=True,
+            )
+            # multi-budget smoke: full 256 KiB sent in one burst BEFORE the 200
+            # is read; the post-setup write-side FIN is a stated transition and
+            # the echo must still land byte-exact to EOF across >=3 budget
+            # splits. Kernel-receipt / no-new-edge isolation lives in the Linux
+            # serving-seam unit tests, not this blackbox.
+            case_no_new_edge_retained("echo.example.org")
 
             # negatives with upstream-effect assertions
             c_conns = counting.conns

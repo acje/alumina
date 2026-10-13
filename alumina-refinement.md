@@ -20,6 +20,7 @@ explicit design revision and user decision when its trigger is met.
 
 | Surface | Fixed baseline | Decision trigger (evidence condition) |
 |---|---|---|
+| 16-I/O-op per-visit count basis (`docs/alumina-proxy.md:146`) | Per nonblocking syscall attempt, including WouldBlock/spurious readiness — `docs/alumina-proxy.md:146` establishes the I/O-operation/count basis; `:226` mandates WouldBlock/spurious-readiness forwarding-gate coverage (no count-basis text there); per-attempt granularity from oracle alumina-8d7z §4 (G1: unspecified at the spec level); realized as serving.rs `VisitState::note` op-per-attempt, pinned by host unit tests | A mandated count basis that excludes non-advancing attempts (e.g. bytes-advanced only) — an explicit design revision and user decision. |
 | TLS 1.3-only (`docs/alumina-proxy.md:47`) | Compatibility profile, not a security control; no measured client mismatch yet. | A measured trusted-client mismatch that demands compatibility. |
 | Zero allocation **and** deallocation post-boot (`docs/alumina-proxy.md:206`,`:150`) | Stricter than bounded memory; excludes routine heap-owned drop paths; retained heap storage is not deallocated on exit. | Observed impossibility of the current reading or a material cost it imposes. |
 | Cloud Run Direct VPC / raw-TCP ≤1 Gbps initial target (`docs/alumina-proxy.md:136`) | Platform network limit independent of CPU; no external guarantee established here. | Measured deployment bounds that change the practical ceiling (build-plan §7). |

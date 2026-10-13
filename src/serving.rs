@@ -91,12 +91,28 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 /// (xz3f N6; alumina-refinement.md factual note).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// The per-event read/write operation budget for one direction: bounded IO,
-/// with a pending-ready sink re-armed rather than relying on a new edge.
-const MAX_OPS: usize = 16;
+/// The canonical complete-visit I/O budget (docs/alumina-proxy.md:146): at
+/// most 64 KiB of I/O or 16 I/O operations per connection visit, whichever
+/// comes first, combined across both directions and every arm of one visit.
+/// A WouldBlock or spurious-readiness attempt counts as an I/O operation
+/// (:226; oracle alumina-8d7z §4), so a stalled arm still consumes budget.
+const VISIT_OPS: u16 = 16;
+const VISIT_BYTES: u32 = 64 * 1024;
 
-/// Read chunk size; the relation CHUNK * MAX_OPS = 64 KiB bounds one drain to
-/// the direction cap.
+/// Timers rejoin the turn after at most this many ready-slot visits or I/O
+/// operations within one poll dispatch (docs/alumina-proxy.md:146), so an
+/// over-long batch cannot delay an expired deadline past this bound.
+const TIMER_RECHECK_EVERY: usize = 256;
+
+/// The fixed event-buffer capacity factor: the poll batch is a bounded
+/// snapshot, and per-batch slot dedup (one complete visit per connection per
+/// batch) means the visit budget, not this cap, bounds a slot's turn. This
+/// seed predates complete-visit accounting; scheduling is owned by
+/// [`VISIT_OPS`]/[`VISIT_BYTES`].
+const EVENT_CAP: usize = 16;
+
+/// Read chunk size; the relation CHUNK * EVENT_CAP = 64 KiB still bounds one
+/// direction's read shape, and the complete-visit budget bounds the total.
 const CHUNK: usize = 4096;
 
 /// Client sockets occupy tokens `1..=MAX_TUNNELS`; each upstream socket uses a
@@ -232,6 +248,113 @@ fn classify_read(result: io::Result<usize>) -> ReadOutcome {
     }
 }
 
+/// The complete-visit I/O budget of one connection: how much read+write work
+/// that visit has performed, so every arm of the visit resolves into one
+/// shared counter against the canonical 16-op/64 KiB bound
+/// (docs/alumina-proxy.md:146; oracle alumina-8d7z A1). `Idle` between
+/// dispatches and for non-connection events, so deadline sweeps and direct
+/// test calls are never accidentally budgeted against a stale visit. One
+/// connection is one visit per poll batch: both of its readiness tokens merge
+/// into a single `Live` budget (HIGH-1 dedup), sealed and counted once when a
+/// different slot begins its visit or the batch ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VisitState {
+    Idle,
+    Live { slot: usize, ops: u16, bytes: u32 },
+}
+
+impl VisitState {
+    const fn idle() -> VisitState {
+        VisitState::Idle
+    }
+
+    const fn live(slot: usize) -> VisitState {
+        VisitState::Live {
+            slot,
+            ops: 0,
+            bytes: 0,
+        }
+    }
+
+    fn exhausted(self) -> bool {
+        match self {
+            VisitState::Live { ops, bytes, .. } => ops >= VISIT_OPS || bytes >= VISIT_BYTES,
+            VisitState::Idle => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn ops(self) -> u16 {
+        match self {
+            VisitState::Live { ops, .. } => ops,
+            VisitState::Idle => 0,
+        }
+    }
+
+    /// Records one attempted read/write syscall and the bytes it committed
+    /// (0 for WouldBlock/Interrupted/failure, whose attempts still count as
+    /// I/O operations). Saturates so the budget can never wrap; the byte
+    /// counter is carried as `u32` via a checked cast (io_room already keeps
+    /// a single syscall within 64 KiB, so this never clamps in practice).
+    fn note(self, attempted: usize) -> VisitState {
+        let bytes = u32::try_from(attempted).unwrap_or(u32::MAX);
+        match self {
+            VisitState::Live {
+                slot,
+                ops,
+                bytes: acc,
+            } => VisitState::Live {
+                slot,
+                ops: ops.saturating_add(1),
+                bytes: acc.saturating_add(bytes),
+            },
+            VisitState::Idle => VisitState::Idle,
+        }
+    }
+}
+
+/// Counter of ready-slot visits and I/O operations since the last timer
+/// recheck, so `expire_sweep` can rejoin the turn after at most
+/// [`TIMER_RECHECK_EVERY`] units of work (docs/alumina-proxy.md:146), even
+/// when dispatch stays hot. The recheck is decided *before* dispatching the
+/// visit that would cross the bound (one visit may add `1 + VISIT_OPS`
+/// units), so no threshold overshoot lands before the sweep.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct BatchProgress {
+    work_since_recheck: u16,
+}
+
+impl BatchProgress {
+    /// MEDIUM-2 pre-dispatch bound: the next visit would add at most
+    /// `1 + VISIT_OPS` units, so the recheck is due the moment those units
+    /// would carry cumulative work past [`TIMER_RECHECK_EVERY`]. Checked
+    /// *before* dispatching, so the sweep never lands after work has already
+    /// crossed 256.
+    fn due(&self) -> bool {
+        self.work_since_recheck as usize + 1 + VISIT_OPS as usize > TIMER_RECHECK_EVERY
+    }
+
+    /// Notes one ready-slot visit plus its I/O operations (saturating, so the
+    /// count can never wrap).
+    fn accrue(&mut self, ops: u16) {
+        self.work_since_recheck = self
+            .work_since_recheck
+            .saturating_add(1)
+            .saturating_add(ops);
+    }
+}
+
+/// The outcome of one nonblocking write attempt, kept distinct from the visit
+/// bookkeeping so the byte-cursor advance, the idle reset, and the op note are
+/// each applied exactly once per syscall.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteOutcome {
+    Wrote(usize),
+    Wait,
+    Failed,
+    None,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConnectState {
     Connected,
@@ -313,6 +436,10 @@ struct SlotWorkspace {
     handle: Option<SlotIndex>,
     tunnel: Option<TunnelIndex>,
     slot_gen: u64,
+    /// The batch generation in which this slot last began its single complete
+    /// visit (HIGH-1 per-batch dedup): a later token for the same slot in the
+    /// same batch merges or re-arms instead of opening a second visit.
+    batch_seen: u64,
     client: Option<TcpStream>,
     upstream: Option<TcpStream>,
     parser: ConnectParser,
@@ -345,6 +472,7 @@ impl SlotWorkspace {
             handle: None,
             tunnel: None,
             slot_gen: 0,
+            batch_seen: 0,
             client: None,
             upstream: None,
             parser: ConnectParser::new(),
@@ -448,6 +576,23 @@ pub struct Serving {
     events: Events,
     listener_pause_until: Option<Instant>,
     dns_event: bool,
+    visit: VisitState,
+    /// Poll-batch generation stamp for per-connection visit dedup: each
+    /// connection owns at most one complete visit per batch, and runs outside
+    /// `run_once` (direct test/driver dispatches) each open their own batch.
+    batch_gen: u64,
+    /// True while `run_once` dispatches one poll batch, so connection tokens
+    /// for the same slot merge into that batch's single visit instead of
+    /// opening fresh budgets.
+    in_batch: bool,
+    /// Work-since-recheck counter (MEDIUM-2): the timer/DNS recheck rejoins
+    /// the turn before the next visit would push the count past 256.
+    progress: BatchProgress,
+    /// Test-only high-water of `work_since_recheck` observed at a timer/DNS
+    /// recheck boundary, so owner-turn fixtures assert the canonical ≤256
+    /// bound actually fires between hot visits rather than being inferred.
+    #[cfg(test)]
+    pub(crate) max_work_since_recheck: u16,
     shutdown: Shutdown,
     signal_rx: Option<UnixStream>,
     _signal_registration: Option<signal_hook::SigId>,
@@ -505,9 +650,15 @@ impl Serving {
             storage,
             listener: None,
             slots,
-            events: Events::with_capacity(MAX_OPS * 4),
+            events: Events::with_capacity(EVENT_CAP * 4),
             listener_pause_until: None,
             dns_event: false,
+            visit: VisitState::idle(),
+            batch_gen: 0,
+            in_batch: false,
+            progress: BatchProgress::default(),
+            #[cfg(test)]
+            max_work_since_recheck: 0,
             shutdown: Shutdown::Serving,
             signal_rx: Some(signal_rx),
             _signal_registration: Some(_signal_registration),
@@ -715,12 +866,23 @@ impl Serving {
             self.on_sigterm()?;
         }
         self.expire_sweep(now);
+        self.batch_gen = self.batch_gen.wrapping_add(1);
+        self.in_batch = true;
         for event in batch.iter() {
             if event.token().0 & LOCAL_MASK == SIGNAL_LOCAL {
                 continue;
             }
+
+            if self.recheck_due() {
+                self.recheck_now();
+            }
             self.dispatch(event)?;
         }
+        if let VisitState::Live { ops, .. } = self.visit {
+            self.note_visit(ops);
+        }
+        self.visit = VisitState::idle();
+        self.in_batch = false;
         self.events = batch;
         Ok(())
     }
@@ -947,6 +1109,9 @@ impl Serving {
     }
 
     fn dispatch_readiness(&mut self, token: Token, ready: Readiness) -> Result<(), ServeError> {
+        if !self.in_batch {
+            self.batch_gen = self.batch_gen.wrapping_add(1);
+        }
         let raw = token.0;
         let local = raw & LOCAL_MASK;
         if raw == 0 {
@@ -986,6 +1151,24 @@ impl Serving {
             }
             self.close_slot(index);
             return Ok(());
+        }
+
+        let first = self.slots[index].batch_seen != self.batch_gen;
+        self.slots[index].batch_seen = self.batch_gen;
+        if first {
+            if let VisitState::Live { ops, .. } = self.visit {
+                self.note_visit(ops);
+            }
+            self.visit = VisitState::live(index);
+        } else {
+            let live_here = matches!(
+                self.visit,
+                VisitState::Live { slot, .. } if slot == index
+            );
+            if !live_here || self.visit.exhausted() {
+                self.reschedule(index);
+                return Ok(());
+            }
         }
         if upstream {
             if ready.readable || ready.read_closed || ready.write_closed {
@@ -1198,15 +1381,69 @@ impl Serving {
         }
     }
 
+    /// Test-only seam: installs an established open-gate relay in `index` over
+    /// real ready sockets, so runtime-level owner-turn composition fixtures
+    /// can drive actual relay work through [`crate::runtime::Runtime::turn`]
+    /// without reaching through this module's private slot fields. Mirrors the
+    /// `open_relay` test helper for callers outside the serving tests module.
+    #[cfg(all(test, feature = "alloc-witness"))]
+    pub(crate) fn test_setup_relay(
+        &mut self,
+        index: usize,
+        up: TcpStream,
+        client: TcpStream,
+    ) -> Result<(), ServeError> {
+        {
+            let ws = &mut self.slots[index];
+            ws.upstream = Some(up);
+            ws.client = Some(client);
+            ws.stage = Stage::Relay;
+            ws.head_len = 4;
+            ws.buf_base = 0;
+            ws.gate.on_connect_head(4);
+            ws.gate.on_authorized();
+            ws.gate.on_upstream_connected();
+            ws.gate.on_response_ok();
+            ws.gate.on_hello_validated(ValidatedHello::test_new(10));
+            ws.gate.upstream_write(6);
+        }
+        self.register_upstream(index)?;
+        self.register_client(index)
+    }
+
+    /// Test-only way for owner-turn fixtures to arm an expired idle deadline
+    /// on `index` without reaching through this module's private slot fields.
+    #[cfg(all(test, feature = "alloc-witness"))]
+    pub(crate) fn test_mark_idle_expired(&mut self, index: usize) {
+        self.slots[index].idle_deadline = Some(Instant::now() - Duration::from_millis(1));
+    }
+
+    /// Test-only visibility into whether a seeded slot was swept closed.
+    #[cfg(all(test, feature = "alloc-witness"))]
+    pub(crate) fn test_slot_closed(&self, index: usize) -> bool {
+        self.slots[index].client.is_none()
+    }
+
     fn accept_all(&mut self) -> Result<(), ServeError> {
         loop {
+            if self.recheck_due() {
+                self.reregister_listener()?;
+                return Ok(());
+            }
             let Some(listener) = &self.listener else {
                 return Ok(());
             };
             match listener.accept() {
-                Ok((stream, _addr)) => self.admit(stream)?,
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Ok((stream, _addr)) => {
+                    self.progress.accrue(1);
+                    self.admit(stream)?;
+                }
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.progress.accrue(1);
+                    return Ok(());
+                }
                 Err(_) => {
+                    self.progress.accrue(1);
                     self.listener_pause_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     return Ok(());
                 }
@@ -1324,13 +1561,90 @@ impl Serving {
         HOLD_CAP - ws.buf_len
     }
 
+    /// Whether `index`'s visit is live and has consumed its complete budget.
+    fn visit_exhausted(&self, index: usize) -> bool {
+        matches!(
+            self.visit,
+            VisitState::Live { slot, .. } if slot == index && self.visit.exhausted()
+        )
+    }
+
+    /// Records one attempted read/write syscall on `index` into its visit, if
+    /// that visit is live. Deadline sweeps and non-connection dispatches (no
+    /// live visit) are unbudgeted.
+    fn note_op(&mut self, index: usize, bytes: usize) {
+        if matches!(
+            self.visit,
+            VisitState::Live { slot, .. } if slot == index
+        ) {
+            self.visit = self.visit.note(bytes);
+        }
+    }
+
+    /// The byte room left in `index`'s live visit; `default` when the visit is
+    /// not live, so a single read/write slice can never push a live visit past
+    /// the canonical 64 KiB bound.
+    fn io_room(&self, index: usize, default: usize) -> usize {
+        if let VisitState::Live { slot, bytes, .. } = self.visit
+            && slot == index
+        {
+            (VISIT_BYTES as usize)
+                .saturating_sub(bytes as usize)
+                .min(default)
+        } else {
+            default
+        }
+    }
+
+    /// MEDIUM-2 pre-dispatch bound: the timer/DNS recheck must rejoin the turn
+    /// before the next visit would push cumulative work past the canonical
+    /// [`TIMER_RECHECK_EVERY`] units, where one visit adds at most
+    /// `1 + VISIT_OPS` units. Checked *before* dispatching, so the sweep never
+    /// lands after work has already crossed 256.
+    fn recheck_due(&self) -> bool {
+        self.progress.due()
+    }
+
+    /// Runs the deadline sweep and resets the work-since-recheck counter.
+    fn recheck_now(&mut self) {
+        #[cfg(test)]
+        {
+            self.max_work_since_recheck = self
+                .max_work_since_recheck
+                .max(self.progress.work_since_recheck);
+        }
+        self.expire_sweep(Instant::now());
+        self.progress.work_since_recheck = 0;
+    }
+
+    /// Counts one ready-slot visit plus its I/O operations into the running
+    /// work-since-recheck total (MEDIUM-2). Called on the seal of a visit —
+    /// when a different slot opens its own, or at end of batch — so each slot
+    /// counts exactly once per poll batch.
+    fn note_visit(&mut self, ops: u16) {
+        self.progress.accrue(ops);
+    }
+
+    /// Re-arms poll interest on a budget-exhausted or re-queued slot so its
+    /// unfinished work reschedules without waiting for a fresh readiness edge
+    /// (docs/alumina-proxy.md:146). A re-registration failure leaves the slot
+    /// without interest and is unclosable-only-once: the client re-arm runs
+    /// first and, on error, closes and returns; only then is the upstream arm
+    /// attempted, so a first-arm failure never double-closes via the second.
+    fn reschedule(&mut self, index: usize) {
+        if self.reregister_client(index).is_err() {
+            self.close_slot(index);
+            return;
+        }
+        if self.reregister_upstream(index).is_err() {
+            self.close_slot(index);
+        }
+    }
+
     fn client_readable(&mut self, index: usize) -> Result<(), ServeError> {
-        let mut ops = 0;
         loop {
-            if ops >= MAX_OPS {
-                if self.reregister_client(index).is_err() {
-                    self.close_slot(index);
-                }
+            if self.visit_exhausted(index) {
+                self.reschedule(index);
                 return Ok(());
             }
             let stage = self.slots[index].stage;
@@ -1358,13 +1672,18 @@ impl Serving {
                 if self.slots[index].fwd < self.slots[index].buf_len {
                     return Ok(());
                 }
+                if self.visit_exhausted(index) {
+                    self.reschedule(index);
+                    return Ok(());
+                }
             }
-            ops += 1;
             let mut scratch = [0u8; CHUNK];
+            let room = self.io_room(index, CHUNK);
             let n = match self.slots[index].client.as_mut() {
                 None => return Ok(()),
-                Some(client) => match client.read(&mut scratch) {
+                Some(client) => match client.read(&mut scratch[..room]) {
                     Ok(0) => {
+                        self.note_op(index, 0);
                         if self.slots[index].stage == Stage::Relay {
                             return self.observe_up_eof(index);
                         }
@@ -1372,13 +1691,18 @@ impl Serving {
                         return Ok(());
                     }
                     Ok(n) => n,
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        self.note_op(index, 0);
+                        return Ok(());
+                    }
                     Err(_) => {
+                        self.note_op(index, 0);
                         self.close_slot(index);
                         return Ok(());
                     }
                 },
             };
+            self.note_op(index, n);
             match self.slots[index].stage {
                 Stage::ReadingConnect => self.buffer_and_parse(index, &scratch[..n])?,
                 Stage::ValidatingHello => self.buffer_and_validate(index, &scratch[..n])?,
@@ -1387,6 +1711,10 @@ impl Serving {
                     self.flush_client_upstream(index)?;
                 }
                 _ => return Ok(()),
+            }
+            if self.visit_exhausted(index) {
+                self.reschedule(index);
+                return Ok(());
             }
             if !matches!(
                 self.slots[index].stage,
@@ -1589,10 +1917,14 @@ impl Serving {
     }
 
     fn observe_upstream_read(&mut self, index: usize) -> Result<(), ServeError> {
-        let mut ops = 0;
         let mut scratch = [0u8; CHUNK];
         loop {
+            if self.visit_exhausted(index) {
+                self.reschedule(index);
+                return Ok(());
+            }
             let outcome = classify_read(self.read_upstream(index, &mut scratch));
+            self.note_op(index, 0);
             match outcome {
                 ReadOutcome::Activity(activity) => {
                     let ws = &mut self.slots[index];
@@ -1621,15 +1953,7 @@ impl Serving {
                     return Ok(());
                 }
                 ReadOutcome::Wait => return Ok(()),
-                ReadOutcome::Retry => {
-                    ops += 1;
-                    if ops >= MAX_OPS {
-                        if self.reregister_upstream(index).is_err() {
-                            self.close_slot(index);
-                        }
-                        return Ok(());
-                    }
-                }
+                ReadOutcome::Retry => {}
             }
         }
     }
@@ -1711,33 +2035,49 @@ impl Serving {
         let mut wrote = false;
         let mut failed = false;
         loop {
-            let stalled = {
+            if self.visit_exhausted(index) {
+                break;
+            }
+            let room = self.io_room(index, usize::MAX);
+            let outcome = {
                 let ws = &mut self.slots[index];
                 if ws.fwd >= ws.buf_len {
-                    true
+                    WriteOutcome::None
                 } else {
+                    let end = ws.buf_len.min(ws.fwd.saturating_add(room));
                     match ws.upstream.as_mut() {
-                        Some(up) => match up.write(&ws.buf[ws.fwd..ws.buf_len]) {
+                        Some(up) => match up.write(&ws.buf[ws.fwd..end]) {
                             Ok(n) => {
                                 ws.fwd += n;
-                                wrote = true;
                                 if ws.gate.is_open() {
                                     ws.idle_deadline = Some(Instant::now() + IDLE_SECS);
                                 }
-                                false
+                                WriteOutcome::Wrote(n)
                             }
-                            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => true,
-                            Err(_) => {
-                                failed = true;
-                                true
+                            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                WriteOutcome::Wait
                             }
+                            Err(_) => WriteOutcome::Failed,
                         },
-                        None => true,
+                        None => WriteOutcome::None,
                     }
                 }
             };
-            if stalled {
-                break;
+            match outcome {
+                WriteOutcome::Wrote(n) => {
+                    wrote = true;
+                    self.note_op(index, n);
+                }
+                WriteOutcome::Wait => {
+                    self.note_op(index, 0);
+                    break;
+                }
+                WriteOutcome::Failed => {
+                    failed = true;
+                    self.note_op(index, 0);
+                    break;
+                }
+                WriteOutcome::None => break,
             }
         }
         (wrote, failed)
@@ -1751,6 +2091,9 @@ impl Serving {
         }
         let was_open = self.slots[index].gate.is_open();
         if !wrote_any || was_open {
+            if self.visit_exhausted(index) {
+                self.reschedule(index);
+            }
             return Ok(());
         }
         let committed = {
@@ -1785,35 +2128,46 @@ impl Serving {
                 self.slots[index].gate.upstream_write(committed2);
             }
         }
+        if self.visit_exhausted(index) {
+            self.reschedule(index);
+        }
         Ok(())
     }
 
     fn flush_down(&mut self, index: usize) {
         let mut failed = false;
         loop {
-            let (stalled, err) = {
+            if self.visit_exhausted(index) {
+                break;
+            }
+            let (stalled, err, note) = {
+                let room = self.io_room(index, usize::MAX);
                 let ws = &mut self.slots[index];
                 if ws.down_off >= ws.down_len {
-                    (true, false)
+                    (true, false, None)
                 } else {
+                    let end = ws.down_len.min(ws.down_off.saturating_add(room));
                     match ws.client.as_mut() {
-                        Some(client) => match client.write(&ws.down[ws.down_off..ws.down_len]) {
+                        Some(client) => match client.write(&ws.down[ws.down_off..end]) {
                             Ok(n) => {
                                 ws.down_off += n;
                                 if ws.gate.is_open() {
                                     ws.idle_deadline = Some(Instant::now() + IDLE_SECS);
                                 }
-                                (false, false)
+                                (false, false, Some(n))
                             }
                             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                                (true, false)
+                                (true, false, Some(0))
                             }
-                            Err(_) => (true, true),
+                            Err(_) => (true, true, Some(0)),
                         },
-                        None => (true, false),
+                        None => (true, false, None),
                     }
                 }
             };
+            if let Some(bytes) = note {
+                self.note_op(index, bytes);
+            }
             failed = failed || err;
             if stalled {
                 break;
@@ -1821,6 +2175,10 @@ impl Serving {
         }
         if failed {
             self.close_slot(index);
+            return;
+        }
+        if self.visit_exhausted(index) {
+            self.reschedule(index);
             return;
         }
         let ws = &mut self.slots[index];
@@ -1831,39 +2189,46 @@ impl Serving {
     }
 
     fn relay_upstream_to_client(&mut self, index: usize) -> Result<(), ServeError> {
-        let mut ops = 0;
         loop {
-            if ops >= MAX_OPS {
-                if self.reregister_upstream(index).is_err() {
-                    self.close_slot(index);
-                }
+            if self.visit_exhausted(index) {
+                self.reschedule(index);
                 return Ok(());
             }
             if self.slots[index].down_len + CHUNK > DOWN_CAP {
                 return Ok(());
             }
-            ops += 1;
             let mut scratch = [0u8; CHUNK];
+            let room = self.io_room(index, CHUNK);
             let n = match self.slots[index].upstream.as_mut() {
                 None => return Ok(()),
-                Some(up) => match up.read(&mut scratch) {
+                Some(up) => match up.read(&mut scratch[..room]) {
                     Ok(0) => {
+                        self.note_op(index, 0);
                         return self.observe_down_eof(index);
                     }
                     Ok(n) => n,
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        self.note_op(index, 0);
+                        return Ok(());
+                    }
                     Err(_) => {
+                        self.note_op(index, 0);
                         self.close_slot(index);
                         return Ok(());
                     }
                 },
             };
+            self.note_op(index, n);
             {
                 let ws = &mut self.slots[index];
                 ws.down[ws.down_len..ws.down_len + n].copy_from_slice(&scratch[..n]);
                 ws.down_len += n;
             }
             self.flush_down(index);
+            if self.visit_exhausted(index) {
+                self.reschedule(index);
+                return Ok(());
+            }
             if self.slots[index].down_len > 0 {
                 return Ok(());
             }
@@ -2172,6 +2537,16 @@ fn write_all_bounded(stream: &mut TcpStream, body: &[u8]) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_offset_pattern(len: usize, seed: u32) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            let salt = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed);
+            salt as u8
+        })
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{TcpListener as StdListener, TcpStream};
@@ -2288,7 +2663,9 @@ mod tests {
 
     fn pump(serving: &mut Serving, times: usize) {
         for _ in 0..times {
-            let _ = serving.run_once(Some(Duration::from_millis(2)));
+            serving
+                .run_once(Some(Duration::from_millis(2)))
+                .expect("pump poll");
         }
     }
 
@@ -2939,7 +3316,7 @@ mod tests {
             serving.register_upstream(index).expect("register upstream");
 
             let mut reads = vec![Ok(1)];
-            reads.extend((0..MAX_OPS).map(|_| Err(io::Error::from(io::ErrorKind::Interrupted))));
+            reads.extend((0..EVENT_CAP).map(|_| Err(io::Error::from(io::ErrorKind::Interrupted))));
             serving.slots[index].test_reads = reads;
 
             let token = upstream_token(serving.slots[index].slot_gen, index);
@@ -3226,6 +3603,118 @@ mod tests {
     }
 
     #[test]
+    fn forced_compaction_preserves_absolute_cursor_and_retained_suffix() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+            sink_stream.set_nonblocking(true).expect("sink nonblocking");
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.head_len = 4;
+                ws.hello_end = Some(10);
+                ws.buf_base = 0;
+                ws.fwd = 4;
+                ws.stage = Stage::Relay;
+                ws.gate.on_connect_head(4);
+                ws.gate.on_authorized();
+                ws.gate.on_upstream_connected();
+                ws.gate.on_response_ok();
+                ws.gate.on_hello_validated(ValidatedHello::test_new(10));
+                ws.buf[..4].copy_from_slice(b"HEAD");
+                ws.buf[4..10].copy_from_slice(b"HELLO!");
+                let payload_start = 10usize;
+                let payload = b"0123456789abcdef";
+                let mut filled = payload_start;
+                while filled + payload.len() <= HOLD_CAP - 3 {
+                    ws.buf[filled..filled + payload.len()].copy_from_slice(payload);
+                    filled += payload.len();
+                }
+                ws.buf_len = HOLD_CAP - 3;
+                assert!(
+                    filled <= ws.buf_len,
+                    "padded payload must fit within the pre-fill workspace"
+                );
+                ws.buf[filled..ws.buf_len]
+                    .copy_from_slice(&test_offset_pattern(ws.buf_len - filled, 8));
+            }
+            serving.register_upstream(index).expect("register up");
+
+            let committed_before = {
+                let ws = &mut serving.slots[index];
+                ws.buf_base + ws.fwd - ws.head_len
+            };
+            let hello_end_before = {
+                let ws = &mut serving.slots[index];
+                ws.hello_end
+            };
+            let suffix_before: Vec<u8> = {
+                let ws = &mut serving.slots[index];
+                ws.buf[ws.fwd..ws.buf_len].to_vec()
+            };
+
+            serving.append_client_bytes(index, b"FRESH");
+
+            let ws = &mut serving.slots[index];
+            assert_eq!(
+                ws.buf_base + ws.fwd - ws.head_len,
+                committed_before,
+                "compaction must preserve the absolute committed cursor (base + fwd - head_len)"
+            );
+            assert_eq!(
+                ws.hello_end, hello_end_before,
+                "the absolute hello end must not shift when the base moves"
+            );
+            assert_eq!(
+                &ws.buf[0..suffix_before.len()][..],
+                &suffix_before[..],
+                "the retained suffix must be preserved byte-for-byte across compaction"
+            );
+
+            serving
+                .flush_client_upstream(index)
+                .expect("flush compacted buffer");
+            let expected_len = suffix_before.len() + 5;
+            let mut got = Vec::new();
+            let mut tmp = [0u8; 65536];
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while got.len() < expected_len {
+                assert!(
+                    Instant::now() < deadline,
+                    "compacted stream never fully drained: got {} / {}",
+                    got.len(),
+                    expected_len
+                );
+                match sink_stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&tmp[..n]),
+                    Err(_) => {}
+                }
+                serving
+                    .run_once(Some(Duration::from_millis(1)))
+                    .expect("compaction-drain poll");
+                match sink_stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&tmp[..n]),
+                    Err(_) => {}
+                }
+            }
+            let mut expected = Vec::with_capacity(expected_len);
+            expected.extend_from_slice(&suffix_before);
+            expected.extend_from_slice(b"FRESH");
+            assert_eq!(
+                got, expected,
+                "post-compaction delivery must match the pre-compaction suffix plus fresh bytes"
+            );
+        });
+    }
+
+    #[test]
     fn relay_client_fin_drains_pending_bytes_then_half_closes_and_releases() {
         let port = ephemeral_port();
         with_serving_stack(port, move |serving| {
@@ -3394,6 +3883,1668 @@ mod tests {
                 got,
                 b"!AZ".to_vec(),
                 "an upstream sink drain must resume the paused client read without a new edge"
+            );
+        });
+    }
+
+    #[test]
+    fn visit_budget_exhausts_on_ops_or_bytes_whichever_first() {
+        let mut v = VisitState::live(0);
+        assert!(!v.exhausted());
+        for _ in 0..15 {
+            v = v.note(1);
+        }
+        assert!(!v.exhausted(), "15 ops at 1 byte stay within the budget");
+        v = v.note(1);
+        assert!(
+            v.exhausted(),
+            "the 16th op exhausts the visit before the byte cap"
+        );
+        assert_eq!(
+            v,
+            VisitState::Live {
+                slot: 0,
+                ops: 16,
+                bytes: 16,
+            }
+        );
+
+        let mut v = VisitState::live(0);
+        v = v.note(32 * 1024);
+        assert!(!v.exhausted());
+        v = v.note(32 * 1024);
+        assert!(v.exhausted(), "64 KiB combined exhausts before 16 ops");
+        assert_eq!(
+            v,
+            VisitState::Live {
+                slot: 0,
+                ops: 2,
+                bytes: 64 * 1024,
+            }
+        );
+
+        let mut v = VisitState::live(0);
+        for _ in 0..15 {
+            v = v.note(0);
+        }
+        assert!(!v.exhausted());
+        v = v.note(0);
+        assert!(
+            v.exhausted(),
+            "a WouldBlock/spurious attempt counts as an I/O operation (:146,:226)"
+        );
+
+        let idle = VisitState::idle();
+        assert!(!idle.exhausted(), "an idle (non-visit) budget never trips");
+        assert_eq!(idle.ops(), 0, "an idle visit owns no ops");
+    }
+
+    #[test]
+    fn batch_progress_rechecks_timers_before_the_visit_that_would_cross() {
+        let mut p = BatchProgress::default();
+        for _ in 0..15 {
+            assert!(
+                !p.due(),
+                "the visit about to run stays inside 256, no recheck before dispatch"
+            );
+            p.accrue(16);
+        }
+        assert_eq!(p.work_since_recheck, 255);
+        assert!(
+            p.due(),
+            "255 units + the next visit's 17 units = 272 > 256, the recheck must precede it"
+        );
+        p.work_since_recheck = 0;
+        assert!(!p.due());
+        p.accrue(16);
+        assert_eq!(
+            p.work_since_recheck, 17,
+            "the boundary visit runs fully within the swept budget"
+        );
+
+        let p = BatchProgress {
+            work_since_recheck: 239,
+        };
+        assert!(
+            !p.due(),
+            "239 + 17 = 256 lands exactly on the bound, so no early recheck"
+        );
+        let p = BatchProgress {
+            work_since_recheck: 240,
+        };
+        assert!(
+            p.due(),
+            "240 + 17 crosses the bound, the recheck fires before the visit"
+        );
+    }
+
+    #[test]
+    fn one_batch_two_tokens_one_slot_share_a_single_complete_visit() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            let got = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let got_reader = std::sync::Arc::clone(&got);
+            let sink_reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 65536];
+                loop {
+                    match sink_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => *got_reader.lock().unwrap() += n,
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let payload = test_offset_pattern(192 * 1024, 7);
+            peer_stream.write_all(&payload).expect("write burst");
+            let avail_start = Instant::now();
+            while serving.slots[index]
+                .client
+                .as_ref()
+                .expect("client present")
+                .peek(&mut [0u8; 1])
+                .is_err()
+            {
+                assert!(
+                    avail_start.elapsed() < Duration::from_secs(2),
+                    "the client burst never became readable"
+                );
+                std::thread::yield_now();
+            }
+
+            let client_token = client_token(serving.slots[index].slot_gen, index);
+            let up_token = upstream_token(serving.slots[index].slot_gen, index);
+            let before = serving.slots[index].fwd;
+            serving.in_batch = true;
+            serving
+                .dispatch_readiness(
+                    client_token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("batch client-readable token");
+            serving
+                .dispatch_readiness(
+                    up_token,
+                    Readiness {
+                        writable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("batch upstream-writable token");
+            serving.in_batch = false;
+
+            let after = serving.slots[index].fwd;
+            let sink_total = *got.lock().unwrap();
+            assert!(
+                after - before <= 64 * 1024,
+                "one batch with both arms of one slot must stay inside one 64 KiB visit, moved {}",
+                after - before
+            );
+            assert!(
+                sink_total <= 64 * 1024,
+                "sink bytes across the batch must stay inside one 64 KiB visit, got {sink_total}"
+            );
+            match serving.visit {
+                VisitState::Live { ops, bytes, .. } => {
+                    assert!(
+                        ops <= 16,
+                        "the shared visit owns at most 16 ops, recorded {ops}"
+                    );
+                    assert!(
+                        bytes <= 64 * 1024,
+                        "the shared visit owns at most 64 KiB, recorded {bytes}"
+                    );
+                }
+                VisitState::Idle => {}
+            }
+
+            drop(peer_stream);
+            serving.close_slot(index);
+            sink_reader.join().expect("sink reader");
+        });
+    }
+
+    #[test]
+    fn eof_read_attempts_count_toward_the_shared_visit_budget() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let sink_stream = sink.accept().expect("accept sink side").0;
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            peer_stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("client fin");
+            let avail = Instant::now();
+            while serving.slots[index]
+                .client
+                .as_ref()
+                .expect("client present")
+                .peek(&mut [0u8; 1])
+                .is_err()
+            {
+                assert!(
+                    avail.elapsed() < Duration::from_secs(2),
+                    "client FIN never became readable"
+                );
+                std::thread::yield_now();
+            }
+
+            let client_token = client_token(serving.slots[index].slot_gen, index);
+
+            serving.in_batch = true;
+            serving.batch_gen = serving.batch_gen.wrapping_add(1);
+            serving
+                .dispatch_readiness(
+                    client_token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("client-readable dispatch");
+
+            assert_eq!(
+                serving.visit.ops(),
+                1,
+                "the up-flow EOF read must consume exactly one visit op, recorded {:?}",
+                serving.visit
+            );
+
+            let _ = sink_stream.set_write_timeout(Some(Duration::from_millis(100)));
+            sink_stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("upstream fin");
+            let avail2 = Instant::now();
+            while serving.slots[index]
+                .upstream
+                .as_ref()
+                .expect("upstream present")
+                .peek(&mut [0u8; 1])
+                .is_err()
+            {
+                assert!(
+                    avail2.elapsed() < Duration::from_secs(2),
+                    "upstream FIN never became readable"
+                );
+                std::thread::yield_now();
+            }
+
+            let up_token = upstream_token(serving.slots[index].slot_gen, index);
+            serving
+                .dispatch_readiness(
+                    up_token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("upstream-readable dispatch");
+            serving.in_batch = false;
+
+            assert_eq!(
+                serving.visit.ops(),
+                2,
+                "the down-flow EOF read must raise the total to exactly two visit ops \
+                 (one per EOF read), recorded {:?}",
+                serving.visit
+            );
+            assert!(
+                serving.slots[index].client.is_none() && serving.slots[index].upstream.is_none(),
+                "both-EOF drained must close the slot exactly once"
+            );
+        });
+    }
+
+    #[test]
+    fn listener_yield_at_recheck_rearms_for_queued_clients_without_new_connects() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let mut clients = Vec::new();
+            for _ in 0..6 {
+                clients.push(connect(port));
+            }
+            serving.progress.work_since_recheck = 237;
+            serving
+                .run_once(Some(Duration::from_millis(2)))
+                .expect("the first real poll consumes the listener edge");
+            let first_wave = serving.storage().occupied();
+            assert_eq!(
+                first_wave, 2,
+                "the preset ledger must make the accept turn yield mid-backlog after a bounded \
+                 admit (2), not drain the queue in one poll: admitted {first_wave}"
+            );
+            assert!(
+                serving.progress.work_since_recheck <= 256,
+                "the accept turn never pushes the ledger past the canonical 256-unit bound"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while serving.storage().occupied() < clients.len() {
+                assert!(
+                    Instant::now() < deadline,
+                    "pre-queued clients must be admitted on later polls via the listener re-arm \
+                     alone (no new connects ever arrive): occupied {} of {}",
+                    serving.storage().occupied(),
+                    clients.len()
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(2)))
+                    .expect("resume poll");
+            }
+            assert_eq!(
+                serving.storage().occupied(),
+                clients.len(),
+                "all six pre-queued clients are admitted across later polls with no new connects"
+            );
+            for c in clients {
+                let _ = c.shutdown(std::net::Shutdown::Both);
+            }
+        });
+    }
+
+    #[test]
+    fn interleaved_a_b_a_mixed_readwrite_timer_preserves_shared_budgets() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let expected_a = 96 * 1024;
+            let expected_b = 96 * 1024;
+            let pattern_a = test_offset_pattern(expected_a, 1);
+            let pattern_b = test_offset_pattern(expected_b, 2);
+
+            let got_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let got_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let mut readers = Vec::new();
+            let mut peers = Vec::new();
+            for (index, pattern) in [(0usize, &pattern_a), (1, &pattern_b)] {
+                let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+                let sink_addr = sink.local_addr().expect("sink addr");
+                let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+                let mut sink_stream = sink.accept().expect("accept sink side").0;
+                sink_stream.set_nonblocking(true).expect("sink nonblocking");
+
+                let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+                let peer_addr = peer_l.local_addr().expect("peer addr");
+                let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+                let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+                {
+                    let ws = &mut serving.slots[index];
+                    ws.upstream = Some(up);
+                    ws.client = Some(client);
+                    ws.stage = Stage::Relay;
+                    ws.head_len = 4;
+                    ws.buf_base = 0;
+                }
+                open_relay(serving, index);
+                serving.register_upstream(index).expect("register up");
+                serving.register_client(index).expect("register client");
+
+                peer_stream
+                    .write_all(pattern)
+                    .expect("preload client pattern before poll");
+
+                let lane_got = if index == 0 {
+                    std::sync::Arc::clone(&got_a)
+                } else {
+                    std::sync::Arc::clone(&got_b)
+                };
+                let lane_stop = std::sync::Arc::clone(&stop);
+                let reader = std::thread::spawn(move || {
+                    let mut tmp = [0u8; 65536];
+                    loop {
+                        if lane_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        match sink_stream.read(&mut tmp) {
+                            Ok(0) => break,
+                            Ok(n) => lane_got.lock().unwrap().extend_from_slice(&tmp[..n]),
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                readers.push(reader);
+                peers.push(peer_stream);
+            }
+
+            serving.batch_gen = serving.batch_gen.wrapping_add(1);
+            let gen_a = serving.slots[0].slot_gen;
+            let gen_b = serving.slots[1].slot_gen;
+            serving.in_batch = true;
+            let a_token = client_token(gen_a, 0);
+            let b_token = client_token(gen_b, 1);
+            let a_up_token = upstream_token(gen_a, 0);
+            let a0 = serving.slots[0].fwd;
+            serving
+                .dispatch_readiness(
+                    a_token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("A client-readable batch token");
+            let a1 = serving.slots[0].fwd;
+            serving
+                .dispatch_readiness(
+                    b_token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("B client-readable batch token");
+            let b_ops_after_visit = match serving.visit {
+                VisitState::Live { ops, .. } => ops,
+                _ => unreachable!("B's visit is live after its first token"),
+            };
+            serving
+                .dispatch_readiness(
+                    a_up_token,
+                    Readiness {
+                        writable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("A upstream-writable batch token");
+            let a2 = serving.slots[0].fwd;
+            serving.in_batch = false;
+
+            assert!(
+                a1 - a0 <= 64 * 1024,
+                "A's first batch token must stay inside one 64 KiB visit, moved {}",
+                a1 - a0
+            );
+            assert!(
+                a2 == a1,
+                "A's upstream-writable token while B's visit is live must defer (reschedule), \
+                 not advance A: moved {} -> {}",
+                a1,
+                a2
+            );
+            assert!(
+                matches!(serving.visit, VisitState::Live { slot: 1, ops, .. } if ops == b_ops_after_visit),
+                "A's deferred arm must not be charged to B's live visit; B's visit unchanged: {:?}",
+                serving.visit
+            );
+
+            let mut pumps = 0;
+            while pumps < 2000 {
+                let done_a = got_a.lock().unwrap().len() >= expected_a;
+                let done_b = got_b.lock().unwrap().len() >= expected_b;
+                if done_a && done_b {
+                    break;
+                }
+                serving
+                    .run_once(Some(Duration::from_millis(2)))
+                    .expect("interleaved real-poll drain poll");
+                pumps += 1;
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let tail_a = got_a.lock().unwrap().clone();
+            let tail_b = got_b.lock().unwrap().clone();
+            readers.remove(0).join().expect("sink reader A");
+            readers.remove(0).join().expect("sink reader B");
+
+            drop(peers);
+
+            assert!(
+                tail_a.len() >= expected_a && tail_b.len() >= expected_b,
+                "both hot slots must be serviced repeatedly with no starvation: A {} / {} B {} / {}",
+                tail_a.len(),
+                expected_a,
+                tail_b.len(),
+                expected_b
+            );
+            assert_eq!(
+                &tail_a[..expected_a],
+                &pattern_a[..],
+                "A's client bytes must arrive byte-exact at the upstream sink"
+            );
+            assert_eq!(
+                &tail_b[..expected_b],
+                &pattern_b[..],
+                "B's client bytes must arrive byte-exact at the upstream sink"
+            );
+
+            serving.slots[0].idle_deadline = Some(Instant::now() - Duration::from_millis(1));
+            serving
+                .run_once(Some(Duration::from_millis(2)))
+                .expect("sweep poll");
+            assert!(
+                matches!(serving.slots[0].stage, Stage::Idle),
+                "one expired relay timer must be swept on the next owner turn (slot 0 was not idle)"
+            );
+            assert!(
+                matches!(serving.slots[1].stage, Stage::Relay),
+                "the timer sweep must not touch the other hot slot (slot 1 was not relay)"
+            );
+        });
+    }
+
+    #[test]
+    fn retained_edge_reschedules_through_run_once_with_silent_peer() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            let got = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let got_reader = std::sync::Arc::clone(&got);
+            let sink_reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 65536];
+                loop {
+                    match sink_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => *got_reader.lock().unwrap() += n,
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let payload = test_offset_pattern(384 * 1024, 5);
+            let payload_len = payload.len();
+            let writer = std::thread::spawn(move || {
+                peer_stream.write_all(&payload).expect("burst");
+                peer_stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("peer half-close");
+            });
+
+            let start = Instant::now();
+            while *got.lock().unwrap() < payload_len {
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "the silent peer's relay tail stalled through real run_once: got {} of {}",
+                    *got.lock().unwrap(),
+                    payload_len
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(10)))
+                    .expect("poll turns the relay forward");
+            }
+            writer.join().expect("peer writer");
+            serving.close_slot(index);
+            sink_reader.join().expect("sink reader");
+            assert_eq!(
+                *got.lock().unwrap(),
+                payload_len,
+                "bytes relayed via real run_once from a silent peer must be byte-exact"
+            );
+        });
+    }
+
+    #[test]
+    fn one_relay_visit_never_exceeds_the_combined_io_budget() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+            let _ = sink_stream.set_read_timeout(Some(Duration::from_millis(50)));
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.stage = Stage::Relay;
+                ws.head_len = 0;
+                ws.buf_base = 0;
+                ws.buf_len = 128 * 1024;
+                ws.fwd = 0;
+                ws.buf[..128 * 1024].copy_from_slice(&test_offset_pattern(128 * 1024, 9));
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+
+            let token = upstream_token(serving.slots[index].slot_gen, index);
+            serving
+                .dispatch_readiness(
+                    token,
+                    Readiness {
+                        writable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("one writable relay visit");
+
+            let moved = serving.slots[index].fwd;
+            assert!(
+                moved <= 64 * 1024,
+                "one connection visit must forward at most 64 KiB combined, forwarded {moved}"
+            );
+            assert!(
+                moved > 0 && serving.slots[index].fwd < serving.slots[index].buf_len,
+                "128 KiB pending must span more than one visit"
+            );
+
+            let mut total = moved;
+            let drain_start = Instant::now();
+            while serving.slots[index].fwd < serving.slots[index].buf_len {
+                assert!(
+                    drain_start.elapsed() < Duration::from_secs(3),
+                    "the rescheduled relay visit never resumed the pending upload"
+                );
+                serving
+                    .dispatch_readiness(
+                        token,
+                        Readiness {
+                            writable: true,
+                            ..Readiness::none()
+                        },
+                    )
+                    .expect("resumed writable visit");
+                total = serving.slots[index].fwd;
+            }
+
+            let mut got = 0usize;
+            let mut tmp = [0u8; 4096];
+            let recv_start = Instant::now();
+            while got < total {
+                assert!(
+                    recv_start.elapsed() < Duration::from_secs(3),
+                    "the sink never received all forwarded bytes"
+                );
+                match sink_stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(_) => std::thread::yield_now(),
+                }
+            }
+            assert_eq!(
+                got, total,
+                "bytes forwarded across budget-split visits must arrive once, unduplicated"
+            );
+            assert!(
+                serving.slots[index].stage == Stage::Relay,
+                "a budget-split relay visit must not advance or close the tunnel"
+            );
+        });
+    }
+
+    #[test]
+    fn preloaded_hold_drains_across_budget_splits_with_quiescent_sink_relying_on_rearm() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let sink_stream = sink.accept().expect("accept sink side").0;
+            let _ = sink_stream.set_nonblocking(true);
+
+            let index = 0;
+            let hold = 96 * 1024;
+            let pattern = test_offset_pattern(hold, 4);
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                ws.buf[..hold].copy_from_slice(&pattern);
+                ws.buf_len = hold;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+
+            let mut progress_polls = 0usize;
+            let mut last_fwd = 0usize;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while serving.slots[index].fwd < hold {
+                assert!(
+                    Instant::now() < deadline,
+                    "the quiescent-sink drain must cross the 64 KiB budget split across real \
+                     polls with no peer consumption to re-trigger it: fwd {} of {}",
+                    serving.slots[index].fwd,
+                    hold
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(5)))
+                    .expect("real poll drives the re-armed drain");
+                if serving.slots[index].fwd > last_fwd {
+                    progress_polls += 1;
+                    last_fwd = serving.slots[index].fwd;
+                }
+            }
+            assert!(
+                progress_polls >= 2,
+                "the 96 KiB preload must cross at least one 64 KiB budget split through real \
+                 polls with the sink quiescent: saw {progress_polls} progress polls"
+            );
+            assert!(
+                serving.slots[index].stage == Stage::Relay,
+                "a budget-split drain must not advance or close the tunnel"
+            );
+            assert_eq!(
+                serving.slots[index].fwd, hold,
+                "the quiescent sink must have absorbed the full preloaded hold"
+            );
+            let _ = sink_stream;
+        });
+    }
+
+    #[test]
+    fn preloaded_hold_drains_across_budget_splits_byte_exact_with_consuming_sink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+            let _ = sink_stream.set_nonblocking(true);
+
+            let index = 0;
+            let hold = 96 * 1024;
+            let pattern = test_offset_pattern(hold, 4);
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                ws.buf[..hold].copy_from_slice(&pattern);
+                ws.buf_len = hold;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+
+            let stop_reader = Arc::new(AtomicBool::new(false));
+            let sink_got = Arc::new(Mutex::new(Vec::new()));
+            let reader_stop = Arc::clone(&stop_reader);
+            let reader_got = Arc::clone(&sink_got);
+            let reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 65536];
+                loop {
+                    if reader_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match sink_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => reader_got.lock().unwrap().extend_from_slice(&tmp[..n]),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let mut progress_polls = 0usize;
+            let mut last_fwd = 0usize;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while serving.slots[index].fwd < hold || sink_got.lock().unwrap().len() < hold {
+                assert!(
+                    Instant::now() < deadline,
+                    "preloaded hold stalled mid-drain with the sink peer consuming: fwd {} / \
+                     {}, sink got {} / {}",
+                    serving.slots[index].fwd,
+                    hold,
+                    sink_got.lock().unwrap().len(),
+                    hold
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(5)))
+                    .expect("real poll drives the drained hold");
+                if serving.slots[index].fwd > last_fwd {
+                    progress_polls += 1;
+                    last_fwd = serving.slots[index].fwd;
+                }
+            }
+            assert!(
+                progress_polls >= 2,
+                "the 96 KiB preload must span at least two 64 KiB budget-split polls, saw \
+                 {progress_polls}"
+            );
+            assert!(
+                serving.slots[index].stage == Stage::Relay,
+                "a budget-split drain must not advance or close the tunnel"
+            );
+            stop_reader.store(true, Ordering::SeqCst);
+            reader.join().expect("sink reader");
+            let got = sink_got.lock().unwrap().clone();
+            assert_eq!(
+                got,
+                pattern,
+                "the drained hold must reach the sink byte-exact (offset-distinguishing pattern): \
+                 got {}B",
+                got.len()
+            );
+        });
+    }
+
+    #[test]
+    fn read_direction_held_peer_drains_across_budget_splits_without_new_edges() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+            let _ = sink_stream.set_nonblocking(true);
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            let hold = 96 * 1024;
+            let pattern = test_offset_pattern(hold, 23);
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                ws.buf_len = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            peer_stream
+                .write_all(&pattern)
+                .expect("preload the full burst before the first real poll");
+
+            let mut probe = vec![0u8; hold];
+            let queue_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let queued = match serving.slots[index]
+                    .client
+                    .as_ref()
+                    .expect("client present")
+                    .peek(&mut probe)
+                {
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                    Err(e) => panic!("peek exact queued length: {e}"),
+                };
+                if queued >= hold {
+                    break;
+                }
+                assert!(
+                    Instant::now() < queue_deadline,
+                    "the proxy-side client fd never queued the full {hold}-byte preload, peeked \
+                     {queued}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            let stop_reader = Arc::new(AtomicBool::new(false));
+            let sink_got = Arc::new(Mutex::new(Vec::new()));
+            let reader_stop = Arc::clone(&stop_reader);
+            let reader_got = Arc::clone(&sink_got);
+            let reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 65536];
+                loop {
+                    if reader_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match sink_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => reader_got.lock().unwrap().extend_from_slice(&tmp[..n]),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let mut progress_polls = 0usize;
+            let mut last_fwd = 0usize;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while serving.slots[index].fwd < hold {
+                assert!(
+                    Instant::now() < deadline,
+                    "the held-peer read-direction drain stalled without a re-armed client \
+                     READABLE edge: fwd {} of {}",
+                    serving.slots[index].fwd,
+                    hold
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(5)))
+                    .expect("real poll drives the read-direction relay");
+                if serving.slots[index].fwd > last_fwd {
+                    progress_polls += 1;
+                    last_fwd = serving.slots[index].fwd;
+                }
+            }
+            let flush_deadline = Instant::now() + Duration::from_secs(5);
+            while sink_got.lock().unwrap().len() < hold {
+                assert!(
+                    Instant::now() < flush_deadline,
+                    "the sink reader never flushed all {hold} relayed bytes"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            stop_reader.store(true, Ordering::SeqCst);
+            reader.join().expect("sink reader");
+            drop(peer_stream);
+            let got = sink_got.lock().unwrap().clone();
+            assert_eq!(
+                got,
+                pattern,
+                "the held-peer read-direction relay must reach the sink byte-exact: got {}B",
+                got.len()
+            );
+            assert!(
+                progress_polls >= 2,
+                "the >64 KiB peer preload with a silent peer must cross at least one 64 KiB \
+                 budget split through a re-armed client READABLE edge, saw {progress_polls} \
+                 progress polls"
+            );
+            assert!(
+                serving.slots[index].stage == Stage::Relay,
+                "a budget-split read drain must not advance or close the tunnel"
+            );
+        });
+    }
+
+    #[test]
+    fn client_read_visit_shares_combined_read_write_budget() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+            let _ = sink_stream.set_nonblocking(true);
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let received_reader = std::sync::Arc::clone(&received);
+            let sink_reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 16384];
+                loop {
+                    match sink_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => received_reader.lock().unwrap().extend_from_slice(&tmp[..n]),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let payload = test_offset_pattern(96 * 1024, 10);
+            peer_stream.write_all(&payload).expect("write burst");
+
+            let token = client_token(serving.slots[index].slot_gen, index);
+            let avail_start = Instant::now();
+            while !serving.slots[index]
+                .client
+                .as_ref()
+                .expect("client present")
+                .peek(&mut [0u8; 1])
+                .is_ok()
+            {
+                assert!(
+                    avail_start.elapsed() < Duration::from_secs(2),
+                    "the client burst never became readable"
+                );
+                std::thread::yield_now();
+            }
+
+            serving
+                .dispatch_readiness(
+                    token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("one client-readable visit");
+
+            assert!(
+                serving.visit.exhausted(),
+                "a large read+write burst must exhaust the complete-visit budget in one visit"
+            );
+
+            let start = Instant::now();
+            while received.lock().unwrap().len() < payload.len() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "the rescheduled client burst never fully relayed"
+                );
+                serving
+                    .dispatch_readiness(
+                        token,
+                        Readiness {
+                            readable: true,
+                            ..Readiness::none()
+                        },
+                    )
+                    .expect("resume client visit");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(peer_stream);
+            serving.close_slot(index);
+            sink_reader.join().expect("sink reader");
+            let got = received.lock().unwrap().len();
+            assert_eq!(
+                got,
+                payload.len(),
+                "bytes relayed across budget-split visits must arrive intact and once"
+            );
+        });
+    }
+
+    #[test]
+    fn four_mib_up_stream_survives_budget_split_visits_byte_conserved() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            let got = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let got_reader = std::sync::Arc::clone(&got);
+            let sink_reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 65536];
+                loop {
+                    match sink_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => *got_reader.lock().unwrap() += n,
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let payload = test_offset_pattern(4 * 1024 * 1024, 3);
+            let payload_len = payload.len();
+            let writer = std::thread::spawn(move || {
+                let payload_clone = payload.clone();
+                peer_stream.write_all(&payload_clone).expect("4 MiB burst");
+                peer_stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("client half-close");
+            });
+
+            let client_token = client_token(serving.slots[index].slot_gen, index);
+            let up_token = upstream_token(serving.slots[index].slot_gen, index);
+            let start = Instant::now();
+            while *got.lock().unwrap() < payload_len {
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "4 MiB up relay never reached the sink: got {}",
+                    *got.lock().unwrap()
+                );
+                serving
+                    .dispatch_readiness(
+                        client_token,
+                        Readiness {
+                            readable: true,
+                            ..Readiness::none()
+                        },
+                    )
+                    .expect("client-readable visit");
+                serving
+                    .dispatch_readiness(
+                        up_token,
+                        Readiness {
+                            writable: true,
+                            ..Readiness::none()
+                        },
+                    )
+                    .expect("upstream-writable visit");
+                if serving.slots[index].upstream.is_none() {
+                    break;
+                }
+            }
+            writer.join().expect("peer writer");
+            serving.close_slot(index);
+            sink_reader.join().expect("sink reader");
+            let got_total = *got.lock().unwrap();
+            assert_eq!(
+                got_total, payload_len,
+                "bytes relayed across budget-split visits must be conserved end to end"
+            );
+        });
+    }
+
+    #[test]
+    fn four_mib_down_stream_survives_budget_split_visits_byte_conserved() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let origin_l = StdListener::bind("127.0.0.1:0").expect("origin bind");
+            let origin_addr = origin_l.local_addr().expect("origin addr");
+            let up = mio::net::TcpStream::connect(origin_addr).expect("upstream connect");
+            let mut origin = origin_l.accept().expect("accept origin side").0;
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+
+            let payload = test_offset_pattern(4 * 1024 * 1024, 6);
+            let payload_len = payload.len();
+            let writer_payload = payload.clone();
+            let origin_writer = std::thread::spawn(move || {
+                origin.write_all(&writer_payload).expect("4 MiB down burst");
+                origin
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("origin FIN");
+            });
+
+            let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let got_reader = std::sync::Arc::clone(&got);
+            let client_reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 65536];
+                loop {
+                    match peer_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => got_reader.lock().unwrap().extend_from_slice(&tmp[..n]),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let up_token = upstream_token(serving.slots[index].slot_gen, index);
+            let client_token2 = client_token(serving.slots[index].slot_gen, index);
+            let start = Instant::now();
+            while got.lock().unwrap().len() < payload_len {
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "4 MiB down relay never reached the client: got {}",
+                    got.lock().unwrap().len()
+                );
+                serving
+                    .dispatch_readiness(
+                        up_token,
+                        Readiness {
+                            readable: true,
+                            ..Readiness::none()
+                        },
+                    )
+                    .expect("upstream-readable visit");
+                serving
+                    .dispatch_readiness(
+                        client_token2,
+                        Readiness {
+                            writable: true,
+                            ..Readiness::none()
+                        },
+                    )
+                    .expect("client-writable visit");
+                if serving.slots[index].client.is_none() {
+                    break;
+                }
+            }
+            origin_writer.join().expect("origin writer");
+            serving.close_slot(index);
+            client_reader.join().expect("client reader");
+            let got_vec = got.lock().unwrap().clone();
+            assert_eq!(
+                got_vec, payload,
+                "down bytes relayed across budget-split visits must arrive byte-exact"
+            );
+        });
+    }
+
+    #[test]
+    fn full_down_buffer_applies_backpressure_not_false_eof() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let upstream_peer_l = StdListener::bind("127.0.0.1:0").expect("upstream peer bind");
+            let upstream_peer_addr = upstream_peer_l.local_addr().expect("upstream peer addr");
+            let up = mio::net::TcpStream::connect(upstream_peer_addr).expect("upstream connect");
+            let mut upstream_peer = upstream_peer_l
+                .accept()
+                .expect("accept upstream peer side")
+                .0;
+
+            let client_peer_l = StdListener::bind("127.0.0.1:0").expect("client peer bind");
+            let client_peer_addr = client_peer_l.local_addr().expect("client peer addr");
+            let client = mio::net::TcpStream::connect(client_peer_addr).expect("client connect");
+            let client_peer = client_peer_l.accept().expect("accept client peer side").0;
+            let _ = client_peer.set_read_timeout(Some(Duration::from_millis(100)));
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                ws.down[..6].copy_from_slice(b"HELLOA");
+                ws.down_len = DOWN_CAP - 1;
+            }
+            open_relay(serving, index);
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+            upstream_peer
+                .write_all(b"more")
+                .expect("upstream data available with no room");
+
+            let up_token = upstream_token(serving.slots[index].slot_gen, index);
+            serving
+                .dispatch_readiness(
+                    up_token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("no-room upstream-readable visit");
+
+            assert!(
+                matches!(serving.slots[index].stage, Stage::Relay),
+                "a full down buffer must apply backpressure, not close the tunnel"
+            );
+            assert_eq!(
+                serving.slots[index].down_len,
+                DOWN_CAP - 1,
+                "no bytes may be read into a zero-room down buffer"
+            );
+            assert!(
+                serving.slots[index].upstream.is_some(),
+                "a no-room upstream-readable visit must never false-EOF the upstream"
+            );
+            assert!(
+                serving.slots[index].client.is_some(),
+                "the downstream client socket must be retained under backpressure"
+            );
+
+            assert_eq!(
+                serving.slots[index].down_len,
+                DOWN_CAP - 1,
+                "backpressure must not consume the pending downstream payload"
+            );
+        });
+    }
+
+    #[test]
+    fn stalled_reverse_fin_drains_exact_bytes_then_closes_once() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let client_peer_l = StdListener::bind("127.0.0.1:0").expect("client peer bind");
+            let client_peer_addr = client_peer_l.local_addr().expect("client peer addr");
+            let client = mio::net::TcpStream::connect(client_peer_addr).expect("client connect");
+            let mut client_peer = client_peer_l.accept().expect("accept client peer side").0;
+            let _ = client_peer.set_read_timeout(Some(Duration::from_millis(20)));
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.directional.down = SideEof::Open;
+                let payload = b"STALLED-REVERSE-PAYLOAD-0123456789";
+                ws.down[..payload.len()].copy_from_slice(payload);
+                ws.down_len = payload.len();
+                ws.down_off = 0;
+            }
+            open_relay(serving, index);
+            serving.register_client(index).expect("register client");
+
+            serving
+                .observe_down_eof(index)
+                .expect("observe stalled reverse FIN");
+            assert!(
+                matches!(
+                    serving.slots[index].directional.down,
+                    SideEof::Eof { half_closed: false }
+                ),
+                "the reverse EOF must be recorded as half-close pending while bytes remain buffered"
+            );
+            assert!(
+                matches!(serving.slots[index].stage, Stage::Relay),
+                "a stalled reverse buffer must keep the tunnel open (no premature half-close/close)"
+            );
+
+            let expected = b"STALLED-REVERSE-PAYLOAD-0123456789";
+            let mut got = Vec::new();
+            let mut tmp = [0u8; 64];
+            let drain_start = Instant::now();
+            while got.len() < expected.len() {
+                assert!(
+                    drain_start.elapsed() < Duration::from_secs(5),
+                    "stalled reverse FIN never drained: got {} of {}",
+                    got.len(),
+                    expected.len()
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(5)))
+                    .expect("gate-vicinity run poll");
+                match client_peer.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&tmp[..n]),
+                    Err(_) => {}
+                }
+            }
+            assert_eq!(
+                got, expected,
+                "the stalled reverse payload must arrive byte-exact after the buffer drains"
+            );
+
+            client_peer
+                .shutdown(std::net::Shutdown::Write)
+                .expect("client fin");
+            let close_start = Instant::now();
+            while !matches!(serving.slots[index].stage, Stage::Idle) {
+                assert!(
+                    close_start.elapsed() < Duration::from_secs(5),
+                    "the slot never closed once both directions drained"
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(5)))
+                    .expect("gate-vicinity run poll");
+            }
+        });
+    }
+
+    #[test]
+    fn second_gateopening_drain_shares_the_single_visit_budget() {
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let sink_stream = sink.accept().expect("accept sink side").0;
+            let _ = sink_stream.set_read_timeout(Some(Duration::from_millis(50)));
+
+            let client = mio::net::TcpStream::connect(
+                StdListener::bind("127.0.0.1:0")
+                    .expect("peer bind")
+                    .local_addr()
+                    .expect("peer addr"),
+            )
+            .expect("client connect");
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::WritingHello;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                ws.gate.on_connect_head(4);
+                ws.gate.on_authorized();
+                ws.gate.on_upstream_connected();
+                ws.gate.on_response_ok();
+                ws.gate.on_hello_validated(ValidatedHello::test_new(1024));
+
+                ws.buf[..4].copy_from_slice(b"HEAD");
+                let hello_region = test_offset_pattern(1020, 11);
+                ws.buf[4..1024].copy_from_slice(&hello_region);
+                let payload_region = test_offset_pattern(HOLD_CAP - 1024, 12);
+                let mut filled = 1024;
+                while filled < ws.buf.len() {
+                    let chunk = (ws.buf.len() - filled).min(1024);
+                    let window = filled - 1024;
+                    ws.buf[filled..filled + chunk]
+                        .copy_from_slice(&payload_region[window..window + chunk]);
+                    filled += chunk;
+                }
+                ws.buf_len = ws.buf.len();
+            }
+            serving.register_upstream(index).expect("register up");
+            serving.register_client(index).expect("register client");
+            assert!(
+                !serving.slots[index].gate.is_open(),
+                "the gate must still be closed before the crossing visit"
+            );
+
+            let _ = sink_stream.set_nonblocking(true);
+
+            serving.in_batch = true;
+            serving.batch_gen = serving.batch_gen.wrapping_add(1);
+            let token = upstream_token(serving.slots[index].slot_gen, index);
+            serving
+                .dispatch_readiness(
+                    token,
+                    Readiness {
+                        writable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("one gate-crossing upstream-writable token");
+            let consumed = match serving.visit {
+                VisitState::Live { ops, bytes, .. } => (ops, bytes),
+                _ => unreachable!("the gate-crossing visit stays live until end of batch"),
+            };
+            let fwd_after = serving.slots[index].fwd;
+            let gate_open = serving.slots[index].gate.is_open();
+            let stage_after = serving.slots[index].stage;
+            serving.in_batch = false;
+
+            assert!(
+                gate_open && matches!(stage_after, Stage::Relay),
+                "the single visit must succeed in opening the gate prior to relay (gate={gate_open})"
+            );
+            assert!(
+                consumed.0 <= 16 && consumed.1 <= 64 * 1024,
+                "pre-open drain + post-open second drain must share ONE visit budget: {} ops / {} bytes",
+                consumed.0,
+                consumed.1
+            );
+            assert!(
+                fwd_after > 1024,
+                "the crossing visit must forward past the validated hello boundary (fwd {})",
+                fwd_after
+            );
+            assert_eq!(
+                serving.slots[index].down_len, 0,
+                "the up-flow gate must open before any downstream read occurs in the visit"
+            );
+        });
+    }
+
+    #[test]
+    fn full_up_buffer_never_reads_into_zero_room_or_false_eofs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let port = ephemeral_port();
+        with_serving_stack(port, move |serving| {
+            let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+            let sink_addr = sink.local_addr().expect("sink addr");
+            let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+            let mut sink_stream = sink.accept().expect("accept sink side").0;
+            sink_stream.set_nonblocking(true).expect("sink nonblocking");
+
+            let peer_l = StdListener::bind("127.0.0.1:0").expect("peer bind");
+            let peer_addr = peer_l.local_addr().expect("peer addr");
+            let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+            let mut peer_stream = peer_l.accept().expect("accept peer side").0;
+
+            let index = 0;
+            {
+                let ws = &mut serving.slots[index];
+                ws.upstream = Some(up);
+                ws.client = Some(client);
+                ws.stage = Stage::Relay;
+                ws.head_len = 4;
+                ws.buf_base = 0;
+                ws.fwd = 0;
+                let pattern = test_offset_pattern(HOLD_CAP - 1, 13);
+                ws.buf[..HOLD_CAP - 1].copy_from_slice(&pattern);
+                ws.buf_len = HOLD_CAP - 1;
+            }
+            open_relay(serving, index);
+            serving.register_client(index).expect("register client");
+            serving.register_upstream(index).expect("register upstream");
+            peer_stream
+                .write_all(b"more")
+                .expect("client data available with no room");
+
+            let token = client_token(serving.slots[index].slot_gen, index);
+            serving
+                .dispatch_readiness(
+                    token,
+                    Readiness {
+                        readable: true,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("no-room readable visit");
+
+            assert!(
+                matches!(serving.slots[index].stage, Stage::Relay),
+                "a full buffer must apply backpressure, not close the tunnel"
+            );
+            assert_eq!(
+                serving.slots[index].buf_len,
+                HOLD_CAP - 1,
+                "no bytes may be read into a zero-room buffer"
+            );
+            assert!(
+                serving.slots[index].client.is_some(),
+                "a no-room readable visit must never false-EOF the client"
+            );
+
+            let expected = test_offset_pattern(HOLD_CAP - 1, 13);
+            let stop_reader = Arc::new(AtomicBool::new(false));
+            let sink_got = Arc::new(Mutex::new(Vec::new()));
+            let reader_stop = Arc::clone(&stop_reader);
+            let reader_got = Arc::clone(&sink_got);
+            let reader = std::thread::spawn(move || {
+                let mut tmp = [0u8; 65536];
+                loop {
+                    if reader_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match sink_stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => reader_got.lock().unwrap().extend_from_slice(&tmp[..n]),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let drain_deadline = Instant::now();
+            while sink_got.lock().unwrap().len() < expected.len() + 4 {
+                assert!(
+                    drain_deadline.elapsed() < Duration::from_secs(3),
+                    "the full upstream buffer must drain to the origin once room appears: \
+                     sink got {} of {}, fwd {} buf_len {} client {}",
+                    sink_got.lock().unwrap().len(),
+                    expected.len() + 4,
+                    serving.slots[index].fwd,
+                    serving.slots[index].buf_len,
+                    serving.slots[index].client.is_some()
+                );
+                serving
+                    .run_once(Some(Duration::from_millis(5)))
+                    .expect("real poll drives the drain and the follow-up head");
+            }
+            stop_reader.store(true, Ordering::SeqCst);
+            reader.join().expect("sink reader");
+            let got = sink_got.lock().unwrap().clone();
+            let mut expected_tail = expected.clone();
+            expected_tail.extend_from_slice(b"more");
+            assert_eq!(
+                got, expected_tail,
+                "the drained buffer plus the pending client bytes must reach the origin byte-exact"
             );
         });
     }
