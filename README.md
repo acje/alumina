@@ -1,13 +1,13 @@
 # Alumina Proxy — Domain filtering TLS proxy
 
-Allowlist TLS egress in your cloud environments
+Allowlist TLS egress in your cloud environments.
 
-Alumina can be deployed as a light weight forward proxy to protect the egress
+Alumina can be deployed as a light weight explicit forward proxy to protect the egress
 for your servers or containers by allowlisting which domains are eligible for
-egress traffic. The idiomatic use case is to deploy alumina with one container
+egress traffic. The idiomatic use case is to deploy Alumina Proxy with one container
 or workload type in a VPC that limits egress to be exclusively through the
-Alumina Proxy. In case of component compromise the attacker will have less
-opportunities for establishing egress.
+Alumina Proxy. In case of component compromise the attacker will have limited
+opportunities for establishing egress (TODO: and risk setting off tripwires with configurable actions.)
 
 ## Documents
 
