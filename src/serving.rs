@@ -54,8 +54,11 @@ use crate::serve::ServeStorage;
 use crate::startup_dns::StartupDnsError;
 use crate::worker::{AttemptCounts, ConnectPhase, MAX_TUNNELS, SlotIndex, TunnelIndex};
 
+mod policy;
 mod reject;
 mod startup;
+
+use self::policy::Refusal;
 
 /// The listener registration token.
 const LISTENER: Token = Token(0);
@@ -178,43 +181,7 @@ impl ShutdownExit {
 }
 
 const BODY_200: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
-const BODY_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n";
-const BODY_403: &[u8] = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n";
-const BODY_502: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n";
 const BODY_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
-const BODY_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\ncontent-length: 0\r\n\r\n";
-
-/// A typed refusal to serve a connection: the single source of truth mapping
-/// forward to both the fixed HTTP body and the fixed `RejectReason` log
-/// vocabulary. The refuse path never reverse-infers a reason from a byte
-/// match, so a new refusal class cannot silently default to BadRequest.
-#[derive(Clone, Copy)]
-enum Refusal {
-    BadRequest,
-    Forbidden,
-    DialFailed,
-    SetupTimeout,
-}
-
-impl Refusal {
-    fn body(self) -> &'static [u8] {
-        match self {
-            Refusal::BadRequest => BODY_400,
-            Refusal::Forbidden => BODY_403,
-            Refusal::DialFailed => BODY_502,
-            Refusal::SetupTimeout => BODY_504,
-        }
-    }
-
-    fn reason(self) -> RejectReason {
-        match self {
-            Refusal::BadRequest => RejectReason::BadRequest,
-            Refusal::Forbidden => RejectReason::Forbidden,
-            Refusal::DialFailed => RejectReason::DialFailed,
-            Refusal::SetupTimeout => RejectReason::SetupTimeout,
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReadOutcome {
