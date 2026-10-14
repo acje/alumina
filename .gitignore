@@ -17,3 +17,6 @@ node_modules/
 # Whole Beads store is ignored (user directive: ignore, never delete the local store)
 .beads/
 *.gate.lock*
+
+# Finder/Spotlight desktop metadata (basename, any directory depth)
+.DS_Store
