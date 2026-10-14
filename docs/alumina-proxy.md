@@ -234,3 +234,82 @@ The first-iteration target is 1-10 Gbps aggregate relayed payload throughput acr
 - **Initial deployment:** Demonstrate TCP DNS resolution and end-to-end CONNECT ingress on the selected Cloud Run worker-pool deployment. Qualify complete direct, CNAME, and negative recursive responses for the intended third-party allowlist against the selected platform resolver, including original CONNECT/SNI preservation. Measure network startup delays against the fixed 90-second DNS budget; verify the chosen allowance and operator-controlled restart policy without automatic timeout extensions. Demonstrate an operator-owned CONNECT plus authenticated TLS check through Alumina for deployment reachability assurance. Compatibility failure requires an explicit deployment or design revision, never automatic protocol or resolver fallback; add bounded follow-up queries only through an explicit revision justified by observed necessary compatibility gaps.
 - **Runtime surface and deployment prerequisites:** Verify that startup fails as root, with nonempty effective, permitted, or ambient capability sets, or without `no_new_privs`. Verify that the running process has exactly one listening socket and no other inbound interface. Verify that SIGTERM performs bounded shutdown and that catchable administrative signals cannot reload configuration or change policy. Verify that the image contains only the specified files.
 - **Performance:** Measure aggregate forwarded payload bytes once, not once on read and again on write. Benchmark 1-10 Gbps bursts where CPU and network capacity permit, and report burst duration, concurrency, payload sizes, CPU utilization, queueing, and sustained throughput separately. Include slow-peer backpressure and verify DNS and deadline progress under load. These targets and deployment behaviors are unverified until measured.
+
+## Tripwire actions, monitoring, and pacing — user-authorized amendment
+
+**Authority.** This section is a narrow, user-authorized amendment to this specification (`alumina-rp2e`, 2026-10-14). It defines a configuration tripwire/action/monitoring/pacing surface and resolves its semantics. It amends only the surface enumerated here; every other clause of this document — the fixed resource profile, lifecycle deadlines, invariants, logging vocabulary, and core TLS 1.3 + SNI + ECH-reject behavior — is unchanged and remains binding. Specification publication precedes implementation; the status table at the end assigns each surface an honest planned/implemented/deferred status.
+
+### Action catalog and attribution
+
+Each configured allowlist ordinal (1 through 32) carries exactly one Action from `FlareOnly`, `Block`, or `Tarpit`. A per-domain action applies only to failures attributable to that specific validated configured-domain identity, keyed by the fixed allowlist ordinal set. A per-domain action never overrides a mandatory-denial class.
+
+Attribution and precedence rules:
+
+- **AnyIllegal class:** CONNECT parse failure, hostname not allowlisted, missing, malformed, or unsupported SNI, ECH, TLS-profile rejection, and any other recognizable control failure from the enumerated CONNECT-head and ClientHello-profile catalogs are fixed, connection-scoped, terminal mandatory denials, unchanged from the baseline contract. They are attributed to the AnyIllegal class, never to a configured domain. Operational failures (upstream dial failure, unavailable or retired DNS binding, capacity refusal, setup deadline expiry, shutdown-phase activity) and absent internal evidence are never AnyIllegal and never select an Action.
+- **AnyIllegal first-slot action:** the first AnyIllegal control failure on a connection selects a configured `Block` action with scope `Connection` or `All` only; a `Domain` scope for the AnyIllegal action is invalid configuration (startup failure, exit 78, EX_CONFIG). An unknown or unattributable identity thus maps through the AnyIllegal channel with its configured Connection/All scope; there is no permissive default and no unconfigured latch.
+- **Early upstream data:** upstream Data observed through actual I/O after a matching, validated ClientHello but before the forwarding gate opens is attributed to the validated configured domain (approved CONNECT ordinal plus matching SNI proof). It remains a mandatory baseline denial — terminate setup, forward nothing; in addition the configured per-domain Action (`FlareOnly` or a scoped `Block`) may apply.
+- **EOF and reset** observed while the gate is closed are operational Unknown: never policy violations, never domain-attributed, never selecting an Action. They keep their baseline handling.
+- Only the configured allowlist ordinal set is ever keyed for per-domain effects; no attacker-controlled hostname or IP table is introduced.
+
+### Block and Flare semantics
+
+- **Block Connection:** terminates the offender connection only; no scope history.
+- **Block Domain:** a fixed ordinal table (at most 32 entries) marks the configured domain blocked; it affects current and future flows matching that ordinal until restart.
+- **Block All:** synchronously prevents all subsequent application I/O, including pending writes and new admission, before any further I/O, then performs bounded physical closure of at most 128 slots. It persists until restart; there is no runtime unblock interface.
+- **FlareOnly:** a notification and aggregation context only. It never authorizes forwarding, never delays baseline denial, and never widens scope. Implicit Flare for an applied Block inherits that Block's scope (reporting scope equals enforcement scope).
+
+### Tarpit (deferred)
+
+Tarpit is `Connection`-scope, post-gate, byte-preserving time-only pacing/backpressure on otherwise-authorized traffic, with a separate per-connection credit counter, a rate given as an integer bytes-per-second plus an explicit `Unlimited` variant, and no simulated packet or byte loss. **No real establishment-allowed predicate exists today**, so Tarpit cannot bind to any current failure without widening a mandatory-denial class; it is therefore **deferred**, not implemented. Configuration that selects `Tarpit` must be rejected with an explicit deferred-status diagnostic — it must never be accepted as an inert runtime setting — until a genuine trigger-catalog decision authorizes a real predicate.
+
+### Configuration surface (planned; exact schema)
+
+The reserved surface keys each Action to the fixed allowlist ordinal set (1 through 32) positionally, by index-aligned arrays, so no attacker-controlled name table and no second mapping are introduced. The exact schema is:
+
+```
+[any_illegal]
+scope = "connection" | "all"          # AnyIllegal first-slot Block scope; "domain" is invalid configuration
+
+[actions]
+kind  = ["flare_only" | "block", ...]  # one literal per allowlist entry, in allowlist order
+scope = ["connection" | "domain" | "all", ...]  # one literal per allowlist entry, in allowlist order
+```
+
+- The group is reserved and validated when present: `[any_illegal]` scope must be `connection` or `all` (a `domain` scope is invalid configuration, exit 78); `[actions]` `kind` and `scope` arrays are mandatory and their length must equal the allowlist length (one entry per configured ordinal); `kind = "tarpit"` for any ordinal is rejected with an explicit Tarpit-deferred diagnostic and is never accepted as an implemented runtime action; any other `kind` or `scope` literal is unknown (exit 78). A partial group (one table without the other, or mismatched lengths) is also exit 78.
+- An absent group is the pre-existing baseline: AnyIllegal remains the always-on offender-scoped mandatory denial, with no supplementary per-domain action and no All latch. This is not a per-key default; it is the un-amended behavior. Force-mandatory scoring of the group (a config without it fails startup) applies at enforcement integration, when runtime effects land; until then the surface stays planned.
+- All keys are mandatory with no defaults within the group and no environment or command-line override; unknown keys or tables fail startup with exit 78 (EX_CONFIG) exactly as today. `Block` and `Flare` scopes are configurable (`Connection`, `Domain`, `All`); the `Tarpit` scope is fixed at `Connection`. The `Tarpit` rate is an integer bytes-per-second plus an explicit `Unlimited` variant, with checked representability. Configuration validation timing and procedure are unchanged.
+- Capacity: the group is within the existing 4 KiB document bound; 32 allowlist names of 100 ASCII bytes each plus the full `[any_illegal]` and `[actions]` arrays still fit.
+
+### Monitoring (planned)
+
+Additional LOG KIND(s) on the existing stdout sink — and only that sink — report per-domain action events and correlated per-ordinal and global aggregates. They follow the existing bounded, best-effort, allocation-free logging contract: whole-record drop and count on overflow, saturating counters with an overflow flag, and fold-before-close/reuse. No new sink, endpoint, control, or metrics interface is added; a Flare for Block or Tarpit events is implicit and coalesced at the existing report cadence, never one record per packet.
+
+### Planned fixed control storage (design estimate, not measured)
+
+All added enforcement and monitoring storage is boot-time allocated from the existing fixed inventory and performs zero heap allocation or deallocation after boot. The bounding design estimate below is derived from the fixed counts (128 tunnel slots, at most 32 ordinals) and a concrete type/sizeof plan to be verified at implementation; it is not a measured or runtime figure.
+
+| Planned structure | Count | Unit size (bound) | Bound total |
+| --- | --- | --- | --- |
+| Per-ordinal DomainAction table (`FlareOnly`/`Block` + scope) | 32 | 2 B | 64 B |
+| Domain-blocked ordinal bitset + All latch | 32 bits + flag | — | 5 B |
+| Per-slot latched tripwire fact (phase, class, validated ordinal, generation) | 128 | 8 B | 1024 B |
+| Per-ordinal saturated aggregate counters + overflow + window state | 32 | 32 B | 1024 B |
+| Per-slot last-counted window marker | 128 | 8 B | 1024 B |
+
+The planned additional control storage totals approximately 3–4 KiB against the existing 128 MiB traffic storage and 2 MiB log queue. Exact sizes are fixed at implementation with `sizeof`-verified types. No pacing credit/burst storage is reserved or preallocated while Tarpit is deferred (no speculative reserved pacing allocation); it is added to this table only if a genuine trigger-catalog decision authorizes Tarpit. Per-turn enforcement work composes with the existing 16-op/64 KiB per-visit budget and at-most-256-visit timer recheck; the per-turn control-step count is a fixed value derived from that native per-visit I/O budget at implementation, not an invented range. Block All's bounded physical closure is the only path that walks the slot table.
+
+### Explicitly unchanged (non-negotiable)
+
+The fixed resource profile (128 tunnels, 32 pending setups, two 512 KiB per-slot buffers, 128 MiB traffic storage, the 256 x 8 KiB log queue, 16-op/64 KiB visits, at-most-256-visit recheck, DNS response/candidate/incident caps, the 90-second startup window, and all deadlines — 10/2/300/5/8 seconds); empty capability sets and `no_new_privs`; byte conservation; non-decrypting; single owner; generation isolation; bounded work; no runtime metrics, control, debug, or endpoint interface; logs to stdout only; core TLS 1.3 + SNI + ECH-reject; packet dropping is never implemented; no new dependency unless its intake precedes execution; no kernel pacing knob.
+
+### Status
+
+| Surface | Status |
+| --- | --- |
+| This amendment published | Current revision |
+| Configuration: exact reserved schema (`[any_illegal]` + positional `[actions]`), AnyIllegal first-slot `Block` `Connection`/`All`, Tarpit deferred rejection, unknown/missing keys exit 78, at most 4 KiB | Validated when present (this increment); force-mandatory scoring and runtime effect at enforcement integration (planned until integrated) |
+| Typed detection-fact capture before erasure; early upstream data validated-domain attribution; EOF/reset operational Unknown | Planned |
+| Enforcement: `Block` Connection/Domain/All synchronous latch + bounded closure; `FlareOnly` reporting context | Planned |
+| Monitoring: new stdout log kinds + correlated aggregates, drop+count, saturation + overflow, fold | Planned |
+| Tarpit pacing | Deferred — no real establishment-allowed predicate; configuration selecting it fails with an explicit deferred-status diagnostic |
+| Pacing credit/burst storage | None reserved (no speculative pacing allocation) |

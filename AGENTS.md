@@ -7,8 +7,10 @@ specification, not feature growth.
 ## Rules
 
 - `docs/alumina-proxy.md` is the sole, byte-canonical governing
-  specification (sha256 `322b68ee…5b836`). Never edit it; documents only
-  restate or cite it.
+  specification (sha256 `bfa1fd9d…2132`). Never edit it; documents only
+  restate or cite it. The sole exception is the narrow, user-authorized
+  `rp2e` (2026-10-14) tripwire/action/monitoring/pacing amendment recorded in
+  the document; no further amendment authority is implied.
 - Status is a scoped local testQA candidate — not production-qualified;
   serving-qualification gates stay open (`docs/build-plan.md` owns them).
 - Native verification entry point, QA run and prerequisite ownership are
