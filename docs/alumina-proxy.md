@@ -262,7 +262,7 @@ Attribution and precedence rules:
 
 Tarpit is `Connection`-scope, post-gate, byte-preserving time-only pacing/backpressure on otherwise-authorized traffic, with a separate per-connection credit counter, a rate given as an integer bytes-per-second plus an explicit `Unlimited` variant, and no simulated packet or byte loss. **No real establishment-allowed predicate exists today**, so Tarpit cannot bind to any current failure without widening a mandatory-denial class; it is therefore **deferred**, not implemented. Configuration that selects `Tarpit` must be rejected with an explicit deferred-status diagnostic — it must never be accepted as an inert runtime setting — until a genuine trigger-catalog decision authorizes a real predicate.
 
-### Configuration surface (planned; exact schema)
+### Configuration surface (implemented; exact schema)
 
 The reserved surface keys each Action to the fixed allowlist ordinal set (1 through 32) positionally, by index-aligned arrays, so no attacker-controlled name table and no second mapping are introduced. The exact schema is:
 
@@ -276,9 +276,9 @@ scope = ["connection" | "domain" | "all", ...]  # one literal per allowlist entr
 ```
 
 - The group is reserved and validated when present: `[any_illegal]` scope must be `connection` or `all` (a `domain` scope is invalid configuration, exit 78); `[actions]` `kind` and `scope` arrays are mandatory and their length must equal the allowlist length (one entry per configured ordinal); `kind = "tarpit"` for any ordinal is rejected with an explicit Tarpit-deferred diagnostic and is never accepted as an implemented runtime action; any other `kind` or `scope` literal is unknown (exit 78). A partial group (one table without the other, or mismatched lengths) is also exit 78.
-- An absent group is the pre-existing baseline: AnyIllegal remains the always-on offender-scoped mandatory denial, with no supplementary per-domain action and no All latch. This is not a per-key default; it is the un-amended behavior. Force-mandatory scoring of the group (a config without it fails startup) applies at enforcement integration, when runtime effects land; until then the surface stays planned.
+- An absent group is invalid configuration at enforcement integration (landed this increment): a document without the full `[any_illegal]` + positional `[actions]` group fails startup with exit 78 (EX_CONFIG). There is no absent-group baseline fallback; the pre-existing offender-scoped mandatory-denial semantics are reproduced by configuring `[any_illegal] scope = "connection"` with per-domain `flare_only`/`connection` entries.
 - All keys are mandatory with no defaults within the group and no environment or command-line override; unknown keys or tables fail startup with exit 78 (EX_CONFIG) exactly as today. `Block` and `Flare` scopes are configurable (`Connection`, `Domain`, `All`); the `Tarpit` scope is fixed at `Connection`. The `Tarpit` rate is an integer bytes-per-second plus an explicit `Unlimited` variant, with checked representability. Configuration validation timing and procedure are unchanged.
-- Capacity: the group is within the existing 4 KiB document bound; 32 allowlist names of 100 ASCII bytes each plus the full `[any_illegal]` and `[actions]` arrays still fit.
+- Capacity: the enforcement group counts toward the existing 4 KiB document bound; no full-schema combination is guaranteed to fit beyond a measured example. Measured with the exact document serializer the parser reads (pinned by parser-real assertions in `src/config.rs`) at 32 allowlist names of 100 ASCII bytes each: the compact `block`/`domain` full arrays with `[any_illegal] scope = "all"` total 4061 bytes (including the trailing newline) and fit; the longer `flare_only`/`connection` full arrays with `[any_illegal] scope = "connection"` total 4356 bytes and are rejected by the byte cap (OversizedDocument, exit 78). The `kind`/`scope` length must equal the allowlist length, so a max-count config at the longer spelling exceeds the bound and is rejected at startup. Each total is the exact serialized document length and is serialization- and layout-dependent (whitespace, listen spelling, trailing newline); only the compact form at the measured 32 × 100-byte names is shown to fit under the preserved 4 KiB cap and 32-name count. Neither a cap expansion, an alias, a silent compact migration, nor a change to the legal literal set is implied.
 
 ### Monitoring (planned)
 
@@ -307,9 +307,9 @@ The fixed resource profile (128 tunnels, 32 pending setups, two 512 KiB per-slot
 | Surface | Status |
 | --- | --- |
 | This amendment published | Current revision |
-| Configuration: exact reserved schema (`[any_illegal]` + positional `[actions]`), AnyIllegal first-slot `Block` `Connection`/`All`, Tarpit deferred rejection, unknown/missing keys exit 78, at most 4 KiB | Validated when present (this increment); force-mandatory scoring and runtime effect at enforcement integration (planned until integrated) |
-| Typed detection-fact capture before erasure; early upstream data validated-domain attribution; EOF/reset operational Unknown | Planned |
-| Enforcement: `Block` Connection/Domain/All synchronous latch + bounded closure; `FlareOnly` reporting context | Planned |
+| Configuration: exact reserved schema (`[any_illegal]` + positional `[actions]`), AnyIllegal first-slot `Block` `Connection`/`All`, Tarpit deferred rejection, unknown/missing keys exit 78, force-mandatory group, at most 4 KiB | Implemented (this increment) |
+| Typed detection-fact capture before erasure; early upstream data validated-domain attribution; EOF/reset operational Unknown | Implemented (this increment) |
+| Enforcement: `Block` Connection/Domain/All synchronous latch + bounded closure at the runtime detection sites; `FlareOnly` reporting context (aggregate capture counters, fold on close) | Implemented (this increment) |
 | Monitoring: new stdout log kinds + correlated aggregates, drop+count, saturation + overflow, fold | Planned |
 | Tarpit pacing | Deferred — no real establishment-allowed predicate; configuration selecting it fails with an explicit deferred-status diagnostic |
 | Pacing credit/burst storage | None reserved (no speculative pacing allocation) |

@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use crate::client_hello::HelloRejectReason;
+use crate::enforcement::policy::AnyIllegalCause;
 use crate::log::RejectReason;
 
 use super::ServeError;
@@ -9,6 +11,10 @@ impl Serving {
     pub(super) fn refuse(&mut self, index: usize, refusal: Refusal) {
         let body = refusal.body();
         self.emit_reject(index, refusal.reason());
+        if self.block_all_latched() {
+            self.close_slot(index);
+            return;
+        }
         let ws = &mut self.slots[index];
         ws.down_off = 0;
         ws.down[..body.len()].copy_from_slice(body);
@@ -34,8 +40,13 @@ impl Serving {
             .reject(secs, reason, client, hostname);
     }
 
-    pub(super) fn reject_hello(&mut self, index: usize) -> Result<(), ServeError> {
+    pub(super) fn reject_hello(
+        &mut self,
+        index: usize,
+        reason: HelloRejectReason,
+    ) -> Result<(), ServeError> {
         self.slots[index].gate.on_hello_rejected();
+        self.any_illegal(index, AnyIllegalCause::TlsProfile(reason));
         self.emit_reject(index, RejectReason::TlsValidation);
         self.close_slot(index);
         Ok(())

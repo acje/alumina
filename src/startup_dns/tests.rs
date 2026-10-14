@@ -276,7 +276,7 @@ fn read_exact(sock: &mut TcpStream, buf: &mut [u8]) -> io::Result<()> {
 
 fn config() -> Config {
     parse_config_document(
-        "allowlist = [\"alpha.example.org\", \"beta.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n",
+        "allowlist = [\"alpha.example.org\", \"beta.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n",
     )
     .expect("valid config")
 }

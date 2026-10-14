@@ -40,6 +40,11 @@ const VALID_CONFIG: &str = r#"
 allowlist = ["example.com", "sub.example.org."]
 listen = "0.0.0.0:8080"
 startup_unresolved_allowance = 1
+[any_illegal]
+scope = "connection"
+[actions]
+kind = ["flare_only", "flare_only"]
+scope = ["connection", "connection"]
 "#;
 
 #[test]
@@ -190,7 +195,7 @@ fn config_wrong_types_fail_without_coercion() {
 fn config_allowlist_empty_and_over_32_fail() {
     assert!(matches!(
         config::parse_config_document(
-            "allowlist = []\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n"
+            "allowlist = []\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = []\nscope = []\n"
         ),
         Err(ConfigError::AllowlistEmpty)
     ));
@@ -199,7 +204,7 @@ fn config_allowlist_empty_and_over_32_fail() {
         names.push(format!("\"n{}.example\"", i));
     }
     let doc = format!(
-        "allowlist = [{}]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n",
+        "allowlist = [{}]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = []\nscope = []\n",
         names.join(",")
     );
     assert!(matches!(
@@ -210,12 +215,12 @@ fn config_allowlist_empty_and_over_32_fail() {
 
 #[test]
 fn config_duplicate_allowlist_names_rejected_after_normalization() {
-    let dup_exact = "allowlist = [\"a.example\", \"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n";
+    let dup_exact = "allowlist = [\"a.example\", \"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(dup_exact),
         Err(ConfigError::DuplicateAllowlistName(_))
     ));
-    let dup_normalized = "allowlist = [\"a.example\", \"a.example.\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n";
+    let dup_normalized = "allowlist = [\"a.example\", \"a.example.\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(dup_normalized),
         Err(ConfigError::DuplicateAllowlistName(_))
@@ -235,7 +240,7 @@ fn config_invalid_fqdn_rejected() {
         ),
     ] {
         let doc = format!(
-            "allowlist = [\"{}\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n",
+            "allowlist = [\"{}\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
             fqdn
         );
         assert!(
@@ -248,17 +253,17 @@ fn config_invalid_fqdn_rejected() {
 
 #[test]
 fn config_allowance_out_of_range_fails() {
-    let eq_len = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n";
+    let eq_len = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(eq_len),
         Err(ConfigError::AllowanceOutOfRange { .. })
     ));
-    let negative = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = -1\n";
+    let negative = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = -1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(negative),
         Err(ConfigError::AllowanceOutOfRange { .. })
     ));
-    let zero_ok = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n";
+    let zero_ok = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     assert!(config::parse_config_document(zero_ok).is_ok());
 }
 
@@ -275,7 +280,7 @@ fn config_listen_variants() {
         ("empty", ""),
     ] {
         let doc = format!(
-            "allowlist = [\"a.example\"]\nlisten = \"{}\"\nstartup_unresolved_allowance = 0\n",
+            "allowlist = [\"a.example\"]\nlisten = \"{}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
             listen
         );
         assert!(
@@ -284,7 +289,7 @@ fn config_listen_variants() {
             name
         );
     }
-    let ipv6_ok = "allowlist = [\"a.example\"]\nlisten = \"[2001:db8::1]:8080\"\nstartup_unresolved_allowance = 0\n";
+    let ipv6_ok = "allowlist = [\"a.example\"]\nlisten = \"[2001:db8::1]:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     let cfg = config::parse_config_document(ipv6_ok).expect("bracketed IPv6 listen");
     assert_eq!(cfg.listen().port(), 8080);
     assert_eq!(cfg.listen().ip().to_string(), "2001:db8::1");
@@ -297,8 +302,14 @@ fn config_allowlist_32_max_fits_document_bound() {
         names.push(format!("\"{}.example.com\"", i));
     }
     let doc = format!(
-        "allowlist = [{}]\n# trailing comment padding\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n",
-        names.join(",")
+        "allowlist = [{}]\n# trailing comment padding\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [{kinds}]\nscope = [{scopes}]\n",
+        names.join(","),
+        kinds = std::iter::repeat_n("\"flare_only\"", 32)
+            .collect::<Vec<_>>()
+            .join(", "),
+        scopes = std::iter::repeat_n("\"connection\"", 32)
+            .collect::<Vec<_>>()
+            .join(", "),
     );
     assert!(doc.len() <= config::CONFIG_DOC_LIMIT);
     let cfg = config::parse_config_document(&doc).expect("32-name allowlist fits");

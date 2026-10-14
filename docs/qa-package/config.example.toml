@@ -1,3 +1,8 @@
 allowlist = ["example.com", "www.example.net"]
 listen = "127.0.0.1:5353"
 startup_unresolved_allowance = 0
+[any_illegal]
+scope = "connection"
+[actions]
+kind = ["flare_only", "flare_only"]
+scope = ["connection", "connection"]

@@ -109,7 +109,12 @@ mkdir -p /work /out
 printf '%s\n' \
     'allowlist = ["example.com"]' \
     'listen = "127.0.0.1:8080"' \
-    'startup_unresolved_allowance = 0' > /work/config.toml
+    'startup_unresolved_allowance = 0' \
+    '[any_illegal]' \
+    'scope = "connection"' \
+    '[actions]' \
+    'kind = ["flare_only"]' \
+    'scope = ["connection"]' > /work/config.toml
 printf '%s\n' 'nameserver 127.0.0.1' > /work/resolv.conf
 # genuine CA + endpoint cert: client validates chain and SAN=example.com
 openssl req -x509 -newkey rsa:2048 -keyout /work/ca.key -out /work/ca.pem \

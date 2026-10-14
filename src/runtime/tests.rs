@@ -9,14 +9,14 @@ use crate::cache::Family;
 
 fn config(port: u16) -> crate::config::Config {
     let doc = format!(
-        "allowlist = [\"sub.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n"
+        "allowlist = [\"sub.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n"
     );
     crate::config::parse_config_document(&doc).expect("valid test config")
 }
 
 fn config_two_names(port: u16) -> crate::config::Config {
     let doc = format!(
-        "allowlist = [\"sub.example.org\", \"other.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n"
+        "allowlist = [\"sub.example.org\", \"other.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n"
     );
     crate::config::parse_config_document(&doc).expect("valid test config")
 }

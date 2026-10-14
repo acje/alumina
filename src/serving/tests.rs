@@ -2,13 +2,14 @@ use super::*;
 use std::net::{TcpListener as StdListener, TcpStream};
 use std::time::{Duration, Instant};
 
+use crate::enforcement::policy::UnknownReason;
 use crate::worker::{MAX_PENDING_SETUPS, SETUP_DEADLINE_SECS};
 
 const RETAINED_OFFSET: usize = 137;
 
 fn config(port: u16) -> crate::config::Config {
     let doc = format!(
-        "allowlist = [\"sub.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n"
+        "allowlist = [\"sub.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n"
     );
     crate::config::parse_config_document(&doc).expect("valid test config")
 }
@@ -3730,4 +3731,1111 @@ fn directional_buffer_profile_matches_the_128_mib_mandate() {
         128 * 1024 * 1024,
         "two 512 KiB buffers per tunnel across 128 slots is the 128 MiB traffic profile"
     );
+}
+
+fn serve_on_cfg(port: u16, cfg: crate::config::Config) -> Serving {
+    let storage = ServeStorage::boot(&cfg).expect("boot storage");
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), port))
+        .expect("bind listener");
+    let traffic = crate::inventory::TrafficStorage::allocate().expect("boot traffic");
+    Serving::new(storage, listener, traffic).expect("serving")
+}
+
+fn cfg_doc1(port: u16, any_scope: &str, kind: &str, action_scope: &str) -> crate::config::Config {
+    let doc = format!(
+        "allowlist = [\"sub.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"{any_scope}\"\n[actions]\nkind = [\"{kind}\"]\nscope = [\"{action_scope}\"]\n"
+    );
+    crate::config::parse_config_document(&doc).expect("valid enforcement test config")
+}
+
+fn with_serving_stack_cfg(
+    port: u16,
+    cfg: crate::config::Config,
+    body: impl FnOnce(&mut Serving) + Send + 'static,
+) {
+    let t = std::thread::Builder::new()
+        .name("serving-test".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let mut serving = serve_on_cfg(port, cfg);
+            body(&mut serving);
+        })
+        .expect("spawn serving thread");
+    t.join().expect("serving thread");
+}
+
+#[test]
+fn any_illegal_all_latches_before_further_io_stops_admission_and_closes_pending() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let mut a = connect(port);
+        a.write_all(b"CONNECT sub.example.org:44")
+            .expect("partial head A");
+        pump(serving, 20);
+        assert_eq!(
+            serving.storage().occupied(),
+            1,
+            "a partial CONNECT head must hold an admitted pending seat"
+        );
+        assert!(!serving.storage().enforcement().block_all());
+
+        let mut b = connect(port);
+        b.write_all(b"CONNECT evil.example.net:443 HTTP/1.1\r\n\r\n")
+            .expect("head B");
+        pump(serving, 30);
+        assert!(
+            serving.storage().enforcement().block_all(),
+            "the first AnyIllegal with scope all must latch before erasure"
+        );
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the latch must close the pending A seat and the offender B before any further I/O"
+        );
+
+        let bb = read_until(&mut b, b"\r\n\r\n");
+        assert!(
+            bb.is_empty(),
+            "after Block All the offender must receive no 403 and no bytes at all (EOF/RST), got {:?}",
+            bb
+        );
+
+        a.set_nonblocking(true).expect("A nonblocking");
+        let mut probe = [0u8; 8];
+        match a.read(&mut probe) {
+            Ok(0) => {}
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("pending A must be closed without a response, got {other:?}"),
+        }
+
+        serving
+            .dispatch_readiness(
+                Token(0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            )
+            .expect("stale listener readiness after the latch");
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "no admission happens after the catch-all latch"
+        );
+    });
+}
+
+fn fabric_validated_early_data(serving: &mut Serving, test_data: Option<usize>) {
+    fabric_validated_early_data_at(serving, 0, test_data);
+}
+
+fn fabric_validated_early_data_at(serving: &mut Serving, index: usize, test_data: Option<usize>) {
+    let origin = StdListener::bind("127.0.0.1:0").expect("origin bind");
+    let origin_addr = origin.local_addr().expect("origin addr");
+    let up = mio::net::TcpStream::connect(origin_addr).expect("upstream connect");
+    let _origin_stream = origin.accept().expect("accept origin side").0;
+    {
+        let ws = &mut serving.slots[index];
+        ws.approved = FixedHostname::normalize(b"sub.example.org");
+        let head_len = b"CONNECT sub.example.org:443 HTTP/1.1\r\n\r\n".len();
+        ws.head_len = head_len;
+        ws.gate.on_connect_head(head_len);
+        ws.gate.on_authorized();
+        ws.gate.on_upstream_connected();
+        ws.stage = Stage::Dialing;
+        ws.upstream = Some(up);
+    }
+    serving.register_upstream(index).expect("register upstream");
+    if let Some(n) = test_data {
+        serving.slots[index].test_reads = Vec::new();
+        serving.slots[index].test_reads = vec![Ok(n)];
+    }
+}
+
+fn fabric_relay_slot(serving: &mut Serving, index: usize, approved: &[u8], pending_down: &[u8]) {
+    let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+    let sink_addr = sink.local_addr().expect("sink addr");
+    let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+    let _sink_stream = sink.accept().expect("accept sink side").0;
+    {
+        let ws = &mut serving.slots[index];
+        ws.approved = FixedHostname::normalize(approved);
+        ws.upstream = Some(up);
+        ws.head_len = 4;
+        ws.hello_end = Some(10);
+        ws.buf_base = 0;
+        ws.buf_len = 0;
+        ws.down_off = 0;
+        ws.down[..pending_down.len()].copy_from_slice(pending_down);
+        ws.down_len = pending_down.len();
+        ws.stage = Stage::Relay;
+        ws.gate.on_connect_head(4);
+        ws.gate.on_authorized();
+        ws.gate.on_upstream_connected();
+        ws.gate.on_response_ok();
+    }
+    serving.register_upstream(index).expect("register upstream");
+}
+
+#[test]
+fn validated_early_data_applies_block_domain_and_terminates_setup() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let _client = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "boot traffic admitted");
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(serving, Some(5));
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early origin data");
+
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "early upstream data is a mandatory termination even under a Block action"
+        );
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        assert!(
+            serving.storage().enforcement().is_blocked(ordinal),
+            "Block Domain must mark the validated configured-domain ordinal"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .domain_blocks(ordinal),
+            1
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .domain_flares(ordinal),
+            0
+        );
+        assert!(
+            !serving.storage().enforcement().block_all(),
+            "Domain scope must never set the All latch"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .any_illegal_total(),
+            0,
+            "AnyIllegal counters stay untouched by a validated-domain fact"
+        );
+    });
+}
+
+#[test]
+fn validated_early_data_flare_is_reporting_only_and_setup_still_terminates() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let _client = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "boot traffic admitted");
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(serving, Some(5));
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early origin data");
+
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "FlareOnly never delays the mandatory denial"
+        );
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .domain_flares(ordinal),
+            1
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .domain_blocks(ordinal),
+            0
+        );
+        assert!(
+            !serving.storage().enforcement().is_blocked(ordinal),
+            "FlareOnly must not mark the domain blocked"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .unknown(UnknownReason::NotYetValidated),
+            0
+        );
+    });
+}
+
+#[test]
+fn prevalidated_early_data_folds_unknown_without_any_block() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let _client = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "boot traffic admitted");
+        fabric_validated_early_data(serving, Some(5));
+        serving.slots[0].hello_end = None;
+        serving.slots[0].approved = None;
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("pre-validated early data");
+
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the anomaly still terminates setup as EvidenceInsufficient"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .unknown(UnknownReason::NotYetValidated),
+            1,
+            "missing validated identity folds Unknown(NotYetValidated), never a block verdict"
+        );
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        assert!(
+            !serving.storage().enforcement().is_blocked(ordinal),
+            "EvidenceInsufficient must not mark any domain blocked"
+        );
+        assert!(
+            !serving.storage().enforcement().block_all(),
+            "EvidenceInsufficient must not set the All latch"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .domain_blocks(ordinal),
+            0
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .any_illegal_total(),
+            0,
+            "the anomaly is not AnyIllegal and carries no Block effect"
+        );
+    });
+}
+
+#[test]
+fn domain_block_refuses_future_flow_of_the_ordinal_until_restart() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        assert!(!serving.storage().enforcement().is_blocked(ordinal));
+
+        let mut evil = connect(port);
+        evil.write_all(b"CONNECT attacker.example.net:443 HTTP/1.1\r\n\r\n")
+            .expect("evil head");
+        pump(serving, 20);
+        let eb = read_until(&mut evil, b"\r\n\r\n");
+        assert!(eb.starts_with(b"HTTP/1.1 403"), "untrusted CONNECT denied");
+        assert!(
+            !serving.storage().enforcement().is_blocked(ordinal),
+            "an untrusted label must never mark a configured domain blocked"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .any_illegal(AnyIllegalCause::HostNotAllowlisted),
+            1
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .domain_blocks(ordinal),
+            0
+        );
+
+        serving.storage_mut().publish_test_a(ordinal.get());
+        let _trigger = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "pre-block peer admitted");
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(serving, Some(5));
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early data blocks the domain");
+        assert!(serving.storage().enforcement().is_blocked(ordinal));
+
+        let mut future = connect(port);
+        future
+            .write_all(b"CONNECT sub.example.org:443 HTTP/1.1\r\n\r\n")
+            .expect("future head");
+        pump(serving, 20);
+        let fb = read_until(&mut future, b"\r\n\r\n");
+        assert!(
+            fb.starts_with(b"HTTP/1.1 403"),
+            "a future flow for the blocked ordinal must be refused before any dial, got {:?}",
+            fb
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .domain_blocks(ordinal),
+            2,
+            "the future-flow refusal folds into the domain block count"
+        );
+    });
+}
+
+#[test]
+fn block_domain_closes_current_flow_with_matching_ordinal() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let _trigger_client = connect(port);
+        pump(serving, 20);
+        let mut relay_client = connect(port);
+        pump(serving, 20);
+        assert_eq!(
+            serving.storage().occupied(),
+            2,
+            "two sub.example.org flows admitted before the block"
+        );
+
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(serving, Some(5));
+        fabric_relay_slot(serving, 1, b"sub.example.org", b"PENDING-DOWN-00");
+        assert_eq!(serving.slots[1].down_len, 15, "relay has a pending payload");
+
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early data on the trigger blocks the domain");
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        assert!(serving.storage().enforcement().is_blocked(ordinal));
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the Block Domain sweep closes the current relay flow with the matching ordinal"
+        );
+
+        relay_client
+            .set_nonblocking(true)
+            .expect("client nonblocking");
+        let mut probe = [0u8; 32];
+        match relay_client.read(&mut probe) {
+            Ok(0) => {}
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(n) => panic!(
+                "the current-flow relay client must receive 0 of the pending payload, got {n} bytes {:?}",
+                &probe[..n]
+            ),
+            Err(other) => panic!("relay client read failed: {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn block_domain_does_not_touch_unrelated_current_flow() {
+    let port = ephemeral_port();
+    let doc = format!(
+        "allowlist = [\"sub.example.org\", \"trusted-other.example.net\"]\n\
+         listen = \"127.0.0.1:{port}\"\n\
+         startup_unresolved_allowance = 0\n\
+         [any_illegal]\n\
+         scope = \"connection\"\n\
+         [actions]\n\
+         kind = [\"block\", \"block\"]\n\
+         scope = [\"domain\", \"domain\"]\n"
+    );
+    let cfg = crate::config::parse_config_document(&doc).expect("two-name config");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let _trigger_client = connect(port);
+        pump(serving, 20);
+        let keep_client = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 2);
+
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(serving, Some(5));
+        fabric_relay_slot(serving, 1, b"trusted-other.example.net", b"KEEP-00");
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early data on the trigger blocks the domain");
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        assert!(serving.storage().enforcement().is_blocked(ordinal));
+        assert_eq!(
+            serving.storage().occupied(),
+            1,
+            "an unrelated current flow for a different ordinal survives the domain sweep"
+        );
+        let other = FixedHostname::normalize(b"trusted-other.example.net").expect("normalize");
+        let other_ordinal = serving
+            .storage()
+            .ordinal_for(&other)
+            .expect("other ordinal");
+        assert!(
+            !serving.storage().enforcement().is_blocked(other_ordinal),
+            "Block Domain must never mark an unrelated configured domain blocked"
+        );
+        drop(keep_client);
+        pump(serving, 5);
+    });
+}
+
+#[test]
+fn block_all_guard_refuses_pending_relay_write_after_latch() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let mut relay_client = connect(port);
+        pump(serving, 20);
+        assert_eq!(
+            serving.storage().occupied(),
+            1,
+            "relay client admitted before the latch"
+        );
+        let index = 0;
+        let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+        let sink_addr = sink.local_addr().expect("sink addr");
+        let up = mio::net::TcpStream::connect(sink_addr).expect("upstream connect");
+        let _sink_stream = sink.accept().expect("accept sink side").0;
+        {
+            let ws = &mut serving.slots[index];
+            ws.upstream = Some(up);
+            ws.head_len = 4;
+            ws.hello_end = Some(10);
+            ws.buf_base = 0;
+            ws.buf_len = 8;
+            ws.fwd = 4;
+            ws.buf[..8].copy_from_slice(b"UPSTRM00");
+            ws.down[..16].copy_from_slice(b"DOWNSTRM00XXXXXX");
+            ws.down_len = 16;
+            ws.down_off = 0;
+            ws.stage = Stage::Relay;
+            ws.gate.on_connect_head(4);
+            ws.gate.on_authorized();
+            ws.gate.on_upstream_connected();
+            ws.gate.on_response_ok();
+        }
+        serving.register_upstream(index).expect("register upstream");
+        assert_eq!(
+            serving.slots[index].buf_len, 8,
+            "a payload is pending client->upstream before the latch"
+        );
+        assert_eq!(
+            serving.slots[index].down_len, 16,
+            "a payload is pending upstream->client before the latch"
+        );
+
+        let mut evil = connect(port);
+        evil.write_all(b"CONNECT evil.example.net:443 HTTP/1.1\r\n\r\n")
+            .expect("evil head");
+        pump(serving, 40);
+        assert!(
+            serving.storage().enforcement().block_all(),
+            "the AnyIllegal All latch fires"
+        );
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the latch closed the relay slot and its pending payload"
+        );
+
+        let ctoken = client_token(serving.slots[index].slot_gen, index);
+        serving
+            .dispatch_readiness(
+                ctoken,
+                Readiness {
+                    writable: true,
+                    ..Readiness::none()
+                },
+            )
+            .expect("stale client writable handled");
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "post-latch client writable refuses instead of draining the pending payload"
+        );
+        assert!(serving.storage().enforcement().block_all());
+
+        relay_client
+            .set_nonblocking(true)
+            .expect("client nonblocking");
+        let mut probe = [0u8; 32];
+        match relay_client.read(&mut probe) {
+            Ok(0) => {}
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(n) => panic!(
+                "the relay client must receive 0 of the pending payload after Block All, got {n} bytes {:?}",
+                &probe[..n]
+            ),
+            Err(other) => panic!("relay client read failed: {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn client_writable_latch_guard_closes_live_relay_without_draining() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let mut evil = connect(port);
+        evil.write_all(b"CONNECT evil.example.net:443 HTTP/1.1\r\n\r\n")
+            .expect("evil head");
+        pump(serving, 30);
+        assert!(serving.storage().enforcement().block_all());
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the synchronous sweep closed every slot before the fault is injected"
+        );
+
+        let peer = StdListener::bind("127.0.0.1:0").expect("peer bind");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let client = mio::net::TcpStream::connect(peer_addr).expect("client connect");
+        let mut reader = peer.accept().expect("accept client").0;
+        {
+            let ws = &mut serving.slots[0];
+            ws.client = Some(client);
+            ws.down_off = 0;
+            ws.down[..16].copy_from_slice(b"DOWNSTRM00XXXXXX");
+            ws.down_len = 16;
+            ws.stage = Stage::Relay;
+            ws.gate.on_connect_head(4);
+            ws.gate.on_authorized();
+            ws.gate.on_upstream_connected();
+            ws.gate.on_response_ok();
+            ws.hello_end = Some(10);
+        }
+        assert!(
+            serving.slots[0].client.is_some() && matches!(serving.slots[0].stage, Stage::Relay),
+            "the fault-injected relay slot is live after the sweep"
+        );
+
+        let ctoken = client_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                ctoken,
+                Readiness {
+                    writable: true,
+                    ..Readiness::none()
+                },
+            )
+            .expect("post-latch client writable handled through the guard");
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Idle | Stage::Closing),
+            "the latch guard must close the live slot without any I/O"
+        );
+        assert!(
+            serving.slots[0].client.is_none(),
+            "the latch guard released the fault-injected slot"
+        );
+
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        let mut probe = [0u8; 32];
+        match reader.read(&mut probe) {
+            Ok(0) => {}
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(n) => panic!(
+                "the post-latch client-writable guard must not drain the pending payload, got {n} bytes"
+            ),
+            Err(other) => panic!("reader read failed: {other:?}"),
+        }
+        drop(evil);
+    });
+}
+
+#[test]
+fn accept_all_latch_guard_holds_with_listener_re_attached() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let mut evil = connect(port);
+        evil.write_all(b"CONNECT evil.example.net:443 HTTP/1.1\r\n\r\n")
+            .expect("evil head");
+        pump(serving, 30);
+        assert!(serving.storage().enforcement().block_all());
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the latch closed every admitted flow before the fault is injected"
+        );
+
+        let back_port = ephemeral_port();
+        let listener = TcpListener::bind(SocketAddr::new(
+            IpAddr::V4([127, 0, 0, 1].into()),
+            back_port,
+        ))
+        .expect("re-attach bind");
+        serving
+            .attach_listener(listener)
+            .expect("attach listener after the latch");
+        let pending = connect(back_port);
+        std::thread::sleep(Duration::from_millis(20));
+        serving.progress.work_since_recheck = 0;
+        serving
+            .dispatch_readiness(
+                Token(0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            )
+            .expect("post-latch listener readiness handled through the guard");
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the accept_all latch guard must hold admission even with a live listener and a pending connection"
+        );
+        drop(pending);
+        drop(evil);
+    });
+}
+
+#[test]
+fn internal_missing_approval_is_unknown_closes_locally_and_unrelated_flow_survives() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let wire = hello_wire(b"sub.example.org", false);
+        {
+            let ws = &mut serving.slots[0];
+            ws.buf_base = 0;
+            ws.buf_len = wire.len();
+            ws.buf[..wire.len()].copy_from_slice(&wire);
+            ws.parse_rel = 0;
+            ws.insp_rel = 0;
+            ws.head_len = 0;
+            ws.hello_end = None;
+            ws.hello_consumed = 0;
+            ws.fwd = 0;
+            ws.approved = None;
+            ws.stage = Stage::ValidatingHello;
+            ws.gate.on_connect_head(0);
+            ws.gate.on_authorized();
+            ws.gate.on_upstream_connected();
+            ws.gate.on_response_ok();
+        }
+        fabric_relay_slot(serving, 1, b"sub.example.org", b"KEEP-00");
+        serving
+            .buffer_and_validate(0, &[])
+            .expect("complete hello inspection without an approved identity");
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Idle),
+            "the internal-fault slot closes locally"
+        );
+        assert!(
+            matches!(serving.slots[1].stage, Stage::Relay),
+            "an unrelated live flow survives the internal absence"
+        );
+        assert!(
+            !serving.storage().enforcement().block_all(),
+            "missing approved evidence must never latch Block All"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .any_illegal_total(),
+            0,
+            "no AnyIllegal folds for absent approved evidence"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .unknown(UnknownReason::MissingParseResult),
+            1,
+            "the absent approved evidence folds exactly one truthful Unknown"
+        );
+    });
+}
+
+#[test]
+fn internal_missing_complete_hello_is_unknown_and_never_latches() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        {
+            let ws = &mut serving.slots[0];
+            ws.approved = FixedHostname::normalize(b"sub.example.org");
+            ws.stage = Stage::ValidatingHello;
+            ws.gate.on_connect_head(0);
+            ws.gate.on_authorized();
+            ws.gate.on_upstream_connected();
+            ws.gate.on_response_ok();
+        }
+        serving
+            .hello_complete(0)
+            .expect("complete inspection without a hello result");
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Idle),
+            "the internal-fault slot closes locally"
+        );
+        assert!(
+            !serving.storage().enforcement().block_all(),
+            "missing complete-hello evidence must never latch Block All"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .any_illegal_total(),
+            0,
+            "no AnyIllegal folds for absent hello-result evidence"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .unknown(UnknownReason::MissingParseResult),
+            1,
+            "the absent hello result folds exactly one truthful Unknown"
+        );
+    });
+}
+
+#[test]
+fn genuine_malformed_hello_still_projects_any_illegal_and_latches_scope_all() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let wire = hello_wire(b"evil.example.net", false);
+        let mut insp = ChInspector::new();
+        assert!(matches!(insp.feed(&wire), Ok(Inspect::Complete { .. })));
+        let approved = FixedHostname::normalize(b"sub.example.org");
+        assert_eq!(
+            client_hello::validate(
+                insp.hello().expect("parsed hello"),
+                &approved.expect("approx")
+            ),
+            Err(client_hello::ChError::ServerNameMismatch),
+            "the fixture must fail validation only on the SNI, not on parsing"
+        );
+        drive_hello(serving, &wire, "sub.example.org");
+        assert!(
+            serving.storage().enforcement().block_all(),
+            "a genuine malformed-hello denial must still latch Block All at scope all"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .any_illegal(AnyIllegalCause::TlsProfile(
+                    HelloRejectReason::ServerNameMismatch
+                )),
+            1,
+            "the genuine denial folds as AnyIllegal by its exact hello-reject discriminant"
+        );
+        assert_eq!(
+            serving.storage().enforcement().counters().unknown_total(),
+            0,
+            "no Unknown folds for a genuine malformed-client denial"
+        );
+    });
+}
+
+#[cfg(feature = "alloc-witness")]
+fn enforcement_witness_thread(body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name("enforcement-alloc-witness".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(body)
+        .expect("spawn enforcement alloc witness")
+        .join()
+        .expect("enforcement alloc witness thread");
+}
+
+#[cfg(all(test, feature = "alloc-witness"))]
+#[test]
+fn block_all_latch_closure_spends_zero_allocations() {
+    enforcement_witness_thread(|| {
+        let port = ephemeral_port();
+        let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+        let mut serving = serve_on_cfg(port, cfg);
+        let mut pending = connect(port);
+        pending
+            .write_all(b"CONNECT sub.example.org:44")
+            .expect("partial head A");
+        pump(&mut serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "pending seat admitted");
+
+        let mut relay_client = connect(port);
+        pump(&mut serving, 20);
+        assert_eq!(serving.storage().occupied(), 2, "relay client admitted");
+        fabric_relay_slot(&mut serving, 1, b"sub.example.org", b"DOWNSTRM00XXXXXX");
+        assert!(
+            serving.slots[1].down_len > 0,
+            "the relay slot holds a pending downstream payload"
+        );
+        assert!(
+            serving.slots[1].upstream.is_some() && serving.slots[1].client.is_some(),
+            "the relay slot owns live client and upstream sockets"
+        );
+
+        let mut evil = connect(port);
+        evil.write_all(b"CONNECT evil.example.net:443 HTTP/1.1\r\n\r\n")
+            .expect("head B");
+
+        let (_, counts) = crate::alloc::run_phase(crate::alloc::Phase::Serving, || {
+            pump(&mut serving, 30);
+            assert!(
+                serving.storage().enforcement().block_all(),
+                "the AnyIllegal All latch fires"
+            );
+            assert_eq!(
+                serving.storage().occupied(),
+                0,
+                "Block All closes the pending seat and the live relay slot"
+            );
+        });
+        assert!(
+            counts.all_zero(),
+            "the Block-All latch closure over real occupied slots must allocate/deallocate nothing: {counts:?}"
+        );
+
+        relay_client
+            .set_nonblocking(true)
+            .expect("client nonblocking");
+        let mut probe = [0u8; 32];
+        match relay_client.read(&mut probe) {
+            Ok(0) => {}
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(n) => panic!(
+                "the live relay client must receive 0 of the pending payload after Block All, got {n} bytes"
+            ),
+            Err(other) => panic!("relay client read failed: {other:?}"),
+        }
+        drop(evil);
+        drop(relay_client);
+        drop(pending);
+    });
+}
+
+#[cfg(all(test, feature = "alloc-witness"))]
+#[test]
+fn block_domain_current_flow_close_spends_zero_allocations() {
+    enforcement_witness_thread(|| {
+        let port = ephemeral_port();
+        let cfg = cfg_doc1(port, "connection", "block", "domain");
+        let mut serving = serve_on_cfg(port, cfg);
+        let _trigger_client = connect(port);
+        pump(&mut serving, 20);
+        let _relay_client = connect(port);
+        pump(&mut serving, 20);
+        assert_eq!(
+            serving.storage().occupied(),
+            2,
+            "two sub.example.org flows admitted before the block"
+        );
+
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(&mut serving, Some(5));
+        fabric_relay_slot(&mut serving, 1, b"sub.example.org", b"PENDING-DOWN-00");
+
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        let (_, counts) = crate::alloc::run_phase(crate::alloc::Phase::Serving, || {
+            serving
+                .dispatch_readiness(
+                    token,
+                    Readiness {
+                        readable: true,
+                        writable: false,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("early data blocks the domain");
+            assert_eq!(
+                serving.storage().occupied(),
+                0,
+                "the Block Domain sweep closes the matching current flow"
+            );
+        });
+        assert!(
+            counts.all_zero(),
+            "the Block-Domain current-flow closure must allocate/deallocate nothing: {counts:?}"
+        );
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        assert!(serving.storage().enforcement().is_blocked(ordinal));
+    });
+}
+
+#[cfg(all(test, feature = "alloc-witness"))]
+#[test]
+fn early_data_projection_spends_zero_allocations() {
+    enforcement_witness_thread(|| {
+        let port = ephemeral_port();
+        let cfg = cfg_doc1(port, "connection", "block", "domain");
+        let mut serving = serve_on_cfg(port, cfg);
+        let _client = connect(port);
+        pump(&mut serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "boot traffic admitted");
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(&mut serving, Some(5));
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+
+        let (_, counts) = crate::alloc::run_phase(crate::alloc::Phase::Serving, || {
+            serving
+                .dispatch_readiness(
+                    token,
+                    Readiness {
+                        readable: true,
+                        writable: false,
+                        ..Readiness::none()
+                    },
+                )
+                .expect("early origin data projects");
+            assert_eq!(
+                serving.storage().occupied(),
+                0,
+                "early upstream data terminates setup"
+            );
+            let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+            let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+            assert!(
+                serving.storage().enforcement().is_blocked(ordinal),
+                "validated early data marks the ordinal blocked"
+            );
+            assert_eq!(
+                serving
+                    .storage()
+                    .enforcement()
+                    .counters()
+                    .domain_blocks(ordinal),
+                1
+            );
+        });
+        assert!(
+            counts.all_zero(),
+            "the early-data projection and close must allocate/deallocate nothing: {counts:?}"
+        );
+    });
+}
+
+#[cfg(all(test, feature = "alloc-witness"))]
+#[test]
+fn block_all_storm_sweeps_128_slots_alloc_free() {
+    enforcement_witness_thread(|| {
+        let port = ephemeral_port();
+        let cfg = cfg_doc1(port, "all", "flare_only", "connection");
+        let mut serving = serve_on_cfg(port, cfg);
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        for ws in serving.slots.iter_mut() {
+            ws.approved = Some(approved);
+            ws.stage = Stage::Dialing;
+        }
+        let (_, counts) = crate::alloc::run_phase(crate::alloc::Phase::Serving, || {
+            let effect = serving.any_illegal(0, AnyIllegalCause::HostNotAllowlisted);
+            assert!(
+                matches!(effect, Effect::Block { scope: Scope::All }),
+                "the storm trigger latches Block All"
+            );
+            assert!(
+                serving
+                    .slots
+                    .iter()
+                    .all(|s| s.stage == Stage::Idle || s.stage == Stage::Closing),
+                "the Block-All sweep must recycle every one of the 128 occupied workspaces"
+            );
+        });
+        assert!(
+            counts.all_zero(),
+            "the 128-slot Block-All storm sweep must allocate/deallocate nothing: {counts:?}"
+        );
+    });
 }

@@ -1065,6 +1065,14 @@ mod tests {
     use crate::config::ALLOWLIST_MAX;
     use crate::config::CONFIG_DOC_LIMIT;
 
+    fn push_compact_group(doc: &mut String, count: usize) {
+        let kinds = vec!["\"block\""; count].join(", ");
+        let scopes = vec!["\"all\""; count].join(", ");
+        doc.push_str(&format!(
+            "[any_illegal]\nscope = \"all\"\n[actions]\nkind = [{kinds}]\nscope = [{scopes}]\n"
+        ));
+    }
+
     const _: () = assert!(SLOT_BYTES > CONFIG_DOC_LIMIT + ALLOWLIST_MAX * 64 + 512);
 
     use std::fs::File;
@@ -1166,7 +1174,7 @@ mod tests {
         use crate::startup_dns::FailureReason;
         let first = b"abcdefghijklmnopqrstuvwxyz0123456789-";
         let d = "b".repeat(62);
-        let e = "c".repeat(53);
+        let e = "c".repeat(35);
         let mut doc = String::new();
         doc.push_str("allowlist = [\n");
         let mut names: Vec<String> = Vec::new();
@@ -1177,6 +1185,7 @@ mod tests {
             names.push(name);
         }
         doc.push_str("]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n");
+        push_compact_group(&mut doc, ALLOWLIST_MAX);
         assert!(
             doc.len() <= CONFIG_DOC_LIMIT,
             "worst-case config fits the documented 4096-byte bound: {}",

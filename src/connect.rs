@@ -75,6 +75,54 @@ impl fmt::Display for ConnectError {
     }
 }
 
+/// The payload-less finite discriminant of a CONNECT-head parse rejection.
+/// The projected kind is keyed only by variant identity — never by an
+/// attacker-controlled port, length, or detail string — so per-cause
+/// capture/fold stays bounded and exact-in-kind while defensive payloads are
+/// erased at the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnectHeadReason {
+    TooLong,
+    NotHttp,
+    MalformedRequestLine,
+    BareLineFeed,
+    ObsFold,
+    InvalidHostname,
+    WrongPort,
+    TransferEncoding,
+    NonzeroContentLength,
+    DuplicateContentLength,
+}
+
+impl ConnectHeadReason {
+    /// Projects a [`ConnectError`] onto its finite discriminant, dropping the
+    /// attacker-supplied payload (`got` width / length / detail string).
+    pub fn from_connect_error(err: &ConnectError) -> ConnectHeadReason {
+        use ConnectError as E;
+        match err {
+            E::TooLong => ConnectHeadReason::TooLong,
+            E::NotHttp => ConnectHeadReason::NotHttp,
+            E::MalformedRequestLine { .. } => ConnectHeadReason::MalformedRequestLine,
+            E::BareLineFeed => ConnectHeadReason::BareLineFeed,
+            E::ObsFold => ConnectHeadReason::ObsFold,
+            E::InvalidHostname { .. } => ConnectHeadReason::InvalidHostname,
+            E::WrongPort { .. } => ConnectHeadReason::WrongPort,
+            E::TransferEncoding => ConnectHeadReason::TransferEncoding,
+            E::NonzeroContentLength { .. } => ConnectHeadReason::NonzeroContentLength,
+            E::DuplicateContentLength => ConnectHeadReason::DuplicateContentLength,
+        }
+    }
+
+    /// The zero-based index into a fixed per-discriminant counter array.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The number of finite CONNECT-head discriminants.
+    pub const COUNT: usize = 10;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Feed {
@@ -375,7 +423,7 @@ mod tests {
 
     fn config() -> Config {
         parse_config_document(
-            "allowlist = [\"sub.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n",
+            "allowlist = [\"sub.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
         )
         .expect("valid config")
     }

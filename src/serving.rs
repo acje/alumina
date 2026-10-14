@@ -44,10 +44,12 @@ use mio::{Events, Interest, Poll, Registry, Token};
 
 use signal_hook::consts::SIGTERM;
 
-use crate::client_hello::{self, ChInspector, Inspect};
+use crate::client_hello::{self, ChInspector, HelloRejectReason, Inspect};
 use crate::config::FixedHostname;
-use crate::connect::{ConnectParser, Feed};
+use crate::connect::{ConnectHeadReason, ConnectParser, Feed};
 use crate::eligibility::NumericAddr;
+use crate::enforcement::action::{DomainOrdinal, FirstSlot, Scope};
+use crate::enforcement::policy::{AnyIllegalCause, Effect, Violation};
 use crate::gate::{Activity, TunnelGate, UpstreamWrite, ValidatedHello};
 use crate::log::{ActivityKind, RejectReason};
 use crate::serve::ServeStorage;
@@ -402,6 +404,7 @@ struct SlotWorkspace {
     inspector: ChInspector,
     gate: TunnelGate,
     approved: Option<FixedHostname>,
+    first_slot: FirstSlot,
     stage: Stage,
     buf: Box<[u8]>,
     buf_base: usize,
@@ -437,6 +440,7 @@ impl SlotWorkspace {
             inspector: ChInspector::new(),
             gate: TunnelGate::new(),
             approved: None,
+            first_slot: FirstSlot::new(),
             stage: Stage::Idle,
             buf: up,
             buf_base: 0,
@@ -480,6 +484,7 @@ impl SlotWorkspace {
         self.inspector = ChInspector::new();
         self.gate = TunnelGate::new();
         self.approved = None;
+        self.first_slot = FirstSlot::new();
         self.stage = Stage::Idle;
         self.buf_len = 0;
         self.buf_base = 0;
@@ -1200,6 +1205,10 @@ impl Serving {
 
     fn accept_all(&mut self) -> Result<(), ServeError> {
         loop {
+            if self.block_all_latched() {
+                self.progress.accrue(1);
+                return Ok(());
+            }
             if self.recheck_due() {
                 self.reregister_listener()?;
                 return Ok(());
@@ -1416,6 +1425,9 @@ impl Serving {
     }
 
     fn client_readable(&mut self, index: usize) -> Result<(), ServeError> {
+        if self.clamp_on_latch(index) {
+            return Ok(());
+        }
         loop {
             if self.visit_exhausted(index) {
                 self.reschedule(index);
@@ -1435,8 +1447,16 @@ impl Serving {
             }
             if self.buf_room(index) < CHUNK {
                 match self.slots[index].stage {
-                    Stage::ReadingConnect => self.refuse(index, Refusal::BadRequest),
-                    Stage::ValidatingHello => self.reject_hello(index)?,
+                    Stage::ReadingConnect => {
+                        self.any_illegal(
+                            index,
+                            AnyIllegalCause::ConnectParse(ConnectHeadReason::TooLong),
+                        );
+                        self.refuse(index, Refusal::BadRequest);
+                    }
+                    Stage::ValidatingHello => {
+                        self.reject_hello(index, HelloRejectReason::Profile)?
+                    }
                     _ => {}
                 }
                 return Ok(());
@@ -1540,26 +1560,127 @@ impl Serving {
                 self.run_decision(index)
             }
             Ok(Feed::Incomplete) => Ok(()),
-            Err(_) => {
+            Err(err) => {
+                self.any_illegal(
+                    index,
+                    AnyIllegalCause::ConnectParse(ConnectHeadReason::from_connect_error(&err)),
+                );
                 self.refuse(index, Refusal::BadRequest);
                 Ok(())
             }
         }
     }
 
+    fn block_all_latched(&self) -> bool {
+        self.storage.enforcement().block_all()
+    }
+
+    fn clamp_on_latch(&mut self, index: usize) -> bool {
+        if !self.block_all_latched() {
+            return false;
+        }
+        if self.slots[index].stage != Stage::Idle && self.slots[index].stage != Stage::Closing {
+            self.close_slot(index);
+        }
+        true
+    }
+
+    fn stop_block_all(&mut self) {
+        if !self.block_all_latched() {
+            return;
+        }
+        self.stop_admission_latched();
+        for index in 0..self.slots.len() {
+            if self.slots[index].stage != Stage::Idle && self.slots[index].stage != Stage::Closing {
+                self.close_slot(index);
+            }
+        }
+    }
+
+    fn stop_admission_latched(&mut self) {
+        let _ = self.stop_admission();
+    }
+
+    fn stop_domain_block(&mut self, ordinal: DomainOrdinal, except: usize) {
+        for index in 0..self.slots.len() {
+            if index != except
+                && self.slots[index].stage != Stage::Idle
+                && self.slots[index].stage != Stage::Closing
+                && self.slot_ordinal(index) == Some(ordinal)
+            {
+                self.close_slot(index);
+            }
+        }
+    }
+
+    fn slot_ordinal(&self, index: usize) -> Option<DomainOrdinal> {
+        self.slots[index]
+            .approved
+            .as_ref()
+            .and_then(|host| self.storage.ordinal_for(host))
+    }
+
+    fn any_illegal(&mut self, index: usize, cause: AnyIllegalCause) -> Effect {
+        let violation = Violation::AnyIllegal { cause };
+        let effect = {
+            let slot = &mut self.slots[index];
+            let en = self.storage.enforcement_mut();
+            en.decide(&mut slot.first_slot, violation)
+        };
+        if matches!(effect, Effect::Block { scope: Scope::All }) {
+            self.stop_block_all();
+        }
+        effect
+    }
+
+    fn project_tripwire(&mut self, index: usize, violation: Violation) -> Effect {
+        let effect = {
+            let slot = &mut self.slots[index];
+            let en = self.storage.enforcement_mut();
+            en.decide(&mut slot.first_slot, violation)
+        };
+        match effect {
+            Effect::Block { scope: Scope::All } => self.stop_block_all(),
+            Effect::Block {
+                scope: Scope::Domain,
+            } => {
+                if let Violation::EarlyUpstreamData { ordinal } = violation {
+                    self.stop_domain_block(ordinal, index);
+                }
+            }
+            _ => {}
+        }
+        effect
+    }
+
     fn run_decision(&mut self, index: usize) -> Result<(), ServeError> {
         let Some(slot) = self.slots[index].handle.as_ref() else {
             return Ok(());
         };
-        let Some(request) = self.slots[index]
-            .parser
-            .result()
-            .copied()
-            .and_then(Result::ok)
-        else {
-            self.refuse(index, Refusal::BadRequest);
-            return Ok(());
+        let request = match self.slots[index].parser.result().copied() {
+            Some(Ok(request)) => request,
+            Some(Err(err)) => {
+                self.any_illegal(
+                    index,
+                    AnyIllegalCause::ConnectParse(ConnectHeadReason::from_connect_error(&err)),
+                );
+                self.refuse(index, Refusal::BadRequest);
+                return Ok(());
+            }
+            None => {
+                self.project_tripwire(index, Violation::MissingParseResult);
+                self.close_slot(index);
+                return Ok(());
+            }
         };
+        let approved = *request.fixed_hostname();
+        if let Some(ordinal) = self.storage.ordinal_for(&approved)
+            && self.storage.enforcement().is_blocked(ordinal)
+        {
+            self.storage.enforcement_mut().note_domain_block(ordinal);
+            self.refuse(index, Refusal::Forbidden);
+            return Ok(());
+        }
         let now = Instant::now();
         let phase = self
             .storage
@@ -1570,6 +1691,7 @@ impl Serving {
                 Ok(())
             }
             Ok(ConnectPhase::Forbidden) => {
+                self.any_illegal(index, AnyIllegalCause::HostNotAllowlisted);
                 self.refuse(index, Refusal::Forbidden);
                 Ok(())
             }
@@ -1583,7 +1705,7 @@ impl Serving {
             }
             Ok(ConnectPhase::Peer { addr, .. }) => {
                 let slot = &mut self.slots[index];
-                slot.approved = Some(*request.fixed_hostname());
+                slot.approved = Some(approved);
                 slot.gate.on_authorized();
                 slot.stage = Stage::Dialing;
                 self.dial(index, addr)
@@ -1613,6 +1735,9 @@ impl Serving {
     }
 
     fn upstream_writable(&mut self, index: usize) -> Result<(), ServeError> {
+        if self.clamp_on_latch(index) {
+            return Ok(());
+        }
         match self.slots[index].stage {
             Stage::Dialing => match self.upstream_connectedness(index) {
                 ConnectState::Pending => Ok(()),
@@ -1658,6 +1783,9 @@ impl Serving {
     }
 
     fn upstream_readable(&mut self, index: usize) -> Result<(), ServeError> {
+        if self.clamp_on_latch(index) {
+            return Ok(());
+        }
         if self.slots[index].gate.is_open() {
             return self.relay_upstream_to_client(index);
         }
@@ -1701,15 +1829,35 @@ impl Serving {
             self.note_op(index, 0);
             match outcome {
                 ReadOutcome::Activity(activity) => {
-                    let ws = &mut self.slots[index];
-                    ws.gate.observe_upstream_activity(activity);
                     let activity_kind = match activity {
                         Activity::Data => ActivityKind::Data,
                         Activity::Eof => ActivityKind::Eof,
                         Activity::Reset => ActivityKind::Reset,
                     };
-                    let approved = ws.approved;
-                    let peer = ws.upstream.as_ref().and_then(|u| u.peer_addr().ok());
+                    let approved = self.slots[index].approved;
+                    let validated = self.slots[index].hello_end.is_some();
+                    {
+                        let ws = &mut self.slots[index];
+                        ws.gate.observe_upstream_activity(activity);
+                    }
+                    if activity == Activity::Data {
+                        let violation = if validated {
+                            match approved {
+                                Some(host) => match self.storage.ordinal_for(&host) {
+                                    Some(ordinal) => Violation::EarlyUpstreamData { ordinal },
+                                    None => Violation::Unattributed,
+                                },
+                                None => Violation::Unattributed,
+                            }
+                        } else {
+                            Violation::EvidenceInsufficient
+                        };
+                        self.project_tripwire(index, violation);
+                    }
+                    let peer = self.slots[index]
+                        .upstream
+                        .as_ref()
+                        .and_then(|u| u.peer_addr().ok());
                     let secs = self.storage.cache_secs(Instant::now());
                     let hostname = approved.as_ref().map(|h| h.as_str());
                     self.storage
@@ -1760,7 +1908,7 @@ impl Serving {
             }
         };
         match inspection {
-            Err(_) => self.reject_hello(index),
+            Err(err) => self.reject_hello(index, HelloRejectReason::from_ch_error(&err)),
             Ok(Inspect::NeedMore) => Ok(()),
             Ok(Inspect::Complete { consumed }) => {
                 self.slots[index].hello_consumed = consumed;
@@ -1772,7 +1920,11 @@ impl Serving {
     fn hello_complete(&mut self, index: usize) -> Result<(), ServeError> {
         let approved = match self.slots[index].approved {
             Some(approved) => approved,
-            None => return self.reject_hello(index),
+            None => {
+                self.project_tripwire(index, Violation::MissingParseResult);
+                self.close_slot(index);
+                return Ok(());
+            }
         };
         let verdict = self.slots[index]
             .inspector
@@ -1780,7 +1932,14 @@ impl Serving {
             .map(|hello| client_hello::validate(hello, &approved));
         let accepted = match verdict {
             Some(Ok(accepted)) => accepted,
-            _ => return self.reject_hello(index),
+            Some(Err(err)) => {
+                return self.reject_hello(index, HelloRejectReason::from_ch_error(&err));
+            }
+            None => {
+                self.project_tripwire(index, Violation::MissingParseResult);
+                self.close_slot(index);
+                return Ok(());
+            }
         };
         let ws = &mut self.slots[index];
         let end = ws.head_len + ws.hello_consumed;
@@ -2010,6 +2169,9 @@ impl Serving {
     }
 
     fn client_writable(&mut self, index: usize) -> Result<(), ServeError> {
+        if self.clamp_on_latch(index) {
+            return Ok(());
+        }
         match self.slots[index].stage {
             Stage::SendingConnected => {
                 self.flush_down(index);

@@ -242,7 +242,7 @@ pub struct Config {
     allowlist: Allowlist,
     listen: ListenAddr,
     startup_unresolved_allowance: u8,
-    control: Option<ControlTable>,
+    control: ControlTable,
 }
 
 impl Config {
@@ -258,12 +258,8 @@ impl Config {
         self.startup_unresolved_allowance
     }
 
-    /// The configured tripwire control table. `None` when the reserved
-    /// enforcement group is absent from the document, which means the
-    /// pre-existing baseline enforcement (AnyIllegal offender-scoped
-    /// mandatory denial, no per-domain action, no All latch).
-    pub fn control(&self) -> Option<&ControlTable> {
-        self.control.as_ref()
+    pub fn control(&self) -> &ControlTable {
+        &self.control
     }
 }
 
@@ -479,34 +475,25 @@ fn from_table(table: toml::Table) -> Result<Config, ConfigError> {
             });
         }
     }
-    let any_illegal = table.get("any_illegal");
-    let actions = table.get("actions");
-    let group_present = any_illegal.is_some() || actions.is_some();
-    if group_present && any_illegal.is_none() {
-        return Err(ConfigError::MissingField("any_illegal".to_owned()));
-    }
-    if group_present && actions.is_none() {
-        return Err(ConfigError::MissingField("actions".to_owned()));
-    }
+    let any_illegal = table
+        .get("any_illegal")
+        .ok_or_else(|| ConfigError::MissingField("any_illegal".to_owned()))?;
+    let actions = table
+        .get("actions")
+        .ok_or_else(|| ConfigError::MissingField("actions".to_owned()))?;
     let allowlist = build_allowlist(allowlist_names)?;
     let listen = parse_listen(&listen)?;
     if allowance < 0 || allowance as usize >= allowlist.len() {
         return Err(ConfigError::AllowanceOutOfRange { value: allowance });
     }
-    let control = match (any_illegal, actions) {
-        (Some(any_value), Some(actions_value)) => {
-            let any_scope = parse_any_illegal(any_value)?;
-            let domain_actions = parse_actions(actions_value, allowlist.len())?;
-            let Some(control) = ControlTable::new(any_scope, &domain_actions) else {
-                return Err(ConfigError::ActionsLengthMismatch {
-                    got_kind: domain_actions.len(),
-                    got_scope: domain_actions.len(),
-                    expected: ALLOWLIST_MAX,
-                });
-            };
-            Some(control)
-        }
-        _ => None,
+    let any_scope = parse_any_illegal(any_illegal)?;
+    let domain_actions = parse_actions(actions, allowlist.len())?;
+    let Some(control) = ControlTable::new(any_scope, &domain_actions) else {
+        return Err(ConfigError::ActionsLengthMismatch {
+            got_kind: domain_actions.len(),
+            got_scope: domain_actions.len(),
+            expected: ALLOWLIST_MAX,
+        });
     };
     Ok(Config {
         allowlist,
@@ -731,10 +718,13 @@ mod enforcement_config_tests {
     }
 
     #[test]
-    fn absent_group_means_baseline_enforcement() {
-        let cfg =
-            parse_config_document(&base("\"sub.example.org\"")).expect("baseline config valid");
-        assert!(cfg.control().is_none());
+    fn missing_enforcement_group_fails() {
+        let err =
+            parse_config_document(&base("\"sub.example.org\"")).expect_err("group is mandatory");
+        assert!(
+            matches!(&err, ConfigError::MissingField(f) if f == "any_illegal"),
+            "expected MissingField(any_illegal), got {err:?}"
+        );
     }
 
     #[test]
@@ -746,7 +736,7 @@ mod enforcement_config_tests {
             "[\"domain\", \"connection\"]",
         );
         let cfg = parse_config_document(&doc).expect("valid enforcement config");
-        let control = cfg.control().expect("group present");
+        let control = cfg.control();
         assert_eq!(control.any_illegal(), AnyIllegalScope::All);
         assert_eq!(control.len(), 2);
         let first = control
@@ -765,10 +755,7 @@ mod enforcement_config_tests {
     fn accepts_any_illegal_connection_scope() {
         let doc = group("\"a.example\"", "connection", "[\"block\"]", "[\"domain\"]");
         let cfg = parse_config_document(&doc).expect("connection scope valid");
-        assert_eq!(
-            cfg.control().expect("group").any_illegal(),
-            AnyIllegalScope::Connection
-        );
+        assert_eq!(cfg.control().any_illegal(), AnyIllegalScope::Connection);
     }
 
     #[test]
@@ -894,6 +881,84 @@ mod enforcement_config_tests {
         );
         let cfg = parse_config_document(&doc).expect("fits and parses");
         assert_eq!(cfg.allowlist().len(), 32);
-        assert_eq!(cfg.control().expect("group").len(), 32);
+        assert_eq!(cfg.control().len(), 32);
+    }
+
+    fn hundred_byte_names(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("\"n{i:02}.{}.{}\"", "a".repeat(48), "b".repeat(47)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn full_group_document(count: usize, any_scope: &str, kind: &str, scope: &str) -> String {
+        let names = hundred_byte_names(count);
+        let kinds = std::iter::repeat_n(format!("\"{kind}\""), count)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let scopes = std::iter::repeat_n(format!("\"{scope}\""), count)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "allowlist = [{names}]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"{any_scope}\"\n[actions]\nkind = [{kinds}]\nscope = [{scopes}]\n"
+        )
+    }
+
+    #[test]
+    fn flare_connection_32_hundred_byte_names_are_rejected_oversized() {
+        let doc = full_group_document(32, "connection", "flare_only", "connection");
+        assert!(
+            doc.len() > CONFIG_DOC_LIMIT,
+            "the longer spelling's measured total is {}",
+            doc.len()
+        );
+        let err = parse_config_document(&doc).expect_err("oversized doc must be rejected");
+        assert!(
+            matches!(&err, ConfigError::OversizedDocument { got, limit } if *limit == CONFIG_DOC_LIMIT && *got == doc.len()),
+            "expected OversizedDocument for {} bytes, got {err:?}",
+            doc.len()
+        );
+    }
+
+    #[test]
+    fn flare_connection_29_hundred_byte_names_fit_and_parse() {
+        let doc = full_group_document(29, "connection", "flare_only", "connection");
+        assert!(
+            doc.len() <= CONFIG_DOC_LIMIT,
+            "29-name longer spelling fits 4096 bytes (len {})",
+            doc.len()
+        );
+        let cfg = parse_config_document(&doc).expect("fits and parses");
+        assert_eq!(cfg.allowlist().len(), 29);
+        assert_eq!(cfg.control().len(), 29);
+    }
+
+    #[test]
+    fn compact_32_hundred_byte_names_measured_total_is_4061() {
+        let doc = full_group_document(32, "all", "block", "domain");
+        assert_eq!(doc.len(), 4061, "compact 32-name measured total");
+        let cfg = parse_config_document(&doc).expect("fits and parses");
+        assert_eq!(cfg.allowlist().len(), 32);
+        assert_eq!(cfg.control().len(), 32);
+    }
+
+    #[test]
+    fn flare_connection_32_hundred_byte_names_measured_total_is_4356() {
+        let doc = full_group_document(32, "connection", "flare_only", "connection");
+        assert_eq!(doc.len(), 4356, "longer 32-name measured total");
+        let err = parse_config_document(&doc).expect_err("oversized doc must be rejected");
+        assert!(
+            matches!(&err, ConfigError::OversizedDocument { got, limit } if *limit == CONFIG_DOC_LIMIT && *got == 4356),
+            "expected OversizedDocument for 4356 bytes, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn flare_connection_29_hundred_byte_names_measured_total_is_3960() {
+        let doc = full_group_document(29, "connection", "flare_only", "connection");
+        assert_eq!(doc.len(), 3960, "29-name longer spelling measured total");
+        let cfg = parse_config_document(&doc).expect("fits and parses");
+        assert_eq!(cfg.allowlist().len(), 29);
+        assert_eq!(cfg.control().len(), 29);
     }
 }

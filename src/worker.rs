@@ -661,7 +661,7 @@ mod tests {
     use crate::connect::ConnectParser;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    const CONFIG: &str = "allowlist = [\"sub.example.org\", \"second.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n";
+    const CONFIG: &str = "allowlist = [\"sub.example.org\", \"second.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
 
     fn config() -> Config {
         parse_config_document(CONFIG).expect("valid config")

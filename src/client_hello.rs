@@ -163,6 +163,62 @@ impl fmt::Display for ChError {
     }
 }
 
+/// The payload-less finite discriminant of a ClientHello rejection: it covers
+/// the enumerated identity/profile catalog — ECH, SNI mismatch, missing-or-
+/// malformed SNI, and the TLS-profile/framing rejections — keyed only by
+/// variant identity, never by an attacker-supplied extension id or detail
+/// string, so per-cause capture/fold stays bounded and exact-in-kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HelloRejectReason {
+    EchPresent,
+    ServerNameMismatch,
+    InvalidServerName,
+    Profile,
+}
+
+impl HelloRejectReason {
+    /// Projects a [`ChError`] onto its finite discriminant. The SNI-missing /
+    /// malformed / duplicate / illegal-name cases all share the
+    /// `InvalidServerName` kind; record/version/extension/compression and
+    /// framing violations collapse to `Profile`.
+    pub fn from_ch_error(err: &ChError) -> HelloRejectReason {
+        match err {
+            ChError::EchPresent => HelloRejectReason::EchPresent,
+            ChError::ServerNameMismatch => HelloRejectReason::ServerNameMismatch,
+            ChError::InvalidServerName { .. } => HelloRejectReason::InvalidServerName,
+            ChError::TooLarge
+            | ChError::RecordTooLarge { .. }
+            | ChError::ZeroLengthRecord
+            | ChError::NotHandshake { .. }
+            | ChError::Sslv2Framing
+            | ChError::BadRecordVersion { .. }
+            | ChError::TruncatedRecord
+            | ChError::NotClientHello { .. }
+            | ChError::TruncatedHandshake
+            | ChError::MalformedBody { .. }
+            | ChError::UnsupportedLegacyVersion { .. }
+            | ChError::MissingSupportedVersions
+            | ChError::InvalidVersionOffer { .. }
+            | ChError::MissingCompressionMethods
+            | ChError::NonNullCompression
+            | ChError::DuplicateExtension { .. }
+            | ChError::MalformedExtension { .. }
+            | ChError::TooManyExtensions => HelloRejectReason::Profile,
+        }
+    }
+
+    /// The zero-based index into a fixed per-discriminant counter array
+    /// (offset from the CONNECT-head kinds by [`ConnectHeadReason::COUNT`] +
+    /// the single `HostNotAllowlisted` kind).
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The number of finite hello-rejection discriminants.
+    pub const COUNT: usize = 4;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Inspect {

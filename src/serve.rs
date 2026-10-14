@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 use mio::net::TcpListener;
 
 use crate::cache::{Cache, CacheError, EntryState, Family, NameIndex};
-use crate::config::Config;
+use crate::config::{Config, FixedHostname};
 use crate::connect::ConnectRequest;
+use crate::enforcement::action::DomainOrdinal;
+use crate::enforcement::state::Enforcement;
 use crate::log::LogStore;
 use crate::schedule::Schedules;
 use crate::startup_dns::{
@@ -35,6 +37,7 @@ pub struct ServeStorage {
     dns: StartupDns,
     config: Config,
     worker: Worker,
+    enforcement: Enforcement,
     origin: Instant,
     now0: u64,
     logs: LogStore,
@@ -133,12 +136,14 @@ impl ServeStorage {
         let dns = StartupDns::new()?;
         let origin = Instant::now();
         let worker = Worker::boot(WorkerClock::new(origin, 0));
+        let enforcement = Enforcement::new(*config.control());
         Ok(ServeStorage {
             cache,
             schedules,
             dns,
             config: config.clone(),
             worker,
+            enforcement,
             origin,
             now0: 0,
             logs,
@@ -220,6 +225,40 @@ impl ServeStorage {
     /// The boot-owned log store, shared for next-drain scheduling.
     pub(crate) fn logs(&self) -> &LogStore {
         &self.logs
+    }
+
+    pub(crate) fn enforcement(&self) -> &Enforcement {
+        &self.enforcement
+    }
+
+    pub(crate) fn enforcement_mut(&mut self) -> &mut Enforcement {
+        &mut self.enforcement
+    }
+
+    pub(crate) fn ordinal_for(&self, hostname: &FixedHostname) -> Option<DomainOrdinal> {
+        let index = self
+            .config
+            .allowlist()
+            .iter()
+            .position(|entry| entry.as_str().as_bytes() == hostname.as_bytes())?;
+        self.enforcement.control().ordinal(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_a(&mut self, ordinal: usize) {
+        use crate::cache::{Generation, StagedPositive};
+        use crate::eligibility::NumericAddr;
+        use std::net::Ipv4Addr;
+        let name = self
+            .cache
+            .name_index(ordinal)
+            .expect("admitted name ordinal");
+        let addrs = [NumericAddr::V4(Ipv4Addr::from([1, 1, 1, 1]))];
+        let staged = StagedPositive::stage(name, Family::A, Generation::INITIAL, &addrs, 1_000, 10)
+            .expect("stage A binding");
+        self.cache
+            .publish_positive(&staged)
+            .expect("publish A binding");
     }
 
     /// Whole-record log drops so far, saturating at `u64::MAX`: the
@@ -612,6 +651,14 @@ mod tests {
         NumericAddr::V6(Ipv6Addr::from(octets))
     }
 
+    fn group(count: usize) -> String {
+        let kinds = vec!["\"flare_only\""; count].join(", ");
+        let scopes = vec!["\"connection\""; count].join(", ");
+        format!(
+            "[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [{kinds}]\nscope = [{scopes}]\n"
+        )
+    }
+
     fn config_with_allowance(count: usize, allowance: u8) -> Config {
         let names = match count {
             1 => "\"alpha.example.org\"",
@@ -620,7 +667,8 @@ mod tests {
             _ => panic!("test allowlist helper supports 1..=3 names"),
         };
         let doc = format!(
-            "allowlist = [{names}]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = {allowance}\n"
+            "allowlist = [{names}]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = {allowance}\n{}\n",
+            group(count)
         );
         crate::config::parse_config_document(&doc).expect("valid test config")
     }
@@ -917,8 +965,11 @@ mod startup_integration {
     const NOW0: u64 = 1000;
 
     fn config_with(names: &str, allowance: u8, listen_port: u16) -> Config {
+        let count = names.matches('"').count() / 2;
+        let kinds = vec!["\"flare_only\""; count].join(", ");
+        let scopes = vec!["\"connection\""; count].join(", ");
         let doc = format!(
-            "allowlist = [{names}]\nlisten = \"127.0.0.1:{listen_port}\"\nstartup_unresolved_allowance = {allowance}\n"
+            "allowlist = [{names}]\nlisten = \"127.0.0.1:{listen_port}\"\nstartup_unresolved_allowance = {allowance}\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [{kinds}]\nscope = [{scopes}]\n"
         );
         parse_config_document(&doc).expect("valid test config")
     }
