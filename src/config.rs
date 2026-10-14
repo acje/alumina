@@ -4,6 +4,8 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 
+use crate::enforcement::action::{ActionKind, AnyIllegalScope, ControlTable, DomainAction, Scope};
+
 pub const CONFIG_DOC_LIMIT: usize = 4096;
 pub const ALLOWLIST_MIN: usize = 1;
 pub const ALLOWLIST_MAX: usize = 32;
@@ -240,6 +242,7 @@ pub struct Config {
     allowlist: Allowlist,
     listen: ListenAddr,
     startup_unresolved_allowance: u8,
+    control: Option<ControlTable>,
 }
 
 impl Config {
@@ -253,6 +256,14 @@ impl Config {
 
     pub fn startup_unresolved_allowance(&self) -> u8 {
         self.startup_unresolved_allowance
+    }
+
+    /// The configured tripwire control table. `None` when the reserved
+    /// enforcement group is absent from the document, which means the
+    /// pre-existing baseline enforcement (AnyIllegal offender-scoped
+    /// mandatory denial, no per-domain action, no All latch).
+    pub fn control(&self) -> Option<&ControlTable> {
+        self.control.as_ref()
     }
 }
 
@@ -291,6 +302,23 @@ pub enum ConfigError {
     },
     AllowanceOutOfRange {
         value: i64,
+    },
+    AnyIllegalScopeDomain,
+    InvalidScope {
+        key: String,
+        value: String,
+    },
+    UnknownAction {
+        index: usize,
+        value: String,
+    },
+    ActionTarpitDeferred {
+        index: usize,
+    },
+    ActionsLengthMismatch {
+        got_kind: usize,
+        got_scope: usize,
+        expected: usize,
     },
 }
 
@@ -362,6 +390,32 @@ impl fmt::Display for ConfigError {
                     value
                 )
             }
+            ConfigError::AnyIllegalScopeDomain => write!(
+                f,
+                "config any_illegal.scope \"domain\" invalid: AnyIllegal Block scope is connection or all only"
+            ),
+            ConfigError::InvalidScope { key, value } => write!(
+                f,
+                "config {key} value {value:?} invalid: expected connection, domain, or all"
+            ),
+            ConfigError::UnknownAction { index, value } => write!(
+                f,
+                "config actions.kind[{}] value {value:?}: unknown action (expected flare_only or block)",
+                index + 1
+            ),
+            ConfigError::ActionTarpitDeferred { index } => write!(
+                f,
+                "config actions.kind[{}] is \"tarpit\": Tarpit pacing is deferred and is not accepted as an operational setting (docs/alumina-proxy.md tripwire amendment)",
+                index + 1
+            ),
+            ConfigError::ActionsLengthMismatch {
+                got_kind,
+                got_scope,
+                expected,
+            } => write!(
+                f,
+                "config [actions] kind/scope lengths {got_kind}/{got_scope} must equal allowlist length {expected}"
+            ),
         }
     }
 }
@@ -417,7 +471,7 @@ fn from_table(table: toml::Table) -> Result<Config, ConfigError> {
     for (key, value) in &table {
         if !matches!(
             key.as_str(),
-            "allowlist" | "listen" | "startup_unresolved_allowance"
+            "allowlist" | "listen" | "startup_unresolved_allowance" | "any_illegal" | "actions"
         ) {
             return Err(match value {
                 toml::Value::Table(_) => ConfigError::UnknownTable(key.clone()),
@@ -425,16 +479,127 @@ fn from_table(table: toml::Table) -> Result<Config, ConfigError> {
             });
         }
     }
+    let any_illegal = table.get("any_illegal");
+    let actions = table.get("actions");
+    let group_present = any_illegal.is_some() || actions.is_some();
+    if group_present && any_illegal.is_none() {
+        return Err(ConfigError::MissingField("any_illegal".to_owned()));
+    }
+    if group_present && actions.is_none() {
+        return Err(ConfigError::MissingField("actions".to_owned()));
+    }
     let allowlist = build_allowlist(allowlist_names)?;
     let listen = parse_listen(&listen)?;
     if allowance < 0 || allowance as usize >= allowlist.len() {
         return Err(ConfigError::AllowanceOutOfRange { value: allowance });
     }
+    let control = match (any_illegal, actions) {
+        (Some(any_value), Some(actions_value)) => {
+            let any_scope = parse_any_illegal(any_value)?;
+            let domain_actions = parse_actions(actions_value, allowlist.len())?;
+            let Some(control) = ControlTable::new(any_scope, &domain_actions) else {
+                return Err(ConfigError::ActionsLengthMismatch {
+                    got_kind: domain_actions.len(),
+                    got_scope: domain_actions.len(),
+                    expected: ALLOWLIST_MAX,
+                });
+            };
+            Some(control)
+        }
+        _ => None,
+    };
     Ok(Config {
         allowlist,
         listen,
         startup_unresolved_allowance: allowance as u8,
+        control,
     })
+}
+
+fn parse_any_illegal(value: &toml::Value) -> Result<AnyIllegalScope, ConfigError> {
+    let toml::Value::Table(table) = value else {
+        return Err(ConfigError::WrongType(
+            "any_illegal: expected table".to_owned(),
+        ));
+    };
+    for key in table.keys() {
+        if key != "scope" {
+            return Err(ConfigError::UnknownKey(format!("any_illegal.{key}")));
+        }
+    }
+    let scope = require_string(table, "scope")
+        .map_err(|err| prefix_group_error("any_illegal", "scope", err))?;
+    match scope.as_str() {
+        "connection" => Ok(AnyIllegalScope::Connection),
+        "all" => Ok(AnyIllegalScope::All),
+        "domain" => Err(ConfigError::AnyIllegalScopeDomain),
+        other => Err(ConfigError::InvalidScope {
+            key: "any_illegal.scope".to_owned(),
+            value: other.to_owned(),
+        }),
+    }
+}
+
+fn parse_actions(
+    value: &toml::Value,
+    allowlist_len: usize,
+) -> Result<Vec<DomainAction>, ConfigError> {
+    let toml::Value::Table(table) = value else {
+        return Err(ConfigError::WrongType("actions: expected table".to_owned()));
+    };
+    for key in table.keys() {
+        if !matches!(key.as_str(), "kind" | "scope") {
+            return Err(ConfigError::UnknownKey(format!("actions.{key}")));
+        }
+    }
+    let kinds = require_string_list(table, "kind")
+        .map_err(|err| prefix_group_error("actions", "kind", err))?;
+    let scopes = require_string_list(table, "scope")
+        .map_err(|err| prefix_group_error("actions", "scope", err))?;
+    if kinds.len() != allowlist_len || scopes.len() != allowlist_len {
+        return Err(ConfigError::ActionsLengthMismatch {
+            got_kind: kinds.len(),
+            got_scope: scopes.len(),
+            expected: allowlist_len,
+        });
+    }
+    let mut actions = Vec::with_capacity(kinds.len());
+    for (index, (kind, scope)) in kinds.iter().zip(scopes.iter()).enumerate() {
+        let kind = match kind.as_str() {
+            "flare_only" => ActionKind::FlareOnly,
+            "block" => ActionKind::Block,
+            "tarpit" => return Err(ConfigError::ActionTarpitDeferred { index }),
+            other => {
+                return Err(ConfigError::UnknownAction {
+                    index,
+                    value: other.to_owned(),
+                });
+            }
+        };
+        let scope = match scope.as_str() {
+            "connection" => Scope::Connection,
+            "domain" => Scope::Domain,
+            "all" => Scope::All,
+            other => {
+                return Err(ConfigError::InvalidScope {
+                    key: format!("actions.scope[{}]", index + 1),
+                    value: other.to_owned(),
+                });
+            }
+        };
+        actions.push(DomainAction::new(kind, scope));
+    }
+    Ok(actions)
+}
+
+fn prefix_group_error(table: &str, key: &str, err: ConfigError) -> ConfigError {
+    match err {
+        ConfigError::MissingField(field) => ConfigError::MissingField(format!("{table}.{field}")),
+        ConfigError::WrongType(message) => {
+            ConfigError::WrongType(format!("{table}.{key}: {message}"))
+        }
+        other => other,
+    }
 }
 
 fn require_string(table: &toml::Table, key: &str) -> Result<String, ConfigError> {
@@ -545,4 +710,190 @@ fn parse_listen(listen: &str) -> Result<ListenAddr, ConfigError> {
         IpAddr::V4(addr)
     };
     Ok(ListenAddr { ip, port })
+}
+
+#[cfg(test)]
+mod enforcement_config_tests {
+    use super::*;
+    use crate::enforcement::action::{ActionKind, AnyIllegalScope, Scope};
+
+    fn base(names: &str) -> String {
+        format!(
+            "allowlist = [{names}]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n"
+        )
+    }
+
+    fn group(names: &str, any_scope: &str, kinds: &str, scopes: &str) -> String {
+        format!(
+            "{base}\n[any_illegal]\nscope = \"{any_scope}\"\n[actions]\nkind = {kinds}\nscope = {scopes}\n",
+            base = base(names)
+        )
+    }
+
+    #[test]
+    fn absent_group_means_baseline_enforcement() {
+        let cfg =
+            parse_config_document(&base("\"sub.example.org\"")).expect("baseline config valid");
+        assert!(cfg.control().is_none());
+    }
+
+    #[test]
+    fn parses_full_enforcement_group() {
+        let doc = group(
+            "\"sub.example.org\", \"other.example.org\"",
+            "all",
+            "[\"block\", \"flare_only\"]",
+            "[\"domain\", \"connection\"]",
+        );
+        let cfg = parse_config_document(&doc).expect("valid enforcement config");
+        let control = cfg.control().expect("group present");
+        assert_eq!(control.any_illegal(), AnyIllegalScope::All);
+        assert_eq!(control.len(), 2);
+        let first = control
+            .at(control.ordinal(0).expect("ordinal"))
+            .expect("configured");
+        assert_eq!(first.kind(), ActionKind::Block);
+        assert_eq!(first.scope(), Scope::Domain);
+        let second = control
+            .at(control.ordinal(1).expect("ordinal"))
+            .expect("configured");
+        assert_eq!(second.kind(), ActionKind::FlareOnly);
+        assert_eq!(second.scope(), Scope::Connection);
+    }
+
+    #[test]
+    fn accepts_any_illegal_connection_scope() {
+        let doc = group("\"a.example\"", "connection", "[\"block\"]", "[\"domain\"]");
+        let cfg = parse_config_document(&doc).expect("connection scope valid");
+        assert_eq!(
+            cfg.control().expect("group").any_illegal(),
+            AnyIllegalScope::Connection
+        );
+    }
+
+    #[test]
+    fn rejects_any_illegal_domain_scope() {
+        let doc = group("\"a.example\"", "domain", "[\"block\"]", "[\"domain\"]");
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::AnyIllegalScopeDomain),
+            "expected AnyIllegalScopeDomain, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_any_illegal_unknown_scope() {
+        let doc = group("\"a.example\"", "wired", "[\"block\"]", "[\"connection\"]");
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidScope { .. }),
+            "expected InvalidScope, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_actions_when_any_illegal_present() {
+        let doc = format!(
+            "{}\n[any_illegal]\nscope = \"all\"\n",
+            base("\"a.example\"")
+        );
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::MissingField(f) if f == "actions"),
+            "expected MissingField(actions), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_any_illegal_when_actions_present() {
+        let doc = format!(
+            "{}\n[actions]\nkind = [\"block\"]\nscope = [\"domain\"]\n",
+            base("\"a.example\"")
+        );
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::MissingField(f) if f == "any_illegal"),
+            "expected MissingField(any_illegal), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_tarpit_kind_with_deferred_diagnostic() {
+        let doc = group("\"a.example\"", "all", "[\"tarpit\"]", "[\"connection\"]");
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ActionTarpitDeferred { index: 0 }),
+            "expected ActionTarpitDeferred, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_action_kind() {
+        let doc = group("\"a.example\"", "all", "[\"peek\"]", "[\"connection\"]");
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnknownAction { index: 0, .. }),
+            "expected UnknownAction, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_per_domain_scope() {
+        let doc = group("\"a.example\"", "all", "[\"block\"]", "[\"wire\"]");
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidScope { .. }),
+            "expected InvalidScope, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_actions_length_mismatch() {
+        let doc = group(
+            "\"a.example\"",
+            "all",
+            "[\"block\", \"block\"]",
+            "[\"domain\", \"domain\"]",
+        );
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ActionsLengthMismatch { .. }),
+            "expected ActionsLengthMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_key_unchanged() {
+        let doc = format!("{}bogus = 1\n", base("\"a.example\""));
+        let err = parse_config_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnknownKey(_)),
+            "expected UnknownKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn compact_32_names_with_group_fit_4kib() {
+        let names: Vec<String> = (0..32)
+            .map(|i| format!("n{i:02}.{}.{}", "a".repeat(48), "b".repeat(47)))
+            .collect();
+        let list = names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let kinds = vec!["\"block\""; 32].join(", ");
+        let scopes = vec!["\"domain\""; 32].join(", ");
+        let doc = format!(
+            "allowlist = [{list}]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"all\"\n[actions]\nkind = [{kinds}]\nscope = [{scopes}]\n"
+        );
+        assert!(
+            doc.len() <= CONFIG_DOC_LIMIT,
+            "compact config with full enforcement group fits 4096 bytes (len {})",
+            doc.len()
+        );
+        let cfg = parse_config_document(&doc).expect("fits and parses");
+        assert_eq!(cfg.allowlist().len(), 32);
+        assert_eq!(cfg.control().expect("group").len(), 32);
+    }
 }

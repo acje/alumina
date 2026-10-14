@@ -6,6 +6,7 @@ pub mod config;
 pub mod connect;
 pub mod dns;
 pub mod eligibility;
+mod enforcement;
 pub mod fault;
 pub mod fuzz;
 pub mod gate;
