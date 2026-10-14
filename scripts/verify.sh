@@ -14,7 +14,7 @@ usage() {
 
 TOOLCHAIN="1.99.0"
 
-INTENDED="Cargo.toml Cargo.lock rust-toolchain.toml deny.toml scripts/verify.sh scripts/cargo_config_probe.py scripts/fixture_metadata_probe.py README.md src/lib.rs src/main.rs src/alloc.rs src/fault.rs src/fuzz.rs src/config.rs src/resolver.rs src/preflight.rs src/inventory.rs src/boot.rs src/serving/tests.rs src/runtime/tests.rs tests/foundations.rs tests/boot.rs"
+INTENDED="Cargo.toml Cargo.lock rust-toolchain.toml deny.toml scripts/verify.sh scripts/cargo_config_probe.py scripts/fixture_metadata_probe.py README.md src/lib.rs src/main.rs src/alloc.rs src/fault.rs src/fuzz.rs src/config.rs src/resolver.rs src/preflight.rs src/inventory.rs src/boot.rs src/serving/tests.rs src/runtime/tests.rs src/startup_dns/tests.rs tests/foundations.rs tests/boot.rs"
 
 # docslink gate roots: the exact nonempty argv docslink_check consumes. Shared
 # with the identity snapshot so the boundary content identity covers precisely
