@@ -49,7 +49,8 @@ use crate::config::FixedHostname;
 use crate::connect::{ConnectHeadReason, ConnectParser, Feed};
 use crate::eligibility::NumericAddr;
 use crate::enforcement::action::{DomainOrdinal, FirstSlot, Scope};
-use crate::enforcement::policy::{AnyIllegalCause, Effect, Violation};
+use crate::enforcement::monitor::{CapturedDetail, CapturedFact, SlotCapture};
+use crate::enforcement::policy::{AnyIllegalCause, Effect, UnknownReason, Violation};
 use crate::gate::{Activity, TunnelGate, UpstreamWrite, ValidatedHello};
 use crate::log::{ActivityKind, RejectReason};
 use crate::serve::ServeStorage;
@@ -405,6 +406,7 @@ struct SlotWorkspace {
     gate: TunnelGate,
     approved: Option<FixedHostname>,
     first_slot: FirstSlot,
+    capture: SlotCapture,
     stage: Stage,
     buf: Box<[u8]>,
     buf_base: usize,
@@ -441,6 +443,7 @@ impl SlotWorkspace {
             gate: TunnelGate::new(),
             approved: None,
             first_slot: FirstSlot::new(),
+            capture: SlotCapture::fresh(0, 0),
             stage: Stage::Idle,
             buf: up,
             buf_base: 0,
@@ -485,6 +488,7 @@ impl SlotWorkspace {
         self.gate = TunnelGate::new();
         self.approved = None;
         self.first_slot = FirstSlot::new();
+        self.capture = SlotCapture::default();
         self.stage = Stage::Idle;
         self.buf_len = 0;
         self.buf_base = 0;
@@ -1252,6 +1256,7 @@ impl Serving {
                 let index = self.storage.slot_index(&slot);
                 let ws = &mut self.slots[index];
                 ws.slot_gen = ws.slot_gen.wrapping_add(1);
+                ws.capture = SlotCapture::fresh(index, ws.slot_gen);
                 ws.handle = Some(slot);
                 ws.client = Some(stream);
                 ws.stage = Stage::ReadingConnect;
@@ -1627,6 +1632,7 @@ impl Serving {
             let en = self.storage.enforcement_mut();
             en.decide(&mut slot.first_slot, violation)
         };
+        self.stamp_capture(index, CapturedFact::AnyIllegal(cause), effect);
         if matches!(effect, Effect::Block { scope: Scope::All }) {
             self.stop_block_all();
         }
@@ -1639,6 +1645,9 @@ impl Serving {
             let en = self.storage.enforcement_mut();
             en.decide(&mut slot.first_slot, violation)
         };
+        if let Some(fact) = captured_fact(violation) {
+            self.stamp_capture(index, fact, effect);
+        }
         match effect {
             Effect::Block { scope: Scope::All } => self.stop_block_all(),
             Effect::Block {
@@ -1651,6 +1660,25 @@ impl Serving {
             _ => {}
         }
         effect
+    }
+
+    fn stamp_capture(&mut self, index: usize, fact: CapturedFact, effect: Effect) {
+        let suppressed = {
+            let ws = &mut self.slots[index];
+            if ws.capture.detail.is_some() {
+                true
+            } else {
+                ws.capture = SlotCapture {
+                    slot: index,
+                    generation: ws.slot_gen,
+                    detail: Some(CapturedDetail { fact, effect }),
+                };
+                false
+            }
+        };
+        if suppressed {
+            self.storage.enforcement_mut().note_suppressed_detail();
+        }
     }
 
     fn run_decision(&mut self, index: usize) -> Result<(), ServeError> {
@@ -2399,6 +2427,20 @@ impl Serving {
 
 fn client_token(generation: u64, index: usize) -> Token {
     Token(((generation as usize) << GEN_SHIFT) | (index + 1))
+}
+
+fn captured_fact(violation: Violation) -> Option<CapturedFact> {
+    match violation {
+        Violation::EarlyUpstreamData { ordinal } => Some(CapturedFact::EarlyData(ordinal)),
+        Violation::EvidenceInsufficient => {
+            Some(CapturedFact::Unknown(UnknownReason::NotYetValidated))
+        }
+        Violation::Unattributed => Some(CapturedFact::Unknown(UnknownReason::Unattributed)),
+        Violation::MissingParseResult => {
+            Some(CapturedFact::Unknown(UnknownReason::MissingParseResult))
+        }
+        Violation::AnyIllegal { .. } => None,
+    }
 }
 
 fn upstream_token(generation: u64, index: usize) -> Token {

@@ -3918,7 +3918,7 @@ fn validated_early_data_applies_block_domain_and_terminates_setup() {
                 .storage()
                 .enforcement()
                 .counters()
-                .domain_blocks(ordinal),
+                .actions_domain_block(ordinal),
             1
         );
         assert_eq!(
@@ -3926,7 +3926,7 @@ fn validated_early_data_applies_block_domain_and_terminates_setup() {
                 .storage()
                 .enforcement()
                 .counters()
-                .domain_flares(ordinal),
+                .actions_flare(ordinal),
             0
         );
         assert!(
@@ -3938,7 +3938,7 @@ fn validated_early_data_applies_block_domain_and_terminates_setup() {
                 .storage()
                 .enforcement()
                 .counters()
-                .any_illegal_total(),
+                .facts_any_illegal_total(),
             0,
             "AnyIllegal counters stay untouched by a validated-domain fact"
         );
@@ -3979,7 +3979,7 @@ fn validated_early_data_flare_is_reporting_only_and_setup_still_terminates() {
                 .storage()
                 .enforcement()
                 .counters()
-                .domain_flares(ordinal),
+                .actions_flare(ordinal),
             1
         );
         assert_eq!(
@@ -3987,7 +3987,7 @@ fn validated_early_data_flare_is_reporting_only_and_setup_still_terminates() {
                 .storage()
                 .enforcement()
                 .counters()
-                .domain_blocks(ordinal),
+                .actions_domain_block(ordinal),
             0
         );
         assert!(
@@ -3999,7 +3999,7 @@ fn validated_early_data_flare_is_reporting_only_and_setup_still_terminates() {
                 .storage()
                 .enforcement()
                 .counters()
-                .unknown(UnknownReason::NotYetValidated),
+                .facts_unknown(UnknownReason::NotYetValidated),
             0
         );
     });
@@ -4038,7 +4038,7 @@ fn prevalidated_early_data_folds_unknown_without_any_block() {
                 .storage()
                 .enforcement()
                 .counters()
-                .unknown(UnknownReason::NotYetValidated),
+                .facts_unknown(UnknownReason::NotYetValidated),
             1,
             "missing validated identity folds Unknown(NotYetValidated), never a block verdict"
         );
@@ -4057,7 +4057,7 @@ fn prevalidated_early_data_folds_unknown_without_any_block() {
                 .storage()
                 .enforcement()
                 .counters()
-                .domain_blocks(ordinal),
+                .actions_domain_block(ordinal),
             0
         );
         assert_eq!(
@@ -4065,7 +4065,7 @@ fn prevalidated_early_data_folds_unknown_without_any_block() {
                 .storage()
                 .enforcement()
                 .counters()
-                .any_illegal_total(),
+                .facts_any_illegal_total(),
             0,
             "the anomaly is not AnyIllegal and carries no Block effect"
         );
@@ -4096,7 +4096,7 @@ fn domain_block_refuses_future_flow_of_the_ordinal_until_restart() {
                 .storage()
                 .enforcement()
                 .counters()
-                .any_illegal(AnyIllegalCause::HostNotAllowlisted),
+                .facts_any_illegal(AnyIllegalCause::HostNotAllowlisted),
             1
         );
         assert_eq!(
@@ -4104,7 +4104,7 @@ fn domain_block_refuses_future_flow_of_the_ordinal_until_restart() {
                 .storage()
                 .enforcement()
                 .counters()
-                .domain_blocks(ordinal),
+                .actions_domain_block(ordinal),
             0
         );
 
@@ -4143,9 +4143,18 @@ fn domain_block_refuses_future_flow_of_the_ordinal_until_restart() {
                 .storage()
                 .enforcement()
                 .counters()
-                .domain_blocks(ordinal),
-            2,
-            "the future-flow refusal folds into the domain block count"
+                .actions_domain_block(ordinal),
+            1,
+            "the early-data Block-Domain action is not re-applied by the refusal"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .refusals_blocked_domain(ordinal),
+            1,
+            "the future-flow refusal folds its own refusal channel, never the action"
         );
     });
 }
@@ -4524,7 +4533,7 @@ fn internal_missing_approval_is_unknown_closes_locally_and_unrelated_flow_surviv
                 .storage()
                 .enforcement()
                 .counters()
-                .any_illegal_total(),
+                .facts_any_illegal_total(),
             0,
             "no AnyIllegal folds for absent approved evidence"
         );
@@ -4533,7 +4542,7 @@ fn internal_missing_approval_is_unknown_closes_locally_and_unrelated_flow_surviv
                 .storage()
                 .enforcement()
                 .counters()
-                .unknown(UnknownReason::MissingParseResult),
+                .facts_unknown(UnknownReason::MissingParseResult),
             1,
             "the absent approved evidence folds exactly one truthful Unknown"
         );
@@ -4570,7 +4579,7 @@ fn internal_missing_complete_hello_is_unknown_and_never_latches() {
                 .storage()
                 .enforcement()
                 .counters()
-                .any_illegal_total(),
+                .facts_any_illegal_total(),
             0,
             "no AnyIllegal folds for absent hello-result evidence"
         );
@@ -4579,7 +4588,7 @@ fn internal_missing_complete_hello_is_unknown_and_never_latches() {
                 .storage()
                 .enforcement()
                 .counters()
-                .unknown(UnknownReason::MissingParseResult),
+                .facts_unknown(UnknownReason::MissingParseResult),
             1,
             "the absent hello result folds exactly one truthful Unknown"
         );
@@ -4613,7 +4622,7 @@ fn genuine_malformed_hello_still_projects_any_illegal_and_latches_scope_all() {
                 .storage()
                 .enforcement()
                 .counters()
-                .any_illegal(AnyIllegalCause::TlsProfile(
+                .facts_any_illegal(AnyIllegalCause::TlsProfile(
                     HelloRejectReason::ServerNameMismatch
                 )),
             1,
@@ -4796,7 +4805,7 @@ fn early_data_projection_spends_zero_allocations() {
                     .storage()
                     .enforcement()
                     .counters()
-                    .domain_blocks(ordinal),
+                    .actions_domain_block(ordinal),
                 1
             );
         });
@@ -4836,6 +4845,193 @@ fn block_all_storm_sweeps_128_slots_alloc_free() {
         assert!(
             counts.all_zero(),
             "the 128-slot Block-All storm sweep must allocate/deallocate nothing: {counts:?}"
+        );
+    });
+}
+
+#[test]
+fn monitor_split_on_full_stack_distinguishes_block_action_from_later_refusal() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        serving.storage_mut().publish_test_a(ordinal.get());
+        let _acceptor = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "pre-block peer admitted");
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(serving, Some(5));
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early data blocks the domain");
+        assert!(serving.storage().enforcement().is_blocked(ordinal));
+        {
+            let m = serving.storage().enforcement().monitor();
+            assert_eq!(m.facts_early_data(ordinal), 1, "one early-data fact");
+            assert_eq!(
+                m.actions_domain_block(ordinal),
+                1,
+                "the Block-Domain action is its own channel"
+            );
+            assert_eq!(
+                m.refusals_blocked_domain(ordinal),
+                0,
+                "the action itself is never also a refusal"
+            );
+        }
+
+        let mut future = connect(port);
+        future
+            .write_all(b"CONNECT sub.example.org:443 HTTP/1.1\r\n\r\n")
+            .expect("future head");
+        pump(serving, 20);
+        let fb = read_until(&mut future, b"\r\n\r\n");
+        assert!(
+            fb.starts_with(b"HTTP/1.1 403"),
+            "a future flow for the blocked ordinal must be refused before any dial, got {:?}",
+            fb
+        );
+        let m = serving.storage().enforcement().monitor();
+        assert_eq!(m.actions_domain_block(ordinal), 1, "no re-applied action");
+        assert_eq!(m.refusals_blocked_domain(ordinal), 1, "one later refusal");
+        assert_eq!(
+            m.refusals_total(),
+            1,
+            "the later refusal folds its own truthfully separated total"
+        );
+    });
+}
+
+#[test]
+fn slot_capture_is_cleared_before_reuse_never_attributes_a_stale_generation() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        serving.storage_mut().publish_test_a(ordinal.get());
+
+        let _first = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "pre-block peer admitted");
+        assert!(
+            serving.slots[0].capture.detail.is_none(),
+            "a fresh slot carries no fact (generation {}), only the admit stamp",
+            serving.slots[0].capture.generation
+        );
+        assert!(
+            serving.slots[0].capture.generation != 0,
+            "the admit stamps the slot's own new generation"
+        );
+        serving.slots[0].hello_end = Some(10);
+        fabric_validated_early_data(serving, Some(5));
+        let token = upstream_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early data blocks the domain");
+        assert!(
+            serving.storage().enforcement().is_blocked(ordinal),
+            "cleared capture from reset must not prevent the block"
+        );
+
+        serving.close_slot(0);
+        let _second = connect(port);
+        pump(serving, 20);
+        assert!(
+            serving.slots[0].capture.detail.is_none(),
+            "a reused slot starts with no stale generation's fact"
+        );
+        assert_eq!(
+            serving.slots[0].capture.generation, serving.slots[0].slot_gen,
+            "the reused slot's capture is correlated to its own new generation"
+        );
+    });
+}
+
+#[test]
+fn production_detection_close_transfers_typed_capture_with_slot_identity_into_monitor() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        serving.storage_mut().publish_test_a(ordinal.get());
+
+        let _first = connect(port);
+        pump(serving, 20);
+        assert_eq!(serving.storage().occupied(), 1, "first peer admitted");
+        let _second = connect(port);
+        pump(serving, 20);
+        assert_eq!(
+            serving.storage().occupied(),
+            2,
+            "a second peer occupies a non-zero slot so the identity pin discriminates"
+        );
+        assert!(
+            serving.slots[1].handle.is_some(),
+            "slots assign lowest-free first, so the second peer holds slot 1"
+        );
+
+        serving.slots[1].hello_end = Some(10);
+        fabric_validated_early_data_at(serving, 1, Some(5));
+        let token = upstream_token(serving.slots[1].slot_gen, 1);
+        serving
+            .dispatch_readiness(
+                token,
+                Readiness {
+                    readable: true,
+                    writable: false,
+                    ..Readiness::none()
+                },
+            )
+            .expect("early data blocks the domain");
+        assert!(
+            serving.storage().enforcement().is_blocked(ordinal),
+            "the production detection latched the ordinal"
+        );
+        let m = serving.storage().enforcement().monitor();
+        assert_eq!(
+            m.capture_detail_len(),
+            1,
+            "M3': close_slot consumed the non-zero stamped capture into the monitor (removal-sensitive)"
+        );
+        let cap = m.capture_detail(0).expect("correlated capture");
+        assert_eq!(
+            cap.slot, 1,
+            "H1' pin: the capture carries the actual detection slot index 1, never ring position 0 or a hardcoded slot 0"
+        );
+        assert_eq!(
+            cap.generation, serving.slots[1].slot_gen,
+            "H1': the capture carries the per-slot generation at detection"
+        );
+        let detail = cap.detail;
+        assert_eq!(
+            detail.fact,
+            CapturedFact::EarlyData(ordinal),
+            "H1': the typed detection fact travels through detection -> close -> monitor"
+        );
+        assert_eq!(
+            detail.effect,
+            Effect::Block {
+                scope: Scope::Domain
+            },
+            "H1': the applied effect travels through detection -> close -> monitor"
         );
     });
 }

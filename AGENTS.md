@@ -7,7 +7,7 @@ specification, not feature growth.
 ## Rules
 
 - `docs/alumina-proxy.md` is the sole, byte-canonical governing
-  specification (sha256 `1da26b6c…30cc`). Never edit it; documents only
+  specification (sha256 `b5b1c9f…137d`). Never edit it; documents only
   restate or cite it. The sole exception is the narrow, user-authorized
   `rp2e` (2026-10-14) tripwire/action/monitoring/pacing amendment recorded in
   the document; no further amendment authority is implied.

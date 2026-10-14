@@ -60,7 +60,11 @@ impl Serving {
         let tunnel = ws.tunnel.take();
         ws.client.take();
         ws.upstream.take();
+        let capture = std::mem::take(&mut ws.capture);
         ws.reset();
+        self.storage
+            .enforcement_mut()
+            .note_consumed_capture(capture);
         if let Some(tunnel) = tunnel {
             self.storage.release_tunnel(tunnel);
         } else if let Some(slot) = slot {

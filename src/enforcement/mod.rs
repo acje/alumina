@@ -15,5 +15,6 @@
 //! this seam produces.
 
 pub mod action;
+pub mod monitor;
 pub mod policy;
 pub mod state;

@@ -125,7 +125,8 @@ impl Preallocated {
     /// that follow with [`std::process::exit`]: a Drained or Forced verdict is
     /// never silently lost to the immediate exit that drops the log queue.
     pub fn emit_shutdown_and_drain(&mut self) {
-        let secs = self.serving.storage().cache_secs(Instant::now());
+        let now = Instant::now();
+        let secs = self.serving.storage().cache_secs(now);
         let status = self
             .serving
             .shutdown_exit()
@@ -135,6 +136,7 @@ impl Preallocated {
             .storage_mut()
             .logs_mut()
             .shutdown_final(secs, status);
+        self.serving.storage_mut().report_monitor_if_due(now, true);
         self.serving.storage_mut().logs_mut().drain_sink();
     }
 
@@ -263,6 +265,9 @@ impl Runtime {
             }
             self.serving.sync_dns_shared()?;
         }
+        self.serving
+            .storage_mut()
+            .report_monitor_if_due(Instant::now(), false);
         self.serving.storage_mut().logs_mut().drain_sink();
         Ok(())
     }
@@ -330,11 +335,13 @@ impl Runtime {
     /// this exact path, so a forced-closure failure is never silently lost to
     /// an exit while the drain still bounds a stalled sink.
     pub(crate) fn emit_shutdown_record_and_drain(&mut self, exit: ShutdownExit) {
-        let secs = self.serving.storage().cache_secs(Instant::now());
+        let now = Instant::now();
+        let secs = self.serving.storage().cache_secs(now);
         self.serving
             .storage_mut()
             .logs_mut()
             .shutdown_final(secs, exit.status());
+        self.serving.storage_mut().report_monitor_if_due(now, true);
         self.serving.storage_mut().logs_mut().drain_sink();
     }
 

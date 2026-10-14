@@ -1,6 +1,6 @@
-use super::action::{ControlTable, DomainOrdinal, FirstSlot, Scope};
-use super::policy::{AnyIllegalCause, Effect, UnknownReason, Violation, decide as pure_decide};
-use crate::config::ALLOWLIST_MAX;
+use super::action::{AnyIllegalScope, ControlTable, DomainOrdinal, FirstSlot, Scope};
+use super::monitor::{Monitor, SlotCapture};
+use super::policy::{Effect, UnknownReason, Violation, decide as pure_decide};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaturatingCounter {
@@ -16,7 +16,7 @@ impl SaturatingCounter {
         }
     }
 
-    fn bump(&mut self) {
+    pub fn bump(&mut self) {
         if self.value == u32::MAX {
             self.overflow = true;
         } else {
@@ -24,14 +24,18 @@ impl SaturatingCounter {
         }
     }
 
-    #[cfg(test)]
     pub const fn value(&self) -> u32 {
         self.value
     }
 
-    #[cfg(test)]
     pub const fn overflow(&self) -> bool {
         self.overflow
+    }
+
+    #[cfg(test)]
+    pub fn saturate_for_test(&mut self) {
+        self.value = u32::MAX;
+        self.overflow = true;
     }
 }
 
@@ -41,19 +45,11 @@ impl Default for SaturatingCounter {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CaptureCounters {
-    any_illegal: [SaturatingCounter; AnyIllegalCause::KIND_COUNT],
-    domain_blocks: [SaturatingCounter; ALLOWLIST_MAX],
-    domain_flares: [SaturatingCounter; ALLOWLIST_MAX],
-    unknown: [SaturatingCounter; UnknownReason::COUNT],
-}
-
 pub struct Enforcement {
     control: ControlTable,
     block_all: bool,
     blocked: u32,
-    counters: CaptureCounters,
+    monitor: Monitor,
 }
 
 impl Enforcement {
@@ -62,7 +58,7 @@ impl Enforcement {
             control,
             block_all: false,
             blocked: 0,
-            counters: CaptureCounters::default(),
+            monitor: Monitor::new(),
         }
     }
 
@@ -82,81 +78,101 @@ impl Enforcement {
         let effect = pure_decide(&self.control, latch, violation);
         match violation {
             Violation::AnyIllegal { cause } => {
-                self.counters.any_illegal[cause.kind_index()].bump();
-                if let Effect::Block { scope: Scope::All } = effect {
-                    self.block_all = true;
+                self.monitor.note_fact_any_illegal(cause);
+                match effect {
+                    Effect::Block {
+                        scope: Scope::Connection,
+                    } => {
+                        self.monitor
+                            .note_action_first_slot_block(AnyIllegalScope::Connection);
+                    }
+                    Effect::Block { scope: Scope::All } => {
+                        let was_latched = self.block_all;
+                        self.block_all = true;
+                        self.monitor
+                            .note_action_first_slot_block(AnyIllegalScope::All);
+                        if !was_latched {
+                            self.monitor.note_block_all();
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Violation::EarlyUpstreamData { ordinal } => match effect {
-                Effect::FlareOnly { .. } => self.counters.domain_flares[ordinal.get()].bump(),
-                Effect::Block { scope } => {
-                    self.counters.domain_blocks[ordinal.get()].bump();
-                    match scope {
-                        Scope::Domain => self.blocked |= 1 << ordinal.get(),
-                        Scope::All => self.block_all = true,
-                        Scope::Connection => {}
+            Violation::EarlyUpstreamData { ordinal } => {
+                self.monitor.note_fact_early_data(ordinal);
+                match effect {
+                    Effect::FlareOnly { .. } => {
+                        self.monitor.note_action_flare(ordinal);
                     }
+                    Effect::Block { scope } => {
+                        self.monitor.note_action_domain_block(ordinal);
+                        match scope {
+                            Scope::Domain => self.blocked |= 1 << ordinal.get(),
+                            Scope::All => {
+                                let was_latched = self.block_all;
+                                self.block_all = true;
+                                if !was_latched {
+                                    self.monitor.note_block_all();
+                                }
+                            }
+                            Scope::Connection => {}
+                        }
+                    }
+                    Effect::Unknown { .. } => {}
+                    Effect::BaselineOnly => {}
                 }
-                Effect::Unknown { reason } => self.counters.unknown[reason.index()].bump(),
-                Effect::BaselineOnly => {}
-            },
+            }
             Violation::EvidenceInsufficient => {
-                self.counters.unknown[UnknownReason::NotYetValidated.index()].bump();
+                self.monitor
+                    .note_fact_unknown(UnknownReason::NotYetValidated);
             }
             Violation::Unattributed => {
-                self.counters.unknown[UnknownReason::Unattributed.index()].bump();
+                self.monitor.note_fact_unknown(UnknownReason::Unattributed);
             }
             Violation::MissingParseResult => {
-                self.counters.unknown[UnknownReason::MissingParseResult.index()].bump();
+                self.monitor
+                    .note_fact_unknown(UnknownReason::MissingParseResult);
             }
         }
         effect
     }
 
     pub fn note_domain_block(&mut self, ordinal: DomainOrdinal) {
-        self.counters.domain_blocks[ordinal.get()].bump();
+        self.monitor.note_refusal_blocked_domain(ordinal);
+    }
+
+    pub(crate) fn note_consumed_capture(&mut self, capture: SlotCapture) {
+        self.monitor.note_consumed_capture(capture);
+    }
+
+    pub(crate) fn note_suppressed_detail(&mut self) {
+        self.monitor.note_suppressed_detail();
+    }
+
+    pub(crate) fn monitor(&self) -> &Monitor {
+        &self.monitor
+    }
+
+    pub(crate) fn monitor_due(&self, secs: u64) -> bool {
+        self.monitor.report_due(secs)
+    }
+
+    pub(crate) fn mark_monitor_reported(&mut self, secs: u64, committed: bool) {
+        self.monitor.mark_reported(secs, committed);
+    }
+
+    pub(crate) fn mark_forced_monitor_reported(&mut self, committed: bool) {
+        self.monitor.mark_forced_reported(committed);
     }
 
     #[cfg(test)]
-    pub fn counters(&self) -> &CaptureCounters {
-        &self.counters
+    pub fn counters(&self) -> &Monitor {
+        &self.monitor
     }
 
     #[cfg(test)]
     pub(crate) fn test_blocked(&self, ordinal: DomainOrdinal) -> bool {
         self.is_blocked(ordinal)
-    }
-}
-
-impl CaptureCounters {
-    #[cfg(test)]
-    pub(crate) fn any_illegal(&self, cause: AnyIllegalCause) -> u32 {
-        self.any_illegal[cause.kind_index()].value()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn any_illegal_total(&self) -> u32 {
-        self.any_illegal.iter().map(SaturatingCounter::value).sum()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn unknown(&self, reason: UnknownReason) -> u32 {
-        self.unknown[reason.index()].value()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn unknown_total(&self) -> u32 {
-        self.unknown.iter().map(SaturatingCounter::value).sum()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn domain_blocks(&self, ordinal: DomainOrdinal) -> u32 {
-        self.domain_blocks[ordinal.get()].value()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn domain_flares(&self, ordinal: DomainOrdinal) -> u32 {
-        self.domain_flares[ordinal.get()].value()
     }
 }
 
@@ -166,7 +182,7 @@ mod tests {
     use crate::client_hello::HelloRejectReason;
     use crate::connect::ConnectHeadReason;
     use crate::enforcement::action::{ActionKind, AnyIllegalScope, DomainAction};
-    use crate::enforcement::policy::UnknownReason;
+    use crate::enforcement::policy::{AnyIllegalCause, UnknownReason};
 
     fn table(any_illegal: AnyIllegalScope, actions: &[(ActionKind, Scope)]) -> ControlTable {
         let entries: Vec<DomainAction> = actions
@@ -207,10 +223,10 @@ mod tests {
         assert!(en.block_all());
         assert_eq!(
             en.counters()
-                .any_illegal(AnyIllegalCause::HostNotAllowlisted),
+                .facts_any_illegal(AnyIllegalCause::HostNotAllowlisted),
             1
         );
-        assert_eq!(en.counters().any_illegal_total(), 1);
+        assert_eq!(en.counters().facts_any_illegal_total(), 1);
         let again = en.decide(
             &mut latch,
             Violation::AnyIllegal {
@@ -223,13 +239,13 @@ mod tests {
             "a latched connection may not fire the action twice"
         );
         assert_eq!(
-            en.counters().any_illegal(AnyIllegalCause::TlsProfile(
+            en.counters().facts_any_illegal(AnyIllegalCause::TlsProfile(
                 HelloRejectReason::ServerNameMismatch
             )),
             1,
             "a later AnyIllegal fact still folds by its exact cause"
         );
-        assert_eq!(en.counters().any_illegal_total(), 2);
+        assert_eq!(en.counters().facts_any_illegal_total(), 2);
     }
 
     #[test]
@@ -254,18 +270,19 @@ mod tests {
         );
         assert_eq!(
             en.counters()
-                .any_illegal(AnyIllegalCause::ConnectParse(ConnectHeadReason::WrongPort)),
+                .facts_any_illegal(AnyIllegalCause::ConnectParse(ConnectHeadReason::WrongPort)),
             1,
             "WrongPort folds into its own counter"
         );
         assert_eq!(
-            en.counters().any_illegal(AnyIllegalCause::ConnectParse(
-                ConnectHeadReason::TransferEncoding
-            )),
+            en.counters()
+                .facts_any_illegal(AnyIllegalCause::ConnectParse(
+                    ConnectHeadReason::TransferEncoding
+                )),
             1,
             "TransferEncoding folds into its own distinct counter"
         );
-        assert_eq!(en.counters().any_illegal_total(), 2);
+        assert_eq!(en.counters().facts_any_illegal_total(), 2);
     }
 
     #[test]
@@ -285,7 +302,7 @@ mod tests {
             }
         );
         assert!(en.test_blocked(ordinal));
-        assert_eq!(en.counters().domain_blocks(ordinal), 1);
+        assert_eq!(en.counters().actions_domain_block(ordinal), 1);
         assert!(!en.block_all());
     }
 
@@ -304,8 +321,92 @@ mod tests {
                 scope: Scope::Connection
             }
         );
-        assert_eq!(en.counters().domain_flares(ordinal), 1);
-        assert_eq!(en.counters().domain_blocks(ordinal), 0);
+        assert_eq!(en.counters().actions_flare(ordinal), 1);
+        assert_eq!(en.counters().actions_domain_block(ordinal), 0);
+    }
+
+    #[test]
+    fn all_transition_is_a_derived_latch_count_not_a_duplicate_action_total() {
+        let t = table(
+            AnyIllegalScope::All,
+            &[(ActionKind::FlareOnly, Scope::Connection)],
+        );
+        let mut en = Enforcement::new(t);
+        let mut latch = FirstSlot::new();
+        let effect = en.decide(
+            &mut latch,
+            Violation::AnyIllegal {
+                cause: AnyIllegalCause::HostNotAllowlisted,
+            },
+        );
+        assert_eq!(effect, Effect::Block { scope: Scope::All });
+        assert!(en.block_all());
+        assert_eq!(
+            en.counters().actions_block_all(),
+            1,
+            "the All latch records one transition"
+        );
+        assert_eq!(
+            en.counters().actions_total(),
+            1,
+            "M2: the one applied first-slot Block is the only action counted; ba is a derived view"
+        );
+    }
+
+    #[test]
+    fn block_all_latch_counts_the_transition_once_not_every_all_application() {
+        let t = table(AnyIllegalScope::All, &[(ActionKind::Block, Scope::All); 2]);
+        let mut en = Enforcement::new(t);
+        let mut latch = FirstSlot::new();
+        en.decide(
+            &mut latch,
+            Violation::AnyIllegal {
+                cause: AnyIllegalCause::HostNotAllowlisted,
+            },
+        );
+        let ordinal = t.ordinal(0).expect("big table ordinal");
+        en.decide(&mut latch, Violation::EarlyUpstreamData { ordinal });
+        assert!(en.block_all(), "both applications select Block All");
+        assert_eq!(
+            en.counters().actions_block_all(),
+            1,
+            "L1: the latch transition counts once even across a later All application"
+        );
+    }
+
+    #[test]
+    fn early_data_unknown_outcome_is_one_detection_fact_not_two() {
+        let small = table(
+            AnyIllegalScope::Connection,
+            &[(ActionKind::FlareOnly, Scope::Connection)],
+        );
+        let mut en = Enforcement::new(small);
+        let mut latch = FirstSlot::new();
+        let big = table(
+            AnyIllegalScope::Connection,
+            &[(ActionKind::Block, Scope::All); 2],
+        );
+        let unbound = big.ordinal(1).expect("big table ordinal");
+        let effect = en.decide(
+            &mut latch,
+            Violation::EarlyUpstreamData { ordinal: unbound },
+        );
+        assert!(matches!(effect, Effect::Unknown { .. }));
+        assert_eq!(
+            en.counters().facts_total(),
+            1,
+            "M2: an early-data Unknown outcome is one detection event, not two"
+        );
+        assert_eq!(
+            en.counters().facts_early_data(unbound),
+            1,
+            "the detection is typed as early upstream data on its ordinal"
+        );
+        assert_eq!(
+            en.counters().facts_unknown(UnknownReason::UnboundOrdinal),
+            0,
+            "M2: the Unknown is the outcome, carried by the correlation, not a second fact"
+        );
     }
 
     #[test]
@@ -328,16 +429,28 @@ mod tests {
                 reason: UnknownReason::UnboundOrdinal
             }
         ));
-        assert_eq!(en.counters().unknown(UnknownReason::UnboundOrdinal), 1);
-        assert_eq!(en.counters().unknown_total(), 1);
+        assert_eq!(
+            en.counters().facts_early_data(unbound),
+            1,
+            "the early-data detection folds its own fact exactly once"
+        );
+        assert_eq!(
+            en.counters().facts_unknown(UnknownReason::UnboundOrdinal),
+            0,
+            "M2: an early-data Unknown outcome is one detection fact, not a second unknown"
+        );
+        assert_eq!(en.counters().unknown_total(), 0);
         assert_eq!(
             en.decide(&mut latch, Violation::EvidenceInsufficient),
             Effect::Unknown {
                 reason: UnknownReason::NotYetValidated
             }
         );
-        assert_eq!(en.counters().unknown(UnknownReason::NotYetValidated), 1);
-        assert_eq!(en.counters().unknown_total(), 2);
+        assert_eq!(
+            en.counters().facts_unknown(UnknownReason::NotYetValidated),
+            1
+        );
+        assert_eq!(en.counters().unknown_total(), 1);
         assert!(!en.block_all(), "Unknown must never set the All latch");
     }
 
@@ -365,8 +478,12 @@ mod tests {
             }
         );
         assert!(!en.block_all());
-        assert_eq!(en.counters().unknown(UnknownReason::MissingParseResult), 1);
-        assert_eq!(en.counters().unknown(UnknownReason::Unattributed), 1);
+        assert_eq!(
+            en.counters()
+                .facts_unknown(UnknownReason::MissingParseResult),
+            1
+        );
+        assert_eq!(en.counters().facts_unknown(UnknownReason::Unattributed), 1);
         assert!(
             !en.test_blocked(t.ordinal(0).expect("ordinal")),
             "Unknown must never mark a configured domain blocked"

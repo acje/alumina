@@ -24,6 +24,10 @@ pub enum AnyIllegalScope {
     All = 1,
 }
 
+impl AnyIllegalScope {
+    pub const COUNT: usize = 2;
+}
+
 /// Per-domain action kind. `Tarpit` is deferred and is not a legal
 /// operational action; configuration selecting it is rejected at parse with
 /// an explicit deferred-status diagnostic.
@@ -71,6 +75,14 @@ pub struct DomainOrdinal(u8);
 impl DomainOrdinal {
     fn mint(index: usize, count: usize) -> Option<DomainOrdinal> {
         if index < count && count <= ALLOWLIST_MAX {
+            Some(DomainOrdinal(index as u8))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn from_index(index: usize) -> Option<DomainOrdinal> {
+        if index < ALLOWLIST_MAX {
             Some(DomainOrdinal(index as u8))
         } else {
             None

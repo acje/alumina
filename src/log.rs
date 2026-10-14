@@ -25,6 +25,9 @@ use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use crate::cache::Family;
+use crate::enforcement::action::{AnyIllegalScope, DomainOrdinal, Scope};
+use crate::enforcement::monitor::{CapturedFact, Monitor};
+use crate::enforcement::policy::{AnyIllegalCause, Effect, UnknownReason};
 use crate::inventory;
 use crate::startup_dns::NameOutcome;
 
@@ -142,6 +145,7 @@ enum Kind {
     CapacityLow,
     QueueHigh,
     QueueLow,
+    Monitor,
 }
 
 impl Kind {
@@ -157,6 +161,7 @@ impl Kind {
             Kind::CapacityLow => "capacity_low",
             Kind::QueueHigh => "queue_high",
             Kind::QueueLow => "queue_low",
+            Kind::Monitor => "monitor",
         }
     }
 }
@@ -438,6 +443,213 @@ fn encode_record_final(
         return None;
     }
     Some(w.len)
+}
+
+fn encode_monitor(slot_buf: &mut [u8; SLOT_BYTES], secs: u64, monitor: &Monitor) -> Option<usize> {
+    let mut w = Entry {
+        buf: slot_buf,
+        len: 0,
+    };
+    if !write_header(&mut w, Level::Info, Kind::Monitor) {
+        return None;
+    }
+    if !push_u64(&mut w, b"secs", secs) {
+        return None;
+    }
+    let ofacts = monitor.facts_any_illegal_overflow()
+        || monitor.facts_early_data_overflow()
+        || monitor.facts_unknown_overflow();
+    let globals: [(&[u8], u64); 13] = [
+        (&b"facts_total"[..], monitor.facts_total()),
+        (&b"actions_total"[..], monitor.actions_total()),
+        (&b"refusals_total"[..], monitor.refusals_total()),
+        (&b"ofacts"[..], ofacts as u64),
+        (&b"oactions"[..], monitor.actions_overflow() as u64),
+        (&b"orefusals"[..], monitor.refusals_overflow() as u64),
+        (&b"report_drops"[..], monitor.report_drops() as u64),
+        (
+            &b"oreport_drops"[..],
+            monitor.report_drops_overflow() as u64,
+        ),
+        (&b"capture_drops"[..], monitor.capture_drops() as u64),
+        (
+            &b"ocapture_drops"[..],
+            monitor.capture_drops_overflow() as u64,
+        ),
+        (
+            &b"s0"[..],
+            monitor.actions_first_slot_block(AnyIllegalScope::Connection) as u64,
+        ),
+        (
+            &b"s1"[..],
+            monitor.actions_first_slot_block(AnyIllegalScope::All) as u64,
+        ),
+        (&b"ba"[..], monitor.actions_block_all() as u64),
+    ];
+    for (key, value) in globals {
+        if !push_u64(&mut w, key, value) {
+            return None;
+        }
+    }
+    for index in 0..AnyIllegalCause::KIND_COUNT {
+        let value = monitor.facts_any_illegal_by_index(index);
+        if value > 0 && !push_indexed_u64(&mut w, b"c", index as u32, value as u64) {
+            return None;
+        }
+    }
+    for index in 0..UnknownReason::COUNT {
+        let value = monitor.facts_unknown_by_index(index);
+        if value > 0 && !push_indexed_u64(&mut w, b"unk", index as u32, value as u64) {
+            return None;
+        }
+    }
+    for index in 0..crate::config::ALLOWLIST_MAX {
+        let Some(ordinal) = DomainOrdinal::from_index(index) else {
+            break;
+        };
+        let facts = monitor.facts_early_data(ordinal);
+        let blocks = monitor.actions_domain_block(ordinal);
+        let flares = monitor.actions_flare(ordinal);
+        let refusals = monitor.refusals_blocked_domain(ordinal);
+        if facts > 0 && !push_indexed_key_u64(&mut w, b"d", index as u32, b"f", facts as u64) {
+            return None;
+        }
+        if blocks > 0 && !push_indexed_key_u64(&mut w, b"d", index as u32, b"b", blocks as u64) {
+            return None;
+        }
+        if flares > 0 && !push_indexed_key_u64(&mut w, b"d", index as u32, b"l", flares as u64) {
+            return None;
+        }
+        if refusals > 0 && !push_indexed_key_u64(&mut w, b"d", index as u32, b"r", refusals as u64)
+        {
+            return None;
+        }
+    }
+    for i in 0..monitor.capture_detail_len() {
+        let Some(cap) = monitor.capture_detail(i) else {
+            break;
+        };
+        if !push_indexed_key_u64(&mut w, b"x", i as u32, b"s", cap.slot as u64) {
+            return None;
+        }
+        if !push_indexed_key_u64(&mut w, b"x", i as u32, b"g", cap.generation) {
+            return None;
+        }
+        if !push_indexed_token_prefix(&mut w, b"x", i as u32, b"t")
+            || !push_fact_token(&mut w, &cap.detail.fact)
+        {
+            return None;
+        }
+        if !push_indexed_token_prefix(&mut w, b"x", i as u32, b"a")
+            || !push_effect_token(&mut w, &cap.detail.effect)
+        {
+            return None;
+        }
+    }
+    if !w.push(b"\n") {
+        return None;
+    }
+    Some(w.len)
+}
+
+fn push_u64(w: &mut Entry<'_>, key: &[u8], value: u64) -> bool {
+    w.push(b" ")
+        && w.push(key)
+        && w.push(b"=")
+        && fmt::Write::write_fmt(w, format_args!("{value}")).is_ok()
+}
+
+fn push_indexed_u64(w: &mut Entry<'_>, key: &[u8], index: u32, value: u64) -> bool {
+    if !w.push(b" ") || !w.push(key) {
+        return false;
+    }
+    if fmt::Write::write_fmt(w, format_args!("{index}")).is_err() {
+        return false;
+    }
+    if !w.push(b"=") {
+        return false;
+    }
+    if !fmt::Write::write_fmt(w, format_args!("{value}")).is_ok() {
+        return false;
+    }
+    true
+}
+
+fn push_indexed_key_u64(
+    w: &mut Entry<'_>,
+    key: &[u8],
+    index: u32,
+    suffix: &[u8],
+    value: u64,
+) -> bool {
+    if !w.push(b" ") || !w.push(key) {
+        return false;
+    }
+    if fmt::Write::write_fmt(w, format_args!("{index}")).is_err() {
+        return false;
+    }
+    if !w.push(suffix) || !w.push(b"=") {
+        return false;
+    }
+    fmt::Write::write_fmt(w, format_args!("{value}")).is_ok()
+}
+
+fn push_indexed_token_prefix(w: &mut Entry<'_>, key: &[u8], index: u32, suffix: &[u8]) -> bool {
+    if !w.push(b" ") || !w.push(key) {
+        return false;
+    }
+    if fmt::Write::write_fmt(w, format_args!("{index}")).is_err() {
+        return false;
+    }
+    w.push(suffix) && w.push(b"=")
+}
+
+fn push_fact_token(w: &mut Entry<'_>, fact: &CapturedFact) -> bool {
+    match *fact {
+        CapturedFact::AnyIllegal(cause) => {
+            if !w.push(b"a") {
+                return false;
+            }
+            fmt::Write::write_fmt(w, format_args!("{}", cause.kind_index())).is_ok()
+        }
+        CapturedFact::EarlyData(ordinal) => {
+            if !w.push(b"d") {
+                return false;
+            }
+            fmt::Write::write_fmt(w, format_args!("{}", ordinal.get())).is_ok()
+        }
+        CapturedFact::Unknown(reason) => {
+            if !w.push(b"u") {
+                return false;
+            }
+            fmt::Write::write_fmt(w, format_args!("{}", reason.index())).is_ok()
+        }
+    }
+}
+
+fn push_effect_token(w: &mut Entry<'_>, effect: &Effect) -> bool {
+    match *effect {
+        Effect::BaselineOnly => w.push(b"none"),
+        Effect::FlareOnly { scope } => push_scope_token(w, b"flr", scope),
+        Effect::Block { scope } => push_scope_token(w, b"blk", scope),
+        Effect::Unknown { reason } => {
+            if !w.push(b"unk") {
+                return false;
+            }
+            fmt::Write::write_fmt(w, format_args!("{}", reason.index())).is_ok()
+        }
+    }
+}
+
+fn push_scope_token(w: &mut Entry<'_>, prefix: &[u8], scope: Scope) -> bool {
+    if !w.push(prefix) || !w.push(b":") {
+        return false;
+    }
+    match scope {
+        Scope::Connection => w.push(b"c"),
+        Scope::Domain => w.push(b"d"),
+        Scope::All => w.push(b"a"),
+    }
 }
 
 /// One fixed 8 KiB slot. `bytes` is the encoded record length; slots are
@@ -842,6 +1054,23 @@ impl LogStore {
             Field::new("status", Val::Str(status.as_str())),
         ];
         self.enqueue(Level::Info, Kind::ShutdownFinal, &fields);
+    }
+
+    pub(crate) fn monitor_summary(&mut self, secs: u64, monitor: &Monitor) -> bool {
+        self.set_now(secs);
+        if self.count >= QUEUE_SLOTS {
+            return false;
+        }
+        let index = self.write_index();
+        let len = encode_monitor(&mut self.slots[index].buf, secs, monitor);
+        match len {
+            Some(len) => {
+                self.commit_record(index, len);
+                self.note_queue_usage();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Evaluates the 80%/70% capacity thresholds for tunnel slots and pending
@@ -1424,6 +1653,168 @@ mod tests {
         assert!(
             low_line[idx..].starts_with(exp) && !low_line[idx + exp.len()..].starts_with('0'),
             "low edge carries the real monotonic sec (review M3), got: {low_line}"
+        );
+    }
+
+    #[test]
+    fn logging_monitor_summary_exact_grammar_and_zero_suppression() {
+        use crate::enforcement::action::{AnyIllegalScope, DomainOrdinal};
+        use crate::enforcement::monitor::Monitor;
+        use crate::enforcement::policy::UnknownReason;
+        let mut m = Monitor::new();
+        m.note_fact_any_illegal(crate::enforcement::policy::AnyIllegalCause::HostNotAllowlisted);
+        m.note_fact_any_illegal(crate::enforcement::policy::AnyIllegalCause::HostNotAllowlisted);
+        m.note_fact_unknown(UnknownReason::Unattributed);
+        let ordinal = DomainOrdinal::from_index(0).expect("bound-level ordinal");
+        m.note_fact_early_data(ordinal);
+        m.note_action_first_slot_block(AnyIllegalScope::Connection);
+        m.note_action_domain_block(ordinal);
+        m.note_action_flare(ordinal);
+        let (mut store, mut file) = file_logstore();
+        assert!(store.monitor_summary(7, &m), "summary committed");
+        flush_all(&mut store);
+        let text = String::from_utf8(read_all(&mut file)).unwrap();
+        assert_eq!(
+            text,
+            "level=info kind=monitor secs=7 facts_total=4 actions_total=3 refusals_total=0 \
+             ofacts=0 oactions=0 orefusals=0 report_drops=0 oreport_drops=0 capture_drops=0 \
+             ocapture_drops=0 s0=1 s1=0 ba=0 \
+             c10=2 unk3=1 d0f=1 d0b=1 d0l=1\n",
+            "exact monitor grammar: always-emit globals, then zero-suppressed scoped segments"
+        );
+        assert!(
+            text.contains(" c10=2"),
+            "the AnyIllegal cause index 10 (HostNotAllowlisted) carries its fold: {text}"
+        );
+        assert!(
+            text.contains("unk3=1"),
+            "the Unattributed unknown reason index 3 carries its fold: {text}"
+        );
+        assert!(
+            !text.contains("c0="),
+            "zero causes stay suppressed (no c0 key)"
+        );
+        assert!(!text.contains(" d0="), "M4: no empty-valued d0 marker key");
+        assert!(
+            !text.contains(" r=1"),
+            "M4: per-field zero-suppression drops the zero refusal field"
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn logging_monitor_all_saturated_record_fits_the_8k_slot() {
+        use crate::enforcement::monitor::Monitor;
+        let mut m = Monitor::new();
+        m.saturate_all_for_test();
+        assert!(
+            m.capture_detail_len() == crate::enforcement::monitor::CAPTURE_DETAIL_LEN,
+            "the worst-case fixture fills the whole correlated-detail ring"
+        );
+        let (mut store, mut file) = file_logstore();
+        assert!(store.monitor_summary(7, &m), "summary committed");
+        flush_all(&mut store);
+        let text = String::from_utf8(read_all(&mut file)).unwrap();
+        assert!(
+            text.len() < SLOT_BYTES,
+            "the all-saturated monitor record stays inside the 8 KiB slot: {} bytes",
+            text.len()
+        );
+        assert!(
+            text.contains("ofacts=1"),
+            "saturation latches the aggregate overflow flags: {text}"
+        );
+        assert!(
+            text.contains("ocapture_drops=1"),
+            "correlated-detail loss latches its own overflow: {text}"
+        );
+        assert!(
+            text.contains("x0g="),
+            "the correlated-detail section is emitted once captures exist: {text}"
+        );
+        assert!(
+            text.contains("x0s=127"),
+            "the all-saturated capture ring carries its worst legal slot identity: {text}"
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn logging_monitor_emits_distinct_slot_identity_for_equal_generation_slots() {
+        use crate::enforcement::monitor::{CapturedDetail, SlotCapture};
+        let cause = AnyIllegalCause::HostNotAllowlisted;
+        let effect = Effect::Block {
+            scope: Scope::Connection,
+        };
+        let cap = |slot, generation| SlotCapture {
+            slot,
+            generation,
+            detail: Some(CapturedDetail {
+                fact: CapturedFact::AnyIllegal(cause),
+                effect,
+            }),
+        };
+        let mut m = Monitor::new();
+        m.note_consumed_capture(cap(0, 1));
+        m.note_consumed_capture(cap(1, 1));
+        let (mut store, mut file) = file_logstore();
+        assert!(store.monitor_summary(7, &m), "summary committed");
+        flush_all(&mut store);
+        let text = String::from_utf8(read_all(&mut file)).unwrap();
+        assert!(
+            text.contains("x0s=0") && text.contains("x1s=1"),
+            "H1': the encoded identity carries each capture's actual slot: {text}"
+        );
+        assert!(
+            text.contains("x0g=1") && text.contains("x1g=1"),
+            "H1': both slots share the equal per-slot generation: {text}"
+        );
+        assert!(
+            text.contains("x0t=a10") && text.contains("x1t=a10"),
+            "H1': both captures emit their typed fact: {text}"
+        );
+        assert!(
+            text.contains("x0a=blk:c") && text.contains("x1a=blk:c"),
+            "H1': both captures emit their applied effect: {text}"
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn logging_monitor_summary_on_full_ring_refuses_without_displacing_held_records() {
+        use crate::enforcement::monitor::Monitor;
+        use crate::enforcement::policy::UnknownReason;
+        let (mut store, mut file) = file_logstore();
+        let mut guard = 0;
+        while store.len() < QUEUE_SLOTS - 1 && guard < 8 * QUEUE_SLOTS {
+            store.startup_warning(100, "sub.example.org", Family::A);
+            guard += 1;
+        }
+        assert_eq!(store.len(), QUEUE_SLOTS - 1, "fill leaves one free slot");
+        store.shutdown_final(101, ShutdownStatus::Drained);
+        assert_eq!(
+            store.len(),
+            QUEUE_SLOTS,
+            "the shutdown verdict holds the last free ring slot"
+        );
+        let dropped_before = store.dropped();
+        let mut m = Monitor::new();
+        m.note_fact_unknown(UnknownReason::Unattributed);
+        assert!(
+            !store.monitor_summary(101, &m),
+            "a full-ring monitor summary is refused, not enqueued"
+        );
+        assert_eq!(
+            store.dropped(),
+            dropped_before,
+            "H2: the refused summary does not displace or count away any held record"
+        );
+        assert_eq!(store.len(), QUEUE_SLOTS, "all held records survive intact");
+        flush_all(&mut store);
+        let text = String::from_utf8(read_all(&mut file)).unwrap();
+        assert!(
+            text.contains("kind=shutdown_final"),
+            "the shutdown verdict remains emitted despite the refused monitor: {text}"
         );
     }
 

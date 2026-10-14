@@ -289,6 +289,24 @@ impl ServeStorage {
         self.logs.drain_sink();
     }
 
+    pub(crate) fn report_monitor_if_due(&mut self, now: Instant, force: bool) -> bool {
+        let secs = self.cache_secs(now);
+        let due = force || self.enforcement.monitor_due(secs);
+        if !due {
+            return false;
+        }
+        let committed = {
+            let monitor = self.enforcement.monitor();
+            self.logs.monitor_summary(secs, monitor)
+        };
+        if force {
+            self.enforcement.mark_forced_monitor_reported(committed);
+        } else {
+            self.enforcement.mark_monitor_reported(secs, committed);
+        }
+        true
+    }
+
     /// One cooperative DNS turn on the single retained transport: advances the
     /// outstanding exchange to its next phase when the shared owner has
     /// observed freshness or its deadline, folding the cache and refresh
@@ -948,6 +966,163 @@ mod tests {
         );
         storage.release(slot);
         assert_eq!(storage.occupied(), 0);
+    }
+
+    #[test]
+    fn monitor_report_emits_at_whole_second_cadence_clears_on_commit_and_counts_ring_refusals() {
+        use crate::enforcement::action::FirstSlot;
+        use crate::enforcement::policy::{AnyIllegalCause, Violation};
+        use std::time::Instant;
+        let mut storage = booted(1, 0);
+        const DNS_EPOCH: u64 = 1_700_000_000;
+        let origin = Instant::now();
+        storage.mount_clock(origin, DNS_EPOCH);
+
+        assert!(
+            !storage.report_monitor_if_due(origin, false),
+            "a clean monitor is never due"
+        );
+
+        storage.enforcement_mut().decide(
+            &mut FirstSlot::new(),
+            Violation::AnyIllegal {
+                cause: AnyIllegalCause::HostNotAllowlisted,
+            },
+        );
+        assert!(
+            storage.report_monitor_if_due(origin, false),
+            "a dirty monitor is due at the whole-second boundary"
+        );
+        assert_eq!(
+            storage.enforcement().monitor().report_drops(),
+            0,
+            "an unforced successful commit is not detail loss"
+        );
+        assert!(
+            !storage.report_monitor_if_due(origin, false),
+            "the same second suppresses the re-emission"
+        );
+        let one_second = origin + Duration::from_secs(1);
+        assert!(
+            !storage.report_monitor_if_due(one_second, false),
+            "H1: no new event between seconds, a committed aggregate is not due again"
+        );
+
+        storage.enforcement_mut().decide(
+            &mut FirstSlot::new(),
+            Violation::AnyIllegal {
+                cause: AnyIllegalCause::HostNotAllowlisted,
+            },
+        );
+        assert!(
+            storage.report_monitor_if_due(one_second, false),
+            "a fresh event re-dirties the aggregate at the next whole second"
+        );
+
+        {
+            let ring = storage.logs_mut();
+            for _ in 0..(crate::log::QUEUE_SLOTS) {
+                ring.startup_warning(DNS_EPOCH, "sub.example.org", Family::A);
+            }
+        }
+        let next = one_second + Duration::from_secs(1);
+        storage.enforcement_mut().decide(
+            &mut FirstSlot::new(),
+            Violation::AnyIllegal {
+                cause: AnyIllegalCause::HostNotAllowlisted,
+            },
+        );
+        assert!(
+            storage.report_monitor_if_due(next, false),
+            "a ring-full summary is still due at the next whole second"
+        );
+        assert_eq!(
+            storage.enforcement().monitor().report_drops(),
+            1,
+            "the ring-full refusal is honest detail loss on the monitor aggregate"
+        );
+        assert!(
+            storage.report_monitor_if_due(next + Duration::from_secs(1), false),
+            "L3: a refused summary stays dirty so the next second re-emits"
+        );
+    }
+
+    #[cfg(all(test, feature = "alloc-witness"))]
+    #[test]
+    fn monitor_detection_report_and_drain_paths_spend_zero_allocations() {
+        use crate::alloc::{Phase, run_phase};
+        use crate::enforcement::action::FirstSlot;
+        use crate::enforcement::policy::{AnyIllegalCause, Violation};
+        let mut storage = booted(1, 0);
+        const DNS_EPOCH: u64 = 1_700_000_000;
+        storage.mount_clock(Instant::now(), DNS_EPOCH);
+        let cause = AnyIllegalCause::HostNotAllowlisted;
+        let (_, counts) = run_phase(Phase::Serving, || {
+            for _ in 0..256 {
+                storage
+                    .enforcement_mut()
+                    .decide(&mut FirstSlot::new(), Violation::AnyIllegal { cause });
+            }
+        });
+        assert!(
+            counts.all_zero(),
+            "the detection fold (facts + first-slot action) allocates nothing: {counts:?}"
+        );
+        let (_, counts) = run_phase(Phase::Logging, || {
+            for _ in 0..4 {
+                let now = Instant::now();
+                storage.report_monitor_if_due(now, false);
+                storage.logs_mut().drain_sink();
+            }
+        });
+        assert!(
+            counts.all_zero(),
+            "the summary report encode + ring + sink drain allocate nothing: {counts:?}"
+        );
+    }
+
+    #[cfg(all(test, feature = "alloc-witness"))]
+    #[test]
+    fn monitor_nonempty_detail_ring_report_and_drain_spend_zero_allocations() {
+        use crate::alloc::{Phase, run_phase};
+        use crate::enforcement::action::Scope;
+        use crate::enforcement::monitor::{CapturedDetail, CapturedFact, SlotCapture};
+        use crate::enforcement::policy::{AnyIllegalCause, Effect};
+        let mut storage = booted(1, 0);
+        const DNS_EPOCH: u64 = 1_700_000_000;
+        storage.mount_clock(Instant::now(), DNS_EPOCH);
+        let cause = AnyIllegalCause::HostNotAllowlisted;
+        let effect = Effect::Block {
+            scope: Scope::Connection,
+        };
+        for slot in 0..crate::enforcement::monitor::CAPTURE_DETAIL_LEN {
+            storage
+                .enforcement_mut()
+                .note_consumed_capture(SlotCapture {
+                    slot,
+                    generation: slot as u64,
+                    detail: Some(CapturedDetail {
+                        fact: CapturedFact::AnyIllegal(cause),
+                        effect,
+                    }),
+                });
+        }
+        assert_eq!(
+            storage.enforcement().monitor().capture_detail_len(),
+            crate::enforcement::monitor::CAPTURE_DETAIL_LEN,
+            "the witness populates a nonempty correlated-detail ring"
+        );
+        let (_, counts) = run_phase(Phase::Logging, || {
+            for _ in 0..4 {
+                let now = Instant::now();
+                storage.report_monitor_if_due(now, false);
+                storage.logs_mut().drain_sink();
+            }
+        });
+        assert!(
+            counts.all_zero(),
+            "the correlated-detail x-segment encode + drain allocate nothing on a populated ring: {counts:?}"
+        );
     }
 }
 
