@@ -251,6 +251,34 @@ fn hello_wire(sni: &[u8], ech_only: bool) -> Vec<u8> {
     record
 }
 
+fn hello_wire_no_sni() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0x2a; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+    body.extend_from_slice(&[0x01, 0x00]);
+    let ext = [0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04];
+    body.push((ext.len() >> 8) as u8);
+    body.push((ext.len() & 0xff) as u8);
+    body.extend_from_slice(&ext);
+
+    let mut hs = vec![
+        0x01,
+        (body.len() >> 16) as u8,
+        (body.len() >> 8) as u8,
+        (body.len() & 0xff) as u8,
+    ];
+    hs.extend_from_slice(&body);
+
+    let mut record = Vec::new();
+    record.extend_from_slice(&[0x16, 0x03, 0x03]);
+    record.push((hs.len() >> 8) as u8);
+    record.push((hs.len() & 0xff) as u8);
+    record.extend_from_slice(&hs);
+    record
+}
+
 fn drive_hello(serving: &mut Serving, wire: &[u8], approved: &str) {
     let index = 0;
     let ws = &mut serving.slots[index];
@@ -387,6 +415,63 @@ fn hello_with_ech_is_rejected_without_forwarding() {
             serving.storage().occupied(),
             0,
             "the ECH connection is closed without forwarding"
+        );
+    });
+}
+
+#[test]
+fn hello_without_sni_identity_is_rejected_without_forwarding() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let wire = hello_wire_no_sni();
+        let mut insp = ChInspector::new();
+        assert!(
+            matches!(insp.feed(&wire), Ok(Inspect::Complete { .. })),
+            "the absent-SNI fixture must parse so validation is what denies it"
+        );
+        let approved = FixedHostname::normalize(b"sub.example.org");
+        assert_eq!(
+            client_hello::validate(insp.hello().expect("parsed hello"), &approved.unwrap()),
+            Err(client_hello::ChError::InvalidServerName {
+                detail: "requires exactly one host_name entry",
+            }),
+            "an absent SNI is a missing-identity denial, not a mismatch"
+        );
+        drive_hello(serving, &wire, "sub.example.org");
+        assert_eq!(
+            serving.slots[0].fwd, 0,
+            "no client byte may be forwarded upstream for a hello with no SNI identity"
+        );
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the missing-identity connection is closed and its seat released"
+        );
+    });
+}
+
+#[test]
+fn hello_with_illegal_sni_name_is_rejected_without_forwarding() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let wire = hello_wire(b"!bad", false);
+        let mut insp = ChInspector::new();
+        assert!(
+            matches!(
+                insp.feed(&wire),
+                Err(client_hello::ChError::InvalidServerName { .. })
+            ),
+            "an illegal FQDN host_name must fail parsing as malformed identity"
+        );
+        drive_hello(serving, &wire, "sub.example.org");
+        assert_eq!(
+            serving.slots[0].fwd, 0,
+            "no client byte may be forwarded upstream for a malformed SNI identity"
+        );
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the malformed-identity connection is closed and its seat released"
         );
     });
 }
