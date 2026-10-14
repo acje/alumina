@@ -1,24 +1,23 @@
 # Alumina — Reduced-Copy Single-Owner Relay Plan (Proposed)
 
-> **STATUS: §4 direct initialized-tail reads IMPLEMENTED (alumina-vdpi.3, after
-> AS-IS `8dbbec8`); §7 measurement plan NOT RUN — no measured or
-> release-qualified performance claim.** The direct initialized-tail read
-> described in §4 is implemented in both directions in `src/serving.rs`
-> (`client_readable` up read and `relay_upstream_to_client` down read): socket
-> bytes are read directly into the boot-initialized unused retained tail,
-> the returned read count is committed once (`buf_len/down_len += n`), and
-> parsers feed from already-retained bytes with no append copy. The
-> scratch→retained placement copies listed in §2 (`"the copy this plan
-> removes"`) are removed. Remaining copies are unchanged: kernel socket copies,
-> the parser workspace copies §5.1 (CONNECT 8 KiB `src/connect.rs:133-139`;
-> ClientHello input+flatten `src/client_hello.rs:232-243,304`), and relay-phase
-> compaction. Behaviour is preserved (byte-exact relay, gates, compaction
-> absolute offsets, directional FIN, full-room guards, shared fair budget
-> unchanged); exact-input gate evidence is recorded under `alumina-vdpi.3`.
-> The canonical specification `docs/alumina-proxy.md` (sha256 `322b68ee…5b836`)
-> is byte-unchanged. Earlier plan text describing the seams at HEAD `aa92329`
-> or as **PROPOSED** describes the design as authored before implementation;
-> §4/§5 headers carry the implemented status.
+> **STATUS: REVERTED TO AS-IS — CURRENT; §4 direct initialized-tail reads
+> HISTORICAL (implemented `54a34ce`, measured as a retained variant, now
+> reverted).** The current checkout reads socket bytes into a CHUNK-sized stack
+> `scratch` clamped by `io_room` to the shared 16-op / 64 KiB whole-visit
+> budget, then appends them once into the retained buffer — byte-identical to
+> the corrected AS-IS `8dbbec8` runtime (`Serving::client_readable`,
+> `Serving::append_client_bytes`; `Serving::relay_upstream_to_client`).
+> The direct initialized-tail reads of §4 were implemented in `54a34ce`,
+> measured over the 100 Mbps trust-pair (scoped observation in
+> `docs/benchmarks/100mbps-comparison.md`; raw timed JSON under
+> `docs/benchmarks/results/`), showed no lower observed proxy CPU in that
+> single pair, and were reverted by explicit user decision (`alumina-cd9n`).
+> This document distinguishes the current restored behavior from that
+> historical implemented+measured+reverted variant and makes **no
+> production-qualification claim**. The canonical specification
+> `docs/alumina-proxy.md` (sha256 `322b68ee…5b836`) is byte-unchanged. Earlier
+> plan text describing the seams at HEAD `aa92329` or as **PROPOSED** is
+> historical design context; §4/§5 describe the reverted mechanism.
 
 ## 1. Objective, alignment, scope
 
@@ -27,6 +26,12 @@ single-owner relay by reading socket bytes directly into the already-initialized
 unused tail of the existing retained per-direction buffer — and committing only
 the returned **read** count — while leaving every fixed limit, cursor, gate
 accounting rule, and outcome unchanged.
+
+**Current status.** This objective describes the §4 mechanism as a plan. The
+mechanism was implemented in `54a34ce`, measured over the 100 Mbps trust-pair,
+showed no lower observed proxy CPU in that single pair, and was reverted by
+explicit user decision; the current checkout restores the scratch→retained
+receive the plan set out to replace (see §2 and the banner above).
 
 **Alignment with what already exists.** Bimodality and typed teardown are
 **already-realised, as-built** design, not something this plan creates. The
@@ -60,16 +65,17 @@ The plan's scope is therefore the **narrower retained-store copy removal**,
 orthogonal to the parser workspaces: it does *not* create bimodality, enable
 opaque forwarding, or touch typed teardown.
 
-**Scope (historical — the removed copies).** At plan authorship the two read
-sites in `src/serving.rs` read into a stack `scratch` and then copied into the
-retained buffer; §4 removes exactly those copies and both sites now read
-directly into the retained tail (no scratch in the up/down payload receive
-paths):
+**Scope (current — the copy is restored).** The two receive sites in
+`src/serving.rs` read into a stack `scratch` clamped by `io_room`, then append
+once into the retained buffer; the §4 direct initialized-tail reads are removed
+in the current checkout, byte-identical to the corrected AS-IS `8dbbec8`
+runtime:
 
-- client → upstream (`client_readable`): read at `src/serving.rs:1363-1376` →
-  the `append_client_bytes` copy at `src/serving.rs:1405-1413`.
-- upstream → client (`relay_upstream_to_client`): read at `src/serving.rs:1846
-  -1854` → the `down` copy at `src/serving.rs:1861-1865`.
+- client → upstream (`Serving::client_readable`): read into
+  `scratch[..room]` (room-limited via `io_room`) → the
+  `Serving::append_client_bytes` copy.
+- upstream → client (`Serving::relay_upstream_to_client`): read into
+  `scratch[..room]` (room-limited via `io_room`) → the `down` copy.
 
 **Out of scope (unchanged behaviour / preserved exclusions).**
 
@@ -108,44 +114,46 @@ store (`src/serving.rs:343-373,494-500`):
 
 ### 2.1 Copy inventory — client → upstream (per byte, current)
 
-1. **Read** client socket into the boot-initialized retained tail, room-limited
-   (`src/serving.rs:1680-1686`: `room = io_room(index, CHUNK)`; `CHUNK = 4096`
-   `:116`; typed visit budget `VISIT_OPS` / `VISIT_BYTES` `:99-100`). Nonblocking;
-   `WouldBlock` returns without progress; `Ok(0)` → `Activity::Eof`.
-2. ~~**Append copy**~~ **Removed by §4 (implemented):** the read targets
-   `&mut buf[buf_len .. buf_len + room]` directly and commits `buf_len += n`
-   once; no scratch-to-retained copy exists in the up path.
-3. **Conditional compaction** `compact()`: `copy_within(fwd..buf_len, 0)` moving
-   the live tail front, `buf_base` advanced in lockstep (`src/serving.rs:507
-   -516`); runs only when `fwd > 0` (relay) and the tail is near cap
-   (`buf_room`, `:1556-1561`).
+1. **Read** client socket into a CHUNK-sized stack `scratch`, room-limited
+   (`Serving::client_readable`: `scratch` + `room = io_room(index, CHUNK)`;
+   `CHUNK`; typed visit budget `VISIT_OPS` / `VISIT_BYTES`).
+   Nonblocking; `WouldBlock` returns without progress; `Ok(0)` →
+   `Activity::Eof`.
+2. **Append copy (current, restored AS-IS)** `append_client_bytes`:
+   `copy_from_slice(&scratch[..n])` into the retained tail then `buf_len += n`
+   once (`Serving::append_client_bytes`). §4's direct initialized-tail read removed
+   this copy in the reverted `54a34ce` variant (historical-implemented).
+3. **Conditional compaction** `compact()` (`SlotWorkspace::compact`:
+   `copy_within(fwd..buf_len, 0)` moving the live tail front, `buf_base`
+   advanced in lockstep); runs only when `fwd > 0` (relay) and the tail is
+   near cap (`Serving::buf_room`).
 4. **Parser/inspector internal copies (remain, out of scope):** CONNECT head
    copy (`src/connect.rs:133-139`); ClientHello input copy + flat-record copy
    (`src/client_hello.rs:232-243,304`); both fixed-array workspaces accounted in
    `SLOT_WORKSPACE_BYTES` (`src/inventory.rs:15-18`).
-5. **Syscall write** upstream, `fwd += n` only on `Ok(n)` (`drain_to_upstream`
-   `src/serving.rs:2045-2094`).
+5. **Syscall write** upstream, `fwd += n` only on `Ok(n)` (`Serving::drain_to_upstream`).
 
 ### 2.2 Copy inventory — upstream → client (per byte, current)
 
-1. **Read** upstream socket into the boot-initialized retained down tail,
-   room-limited (`src/serving.rs:2211-2218`: `room = io_room(index, CHUNK)`),
-   blocked at `down_len + CHUNK > DOWN_CAP` (`:2208-2210`).
-2. ~~**Retained copy**~~ **Removed by §4 (implemented):** the read targets
-   `&mut down[down_len .. down_len + room]` directly and commits `down_len += n`
-   once; no scratch-to-retained copy exists in the down path.
-3. **Syscall write** client, `down_off += n` only on `Ok(n)` (`flush_down`
-   `src/serving.rs:2148-2200`); full drain resets both cursors to 0
-   (`:2195-2199`).
+1. **Read** upstream socket into a CHUNK-sized stack `scratch`, room-limited
+   (`Serving::relay_upstream_to_client`: `scratch` + `room = io_room(index, CHUNK)`),
+   blocked at `down_len + CHUNK > DOWN_CAP` (down-cap guard).
+2. **Retained copy (current, restored AS-IS)**
+   `down[down_len..].copy_from_slice(&scratch[..n])` then `down_len += n` once
+   (`Serving::relay_upstream_to_client` retained copy). §4's direct read removed this copy in the
+   reverted `54a34ce` variant (historical-implemented).
+3. **Syscall write** client, `down_off += n` only on `Ok(n)` (`Serving::flush_down`);
+   full drain resets both cursors to 0 (flush_down full-drain reset).
 
 ### 2.3 Gate and D3 write accounting (current)
 
 Forwarded-byte accounting advances **only on successful writes**, cumulative and
 non-decreasing (`src/gate.rs:208-240`). `committed = buf_base + fwd − head_len`
-(`src/serving.rs:2110-2113`). `drain_to_upstream` may issue several successful writes
+(`Serving::flush_client_upstream` projection). `drain_to_upstream` may issue several successful writes
 in one burst; `flush_client_upstream` then reports the cumulative projection
-ONCE per burst via `gate.upstream_write(committed)` (`:2097-2146`; report at
-`:2114`). D3 hence
+ONCE per burst via `gate.upstream_write(committed)` (`Serving::flush_client_upstream`;
+first `gate.upstream_write(committed)`, then the second-drain
+`gate.upstream_write(committed2)` report). D3 hence
 locates the gate opening in this **worker accounting transition — before any
 subsequent upstream read — not inside a single write syscall**
 (`docs/architecture.md:75-79`; `docs/alumina-proxy.md:147`). `upstream_write` returns
@@ -156,10 +164,11 @@ cumulative − hello_len` counts the **accepted** trailing bytes only
 **Immediate post-opening second drain.** On `GateOpened`/`Open`, after the gate
 transition sets `Stage::Relay`, `flush_client_upstream` **immediately** calls
 `drain_to_upstream` a second time and, if the second burst advanced `committed`,
-issues a second `gate.upstream_write(committed2)` (`src/serving.rs:2127-2140`).
+issues a second `gate.upstream_write(committed2)` (`Serving::flush_client_upstream`
+second drain).
 A residual coalesced tail therefore persists when the second drain **either**
 stalls on a non-writable upstream **or** exits on an exhausted shared
-complete-visit budget (`src/serving.rs:2049-2050`), leaving the tail for a
+complete-visit budget (`Serving::drain_to_upstream` exhausted-budget exit), leaving the tail for a
 later visit; otherwise it drains in the same call.
 
 ## 3. Concrete stream examples (source walk at aa92329, not executed)
@@ -230,11 +239,17 @@ no-half-close-with-pending invariant (RF-003). Existing real-socket test
 exercises client FIN then reverse drain (`src/serving.rs:3229-3339`; inspected,
 not rerun here).
 
-## 4. Direct initialized-tail read (IMPLEMENTED)
+## 4. Direct initialized-tail read (HISTORICAL — implemented `54a34ce`, measured, then reverted)
 
 The seam is *reading directly into the initialized unused retained tail* and
 committing only the returned count, dropping the stack `scratch` and its copy
 into the retained buffer for both directions.
+
+> All line references inside §4/§5 point at the reverted `54a34ce` revision's
+> source layout (direct-read cells) and do **not** exist in the current restored
+> checkout; the current mechanism is §2's scratch→retained receive. This section
+> is retained as design + audit history of the implemented+measured+reverted
+> variant.
 
 ### 4.1 Up direction (client → upstream)
 
@@ -322,42 +337,42 @@ cycle drives real sockets or adds a seam is a test-story decision consistent
 with this plan's unchanged scope. The previous version overstated this need as a
 required helper; this plan presents it as optional.
 
-## 5. Diagrams (IMPLEMENTED)
+## 5. Diagrams (HISTORICAL — `54a34ce` mechanism, reverted)
 
 ### 5.1 Data path before/after, both directions
 
 ```mermaid
 flowchart LR
-    subgraph UpBefore["UP — BEFORE (stack scratch + copy, removed)"]
+    subgraph UpBefore["UP — CURRENT (restored AS-IS: stack scratch + copy)"]
         C1[client socket] -- "read 4KiB" --> S1[/stack scratch 4KiB/]
         S1 -- "copy into retained tail" --> B1[(retained buf 512KiB)]
         B1 -- "feed slice (parser workspaces copy)" --> P1[CONNECT/CH workspaces]
         B1 -- "write ok -> fwd+=n" --> U1[upstream socket]
     end
-    subgraph UpAfter["UP — AFTER (direct initialized-tail read)"]
+    subgraph UpAfter["UP — HISTORICAL 54a34ce (direct initialized-tail read, reverted)"]
         C2[client socket] -- "read up to room (io_room <= CHUNK) direct into retained tail" --> B2[(retained buf 512KiB)]
         B2 -- "feed slice (parser workspaces copy)" --> P2[CONNECT/CH workspaces]
         B2 -- "write ok -> fwd+=n" --> U2[upstream socket]
     end
-    subgraph DownBefore["DOWN — BEFORE (stack scratch + copy, removed)"]
+    subgraph DownBefore["DOWN — CURRENT (restored AS-IS: stack scratch + copy)"]
         U3[upstream socket] -- "read 4KiB" --> S3[/stack scratch 4KiB/]
         S3 -- "copy into retained tail" --> B3[(retained down 512KiB)]
         B3 -- "write ok -> down_off+=n" --> C3[client socket]
     end
-    subgraph DownAfter["DOWN — AFTER (direct initialized-tail read)"]
+    subgraph DownAfter["DOWN — HISTORICAL 54a34ce (direct initialized-tail read, reverted)"]
         U4[upstream socket] -- "read up to room (io_room <= CHUNK) direct into retained tail" --> B4[(retained down 512KiB)]
         B4 -- "write ok -> down_off+=n" --> C4[client socket]
     end
 ```
 
 ```text
-BEFORE   client -> upstream : read->scratch  copy(scratch->buf)  feed(parse)  write(fwd)
-AFTER    client -> upstream : read -> buf tail (direct, room<=CHUNK)  feed(parse)  write(fwd)
-                              (scratch + scratch->buf copy removed)
+CURRENT  client -> upstream : read->scratch  copy(scratch->buf)  feed(parse)  write(fwd)
+HIST (54a34ce, reverted) client -> upstream : read -> buf tail (direct, room<=CHUNK)  feed(parse)  write(fwd)
+                              (direct read; scratch + scratch->buf copy removed in that variant)
 
-BEFORE   upstream -> client : read->scratch  copy(scratch->down)  write(down_off)
-AFTER    upstream -> client : read -> down tail (direct, room<=CHUNK)  write(down_off)
-                              (scratch + scratch->down copy removed)
+CURRENT  upstream -> client : read->scratch  copy(scratch->down)  write(down_off)
+HIST (54a34ce, reverted) upstream -> client : read -> down tail (direct, room<=CHUNK)  write(down_off)
+                              (direct read; scratch + scratch->down copy removed in that variant)
 
 Workspace copies that REMAIN (not copy-free):
   CONNECT head copy (src/connect.rs:133-139)
@@ -365,13 +380,13 @@ Workspace copies that REMAIN (not copy-free):
   compaction copy_within (src/serving.rs:507-516)   [relay phase only]
 ```
 
-### 5.2 Cursor/held picture per direction (implemented)
+### 5.2 Cursor/held picture per direction (historical `54a34ce` — reverted)
 
 ```text
 UP    held       absolute [buf_base .. buf_base + buf_len)
       forwarded  absolute [buf_base .. buf_base + fwd)     (fwd = in-buffer offset)
       gate committed abs = buf_base + fwd - head_len
-      DIRECT tail read (implemented): &buf[buf_len .. buf_len+room], room = io_room(index, CHUNK) (<= CHUNK, nonzero), then buf_len += n
+      DIRECT tail read (reverted 54a34ce): &buf[buf_len .. buf_len+room], room = io_room(index, CHUNK) (<= CHUNK, nonzero), then buf_len += n
 
   buf_base            buf_base+fwd         buf_base+buf_len
   |-------------------|---------------------|----------------------|
@@ -382,7 +397,7 @@ UP    held       absolute [buf_base .. buf_base + buf_len)
   |                   |<- compact() moves (fwd..buf_len)->0, buf_base+=fwd -- relay only
 
 DOWN  held [.. down_len)   written [.. down_off)
-      DIRECT tail read (implemented): &down[down_len .. down_len+room], room = io_room(index, CHUNK) (<= CHUNK, nonzero), then down_len += n
+      DIRECT tail read (reverted 54a34ce): &down[down_len .. down_len+room], room = io_room(index, CHUNK) (<= CHUNK, nonzero), then down_len += n
   |--------|----------------------------------|---------------------|
   | written| pending                          | empty tail (init,   |
   down_off|                                  down_len     reusable) |
@@ -393,27 +408,32 @@ DOWN  held [.. down_len)   written [.. down_off)
 | Element | Value / rule | Source |
 |---|---|---|
 | Retained per-slot store | 2 × 512 KiB (`buf`+`down`), 128 slots, 128 MiB | `inventory.rs:9-12`; `docs/alumina-proxy.md:161-164,183` |
-| Boot ownership | single boot owner, buffers moved in by value, no post-boot heap alloc/dealloc | `serving.rs:640-648` (`Serving::preallocate` seam), `470-500` (`with_traffic` move-by-value `buf: up` at :483 / `down` at :492); `docs/alumina-proxy.md:150,206` |
-| Complete-visit I/O budget | one shared 64 KiB-or-16-ops read+write budget per connection visit, whichever first; direct tail reads/writes are clamped to the remaining room via `io_room` | `serving.rs:99-100` (`VISIT_OPS`/`VISIT_BYTES`), `1565-1597` (`visit_exhausted`/`note_op`/`io_room`), `2045-2094` (`drain_to_upstream`), `2148-2200` (`flush_down`); `docs/alumina-proxy.md:146` |
+| Boot ownership | single boot owner, buffers moved in by value, no post-boot heap alloc/dealloc | `Serving::preallocate` boot seam; `with_traffic` (move-by-value `buf: up` / `down`); `docs/alumina-proxy.md:150,206` |
+| Complete-visit I/O budget | one shared 64 KiB-or-16-ops read+write budget per connection visit, whichever first; direct tail reads/writes are clamped to the remaining room via `io_room` | `VISIT_OPS`/`VISIT_BYTES`; `Serving::visit_exhausted`/`note_op`/`io_room`; `Serving::drain_to_upstream`; `Serving::flush_down`; `docs/alumina-proxy.md:146` |
 | Setup caps | CONNECT 8 KiB; ClientHello ≤ 64 KiB, record payload 16 KiB; serving buffers are the coarser backstop | `connect.rs:8,131-152`; `client_hello.rs:6-9,238-249`; `docs/alumina-proxy.md:163-164` |
-| Gate accounting | `committed = buf_base + fwd − head_len`; advance only on successful writes; **no second byte count** | `serving.rs:2110-2113`; `gate.rs:208-240`; `docs/alumina-proxy.md:147,220` |
-| Gate open | one `gate.upstream_write` per burst + immediate second drain on open; opens before subsequent upstream read; coalesced `X` retained, never duplicated | `gate.rs:213-240`; `serving.rs:2097-2146`; D3 |
+| Gate accounting | `committed = buf_base + fwd − head_len`; advance only on successful writes; **no second byte count** | `Serving::flush_client_upstream`; `gate.rs:208-240`; `docs/alumina-proxy.md:147,220` |
+| Gate open | one `gate.upstream_write` per burst + immediate second drain on open; opens before subsequent upstream read; coalesced `X` retained, never duplicated | `gate.rs:213-240`; `Serving::flush_client_upstream`; D3 |
 | Barriers | no client bytes before full validation; no upstream bytes before gate open; pre-open upstream activity terminates | `gate.rs:245-252`; `docs/alumina-proxy.md:201` |
-| Down reset/backpressure | full-drain reset; full tail → no read, stall/re-arm; fixed 200/refusal bodies | `serving.rs:2195-2199,2208-2210`; `docs/alumina-proxy.md:185` |
-| Drain/closure | first EOF starts never-reset 5 s drain; directional half-close only when drained; both-EOF+drained closes exactly once | `serving.rs:82,2326,2364-2401`; `docs/alumina-proxy.md:190-191` |
-| Parser workspace copies | CONNECT 8 KiB + ClientHello 64 KiB input/flatten copies **remain** (not copy-free) | §5.1; `serving.rs:1754,1983`; `docs/alumina-proxy.md:206` |
-| Compaction | `compact()` relay-only (pre-gate `fwd == 0`), `buf_base` lockstep, cumulative invariant preserved | `serving.rs:507-516`; D5 |
+| Down reset/backpressure | full-drain reset; full tail → no read, stall/re-arm; fixed 200/refusal bodies | `Serving::flush_down` full-drain reset; `Serving::relay_upstream_to_client` down-cap guard; `docs/alumina-proxy.md:185` |
+| Drain/closure | first EOF starts never-reset 5 s drain; directional half-close only when drained; both-EOF+drained closes exactly once | `DRAIN_SECS`; `Serving::observe_up_eof`/`Serving::observe_down_eof`/`Serving::finish_drain`; `docs/alumina-proxy.md:190-191` |
+| Parser workspace copies | CONNECT 8 KiB + ClientHello 64 KiB input/flatten copies **remain** (not copy-free) | §5.1; `Serving::buffer_and_parse`/`Serving::buffer_and_validate`; `docs/alumina-proxy.md:206` |
+| Compaction | `compact()` relay-only (pre-gate `fwd == 0`), `buf_base` lockstep, cumulative invariant preserved | `SlotWorkspace::compact`; D5 |
 
 ## 7. Ranked seam assessment, workload model, measurement plan
 
 This section was written as pre-implementation assessment; it is now
 **historical design context**, not a decision record. The §4 direct-tail seam
 **was implemented** under explicit user authorization (`alumina-vdpi`: "User
-authorizes TO-BE implementation"; executed as `alumina-vdpi.3` on HEAD
-`8dbbec8`, preserved in the current `src/serving.rs` candidate). Measurement
-remains NOT RUN (§7.3); at authorship and now, **no measured-benefit claim is
-made** (`docs/alumina-proxy.md:185,236` throughput targets are unverified). The
-ranked seams below are retained as assessment only.
+authorizes TO-BE implementation"; executed as `54a34ce` after AS-IS
+`8dbbec8`), **measured** over the 100 Mbps trust-pair (scoped observation in
+`docs/benchmarks/100mbps-comparison.md`; raw timed JSON under
+`docs/benchmarks/results/`, valid=true with `workload_fulfilled=false`), and
+**then reverted** by explicit user decision (`alumina-cd9n`); the current
+candidate restores the §2 scratch→retained receive. The full §7.3 attribution
+plan remains not executed; the scoped trust-pair showed **no lower observed
+proxy CPU in that single pair** — that is all that is claimed, never a
+production-qualified result. The ranked seams below are retained as assessment
+only.
 
 ### 7.1 Ranked optimization seams (assessment)
 
@@ -477,13 +497,12 @@ read+write visit budget. **That gap was closed by the AS-IS fairness work
 (alumina-vdpi Phase A, published at `8dbbec8`), which introduced a
 complete-visit budget shared across reads and writes:** typed `VISIT_OPS = 16`
 / `VISIT_BYTES = 64 KiB` visit counters owned by dispatch
-(`src/serving.rs:99-100`); every read/write attempt is recorded via `note_op`
-(`:1565-1582`); the read arms (`client_readable` `:1644`,
-`relay_upstream_to_client` `:2202`) and the write drains
-(`drain_to_upstream` `:2045-2094`, `flush_down` `:2148-2200`) all check
+(`VISIT_OPS`/`VISIT_BYTES`); every read/write attempt is recorded via `note_op`;
+the read arms (`Serving::client_readable`, `Serving::relay_upstream_to_client`)
+and the write drains (`Serving::drain_to_upstream`, `Serving::flush_down`) all check
 `visit_exhausted`/`io_room` and count attempted syscalls incl. `WouldBlock`; and
 deadline/DNS/timer turns rejoin at most every 256 ready-slot visits or I/O ops
-(`:1604-1618`; `docs/alumina-proxy.md:146,213`). The earlier "reads alone are
+(`Serving::recheck_now` recheck seam; `docs/alumina-proxy.md:146,213`). The earlier "reads alone are
 budgeted, write drains lack counters" wording is **superseded** and does not
 describe HEAD `8dbbec8` or this candidate. Remaining qualification gates are
 distinct and still open: serving-phase allocation-freedom (hence no
@@ -508,62 +527,76 @@ future TDD cycle.
 
 ## 9. Discussion points (historical — resolved or superseded by implementation)
 
-1. **Test seam for the payload reads (RESOLVED).** Real sockets are already the
-   route the relay tests use; real client sockets are a valid deterministic
-   route for the up read. An injected count alone does not materialize bytes,
-   so a separate injection API is **optional**, not mandated (§4.3). The
-   implementation used the real-socket route (new tests
-   `direct_tail_up_read_commits_read_count_once_at_tail_offset` /
-   `_down_..._at_tail_offset`, `src/serving.rs`): both start `buf_len`/`down_len`
-   at 0, so they characterise the returned read count committed once and payload
-   byte-exactness at **zero** retained-tail offset (the read tail coincides with
-   the buffer head; the untouched sentinel byte after the committed count pins
-   commit-once). They do not pin a read at a **nonzero** retained-tail offset —
-   that remains an open coverage limitation (relay/compaction offset behaviour
-   is covered by the existing suite). The pre-open activity path keeps its
-   count-only `test_reads` semantics.
-2. **Implement now vs measure first (SUPERSEDED).** Authored as measure-first
-   advice: the comparable before/after measurement (§7.3) "*should* precede
-   committing to the borrow-risk surface". The user **explicitly authorized
-   implementation ahead of measurement** (`alumina-vdpi`), so the
-   recommendation does not guide the decision already made; it remains relevant
-   only to whether the implemented change is *kept* after a future trustworthy
-   A/B. If a measured CPU delta is negligible, the change can still be reverted
-   with evidence retained.
+1. **Test seam for the payload reads (RESOLVED → reverted).** Real sockets remain
+   the deterministic route the relay tests use. The implemented `54a34ce` tests
+   (`direct_tail_up_read_commits_read_count_once_at_tail_offset` /
+   `_down_..._at_tail_offset`) characterised the direct-read commit-once at
+   **zero** retained-tail offset in that revision. On revert, those two
+   direct-tail tests were replaced (approved Rust, `alumina-s3yd`) by
+   mechanism-agnostic characterisation tests
+   `up_socket_receive_appends_once_at_nonzero_retained_tail` /
+   `down_socket_receive_appends_once_at_nonzero_retained_tail`
+   (`src/serving.rs`; `RETAINED_OFFSET = 137` in the tests module): they seed a
+   **nonzero** retained-tail offset, deliver one payload chunk into it, and pin
+   that it is appended exactly once at that offset. The nonzero-offset coverage
+   limitation this section originally noted is thus **closed** by those tests on
+   the restored scratch→retained path; the earlier zero-offset direct-tail tests
+   are superseded. The pre-open activity path keeps its count-only `test_reads`
+   semantics.
+2. **Implement now vs measure first (SUPERSEDED — then acted).** Authored as
+   measure-first advice: the comparable before/after measurement (§7.3) "*should*
+   precede committing to the borrow-risk surface". The user **explicitly
+   authorized implementation ahead of measurement** (`alumina-vdpi`), so the
+   recommendation does not guide the decision already made. The scoped 100 Mbps
+   trust-pair A/B was subsequently measured on the `54a34ce` variant
+   (`docs/benchmarks/100mbps-comparison.md`; raw JSON under
+   `docs/benchmarks/results/`) and showed **no lower observed proxy CPU in that
+   single pair**, and the change was **reverted with evidence retained** by
+   explicit user decision (`alumina-cd9n`). The negligible-delta revert path this
+   point anticipated is exactly what occurred.
 
 ## 10. Deliverables, review gate, tracking, rollback
 
-**Historical note (prior session).** The bullets below as originally written
+**Historical note (prior sessions).** The bullets below as originally written
 described a documentation-only session at clean HEAD `aa92329` under the prior
 `alumina-bimodal-review` mission (it refined the tracked plan and the ignored
 local visual `.ooda/show-me-reduced-copy-relay.html`, and recorded evidence
 under `mission:alumina-bimodal-review`). That session's **decision and
-publication instructions are superseded** by the implemented status and by the
-current publication-preparation scope; current status is authoritative:
+publication instructions are superseded** by the implement→measure→revert
+sequence and by the current publication-preparation scope; current status is
+authoritative:
 
-- **Implementing session.** The §4 direct-tail change was implemented in
-  `src/serving.rs` as `alumina-vdpi.3` on HEAD `8dbbec8` (self-contained
+- **Implement-and-revert history.** The §4 direct-tail change was implemented
+  in `src/serving.rs` as `54a34ce` after AS-IS `8dbbec8` (self-contained
   candidate; Rust approval `alumina-ip9c`; runtime gates `alumina-x36s`; AS-IS
-  baseline `alumina-hkp6`). **This publication-preparation scope** (per
-  `alumina-d5hx`) resolves the B1/B2/B3 documentation contradictions in this
-  plan and in `docs/benchmarks/feature-match-matrix.md`; no runtime/spec/
-  dependency edits, no measured performance or release-qualified claim.
-  Canonical `docs/alumina-proxy.md` (sha256 `322b68ee…5b836`) is byte-unchanged;
-  user untracked drafts (`.DS_Store`, `scripts/bench_frame_echo.py/.new/.sh`)
-  are preserved untouched.
-- **Review gate.** Review-ready is returned to the commander for a
-  caller-owned **generic review** **before** any staging/commit/push. After
-  approval, only an ordinary inspected linear `main` commit/push carrying the
-  approved `src/serving.rs` plus exactly these two docs is authorized (no force
-  push, no amend of a pushed commit, no reset/stash/clean of shared main, no
-  forbidden hooks — effective hooks are absent); full staged content, hooks,
+  baseline `alumina-hkp6`), measured over the 100 Mbps trust-pair, and then
+  **reverted by explicit user decision** (`alumina-cd9n`). The current
+  `src/serving.rs` candidate is the corrected AS-IS runtime (byte-identical to
+  `8dbbec8`) with approved Rust review (`alumina-s3yd`, `review:approved`).
+  **This doc-correction scope** (`alumina-cd9n.2`) restores the corrected
+  budget/readiness/source-witness structure of this plan and of
+  `docs/benchmarks/feature-match-matrix.md` with explicit current → historical
+  (implemented-measured-reverted) labels; no runtime/spec/dependency edits, no
+  measured performance or release-qualified claim. Canonical
+  `docs/alumina-proxy.md` (sha256 `322b68ee…5b836`) is byte-unchanged; user
+  untracked drafts (`.DS_Store`, `scripts/bench_frame_echo.py/.new/.sh`) are
+  preserved untouched.
+- **Review gate.** Review-ready is returned to the commander for caller-owned
+  **doc review** of the corrected two docs **before** any staging/commit/push
+  (the Rust candidate already holds `review:approved`). After approval, only an
+  ordinary inspected linear `main` commit/push carrying the approved
+  `src/serving.rs` plus exactly these two corrected docs is authorized (no
+  force push, no amend of a pushed commit, no reset/stash/clean of shared main,
+  no forbidden hooks — effective hooks are absent); full staged content, hooks,
   remote and all outgoing commits are inspected first.
-- **Rollback.** Remove only Phase-B-owned hunks before publication if needed;
-  after publication, ordinary reviewed revert only. Preserve unrelated work.
+- **Rollback.** Remove only `alumina-cd9n.2`-owned doc hunks (apply inverse via
+  apply_patch) before publication if needed; after publication, ordinary
+  reviewed revert only. Preserve unrelated work.
 - **Beads / evidence.** Raw gate exits, candidate identity, native evidence
   correspondence and this doc-correction pass are recorded in the durable
-  evidence bead under `mission:alumina-vdpi`; the review-request routes through
-  the commander (generic review) before publication.
+  evidence bead under `mission:alumina-cd9n` (`alumina-vh5e`, superseded by the
+  raw-evidence bead with log pointers); the doc review-request routes through
+  the commander before publication.
 
 ## 11. References
 
@@ -573,7 +606,14 @@ current publication-preparation scope; current status is authoritative:
   invariants (`:198,201,206,213,220`), verification (`:223`).
 - `docs/architecture.md`: D2 two barriers, D3 gate opening, D4 early activity,
   D5/D5a/D5b accounting and buffer reuse, §4 state machine, §6 fixed storage.
-- Source seams cited in §2–§6 (all read at HEAD `aa92329`).
+- Source seams cited in §2–§6 (the restored-scratch current restore is the
+  **dirty working-tree candidate**, verified byte-against the restored AS-IS
+  `8dbbec8` runtime; clean committed HEAD `a9a8c2d` still contains the earlier
+  direct-tail receive layout; the reverted `54a34ce` source layout applies to
+  historical §4/§5 cells).
+- Benchmark record of the reverted variant:
+  `docs/benchmarks/100mbps-comparison.md` (scoped 100 Mbps trust-pair A/B,
+  AS-IS vs `54a34ce`); raw timed JSON under `docs/benchmarks/results/`.
 - Advisory beads: `alumina-bjbo` (oracle-summary), `alumina-d5s0` (orientation);
   prior oracle summaries `alumina-ynwp`, `alumina-bqtc`, ranked orientation
   `alumina-cub9`; user decision `alumina-3xjr.4` (direction A endorsed; kernel

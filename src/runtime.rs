@@ -592,8 +592,7 @@ mod tests {
         let mut dns_advanced_any = false;
         let mut expired_closed = false;
         let mut backlog_admitted = false;
-        let mut per_slot_repeat = [0usize; HOT_SLOTS];
-        let mut last_len = [0usize; HOT_SLOTS];
+        let mut second_visit_turn = [0i32; HOT_SLOTS];
         while turns < 900 {
             runtime
                 .turn(Some(Duration::from_millis(2)))
@@ -609,12 +608,11 @@ mod tests {
             backlog_admitted |= runtime.serving.storage().occupied() >= accept_backlog.len();
             let mut all_complete = true;
             for i in 0..HOT_SLOTS {
-                let len = got[i].lock().unwrap().len();
-                if len > last_len[i] {
-                    per_slot_repeat[i] += 1;
-                    last_len[i] = len;
+                let visits = runtime.serving.test_slot_visits(FIRST_HOT_INDEX + i);
+                if visits >= 2 && second_visit_turn[i] == 0 {
+                    second_visit_turn[i] = turns;
                 }
-                if len < per_slot {
+                if got[i].lock().unwrap().len() < per_slot {
                     all_complete = false;
                 }
             }
@@ -661,6 +659,14 @@ mod tests {
              {high_water} outside [200, 256]"
         );
         for i in 0..HOT_SLOTS {
+            assert!(
+                (1..=HOT_SLOTS as i32).contains(&second_visit_turn[i]),
+                "hot slot {i} must reach its second owner visit within one full round-robin pass \
+                 of the competing hot slots ({HOT_SLOTS} batches; one visit per slot per batch, \
+                 and 96KiB needs two visits under the 64KiB cap), so deferring the second visit \
+                 past a full pass is starvation; observed on turn {turn}",
+                turn = second_visit_turn[i]
+            );
             assert_eq!(
                 tails[i].len(),
                 per_slot,
@@ -671,11 +677,6 @@ mod tests {
                 &tails[i][..],
                 &pattern[..],
                 "hot relay {i} bytes byte-exact"
-            );
-            assert!(
-                per_slot_repeat[i] >= 2,
-                "hot slot {i} must be serviced repeatedly across owner turns (no starvation):                  on {repeat} turn(s) of {turns} total",
-                repeat = per_slot_repeat[i]
             );
         }
     }
@@ -1504,11 +1505,20 @@ mod tests {
                         }
                     }
                     SessionGate::Silent => {
+                        sock.set_nonblocking(true)
+                            .expect("silent session nonblocking");
                         let mut sink = [0u8; 64];
                         loop {
+                            if stop_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                                break;
+                            }
                             match sock.read(&mut sink) {
-                                Ok(0) | Err(_) => break,
+                                Ok(0) => break,
                                 Ok(_) => {}
+                                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                Err(_) => break,
                             }
                         }
                     }
@@ -1561,10 +1571,26 @@ mod tests {
         handle: thread::JoinHandle<()>,
     ) {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        std::net::TcpStream::connect(addr)
-            .expect("unblock the responder accept for a clean join")
-            .shutdown(std::net::Shutdown::Both)
-            .ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut last_err = None;
+        while !handle.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "responder did not stop within the 2s teardown deadline; last unblock connect \
+                     error: {last_err:?}"
+                );
+            }
+            match std::net::TcpStream::connect(addr) {
+                Ok(sock) => {
+                    sock.shutdown(std::net::Shutdown::Both).ok();
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
         handle.join().expect("join responder thread");
     }
 
