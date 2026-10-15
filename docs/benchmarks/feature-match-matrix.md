@@ -1,16 +1,16 @@
-# Alumina 8dbbec8 vs HAProxy 3.2.25 vs Envoy v1.39.4 — feature match matrix
+# Alumina e3a9ff1 vs HAProxy 3.2.25 vs Envoy v1.39.4 — feature match matrix
 
 ## Candidates
 
 | Candidate | Evidence identity |
 | --- | --- |
-| **Alumina 8dbbec8** | Canonical spec [docs/alumina-proxy.md](../../docs/alumina-proxy.md) (sha256 `322b68eeb1…` — **historical pre-rp2e spec digest**; current post-rp2e canonical sha256 `b5b1c9f…137d`); implementation `src/serving.rs`, `src/client_hello.rs`, `src/gate.rs`, `src/log.rs`, `src/worker.rs`; qualification owner `docs/qa-package/README.md` + `scripts/verify.sh`; 100 Mbps timed result in [`100mbps-comparison.md`](100mbps-comparison.md) |
+| **Alumina e3a9ff1** | Canonical spec [docs/alumina-proxy.md](../../docs/alumina-proxy.md) (sha256 `b5b1c9f…137d`, incl. `rp2e` tripwire/action/monitoring amendment); implementation `src/serving.rs`, `src/serving/{policy,reject,startup}.rs`, `src/client_hello.rs`, `src/connect.rs`, `src/eligibility.rs`, `src/enforcement/{mod,action,monitor,policy,state}.rs`, `src/gate.rs`, `src/log.rs`, `src/preflight.rs`, `src/runtime.rs`, `src/worker.rs`; qualification owner [docs/qa-package/README.md](../../docs/qa-package/README.md) + [scripts/verify.sh](../../scripts/verify.sh); 100 Mbps timed result in [100mbps-comparison.md](100mbps-comparison.md) |
 | **HAProxy** | Pinned **3.2.25** (LTS); haproxy.org 3.2 manual + sha256-verified tarball `d59a68d0…` (`alumina-722v`, `alumina-elyw`). Chosen comparable setup: TCP-mode near-direct TLS opaque relay — SNI allowlist, fixed backend, one configured thread, CONNECT stage skipped |
-| **Envoy** | Selected **envoyproxy/envoy:v1.39.4** (arm64 digest `ce82b213…`); official `terminate_http1_connect.yaml` CONNECT-terminate, raw TCP upstream, `--concurrency 1` (`alumina-elyw`). 100 Mbps timed result in [`100mbps-comparison.md`](100mbps-comparison.md) |
+| **Envoy** | Selected **envoyproxy/envoy:v1.39.4** (arm64 digest `ce82b213…`); official `terminate_http1_connect.yaml` CONNECT-terminate, raw TCP upstream, `--concurrency 1` (`alumina-elyw`). 100 Mbps timed result in [100mbps-comparison.md](100mbps-comparison.md) |
 
 ## Legend
 
-Alumina 8dbbec8 column tags:
+Alumina e3a9ff1 column tags:
 
 | Tag | Meaning |
 | --- | --- |
@@ -28,21 +28,26 @@ Candidate columns use exactly one grade:
 
 ## Matrix
 
-| # | Feature (selected benchmark config) | Alumina 8dbbec8 | HAProxy 3.2.25 | Envoy v1.39.4 |
-| --- | --- | --- | --- | --- |
-| 1 | CONNECT wire entry (selected happy-path): completed 200 before ClientHello | `R` `I` | different | ✓ matched (source) |
-| 2 | Endpoint TLS 1.3 pass-through — non-terminating, proxy holds no keys | `R` `I` | ✓ matched (source) | ✓ matched (source) |
-| 3 | Proxy-side TLS 1.3-only ClientHello profile | `R` `I` | different | different |
-| 4 | Initial SNI inspection / matching CONNECT SNI | `R` `I` | partial | different |
-| 5 | Full ClientHello validation (framing, versions, exactly-one SNI, duplicates) | `R` `I` | different | different |
-| 6 | ECH rejection (incl. GREASE) | `R` `I` | different | different |
-| 7 | CONNECT-hostname allowlist / authorization | `R` `I` | partial | different |
-| 8 | Two forwarding barriers (client-before-validation, upstream-before-gate, early data/EOF/reset closed) | `R` `I` | partial | different |
-| 9 | DNS provenance / cache-life / destination-address policy | `R` `I` | different | different |
-| 10 | Original byte preservation (ordered unmodified prefix) | `R` `I` | ✓ matched (source) | unverified |
-| 11 | Partial-I/O, FIN, backpressure | `R` `I` | unverified | unverified |
-| 12 | Bounded resources (fixed limits, reject-on-exhaustion) | `R` | unverified | unverified |
-| 13 | No heap alloc/dealloc while serving | `R` | unverified | unverified |
-| 14 | Single worker | `R` `I` | ✓ matched (config intent) | ✓ matched (source) |
-| 15 | Logging (stdout-only best-effort allocation-free) | `R` `I` | unverified | unverified |
-| 16 | Shutdown (SIGTERM-only, bounded grace, no policy reload) | `R` | unverified | unverified |
+| # | Feature (selected benchmark config) | Alumina e3a9ff1 | HAProxy 3.2.25 | Envoy v1.39.4 | Source / implementation witness |
+| --- | --- | --- | --- | --- | --- |
+| 1 | CONNECT wire entry: completed 200 before ClientHello | `R` `I` | different | ✓ matched (source) | Alumina: `src/serving.rs` (`SendingConnected` → `gate.on_response_ok()` → `Stage::ValidatingHello`); HAProxy: `http_ana.c:2138,2195`, `mux_h1.c:1812-1815` (native CONNECT awaits backend 2xx; benchmark skips CONNECT); Envoy: `upstream_request.cc:73-78` (synthesizes early 200 on TCP pool ready) |
+| 2 | Distinct RFC-aligned pre-200 CONNECT refusal wire contract — 400/403 empty body (`content-length: 0`) vs 502 (no resolved addresses / upstream connection failed), 503 (no capacity), 504 (setup deadline exceeded) static `text/plain; charset=utf-8` reason bodies | `R` `I` | unverified | unverified | Alumina: `src/serving.rs` (`policy.rs:16-34`, dispatch `serving.rs:197`) per `docs/alumina-proxy.md:43` |
+| 3 | Endpoint TLS 1.3 pass-through — non-terminating, proxy holds no keys | `R` `I` | ✓ matched (source) | ✓ matched (source) | Alumina: `src/serving.rs` (opaque byte relay, no SSL roles); HAProxy: `src/h1.c` / TLS pass-through listener; Envoy: `UpstreamConnection` raw-TCP `connect_matcher` route (no TLS in upstream path) |
+| 4 | Proxy-side TLS 1.3-only ClientHello profile (supported_versions 0x0304 only, legacy_version 0x0303, null compression, record <= 16 KiB, total <= 64 KiB) | `R` `I` | different | different | Alumina: `src/client_hello.rs:6-10,26-28,435,552` (docs/alumina-proxy.md:47,164); HAProxy: `req.ssl_*` accepts SSLv3+ ClientHello without a TLS 1.3-only profile; Envoy: no ClientHello inspection on the CONNECT-terminate path |
+| 5 | Initial SNI inspection / matching CONNECT SNI prefix | `R` `I` | partial | different | Alumina: `src/client_hello.rs:498,552` (SNI parse + match against CONNECT hostname); HAProxy: `req.ssl_sni` with `tcp-request content inspect-delay` (first ClientHello CH parse only, no CONNECT-SNI cross-check); Envoy: `connect_matcher` matches CONNECT authority only |
+| 6 | Full ClientHello validation — framing, vector bounds, exactly-one `server_name`, duplicate extension rejection, GREASE skip by length | `R` `I` | different | different | Alumina: `src/client_hello.rs:345,435,476,498,552`; HAProxy: `ssl_sock.c` CH scan is fixed-record tolerant but not fully validating; Envoy: TLS inspector is permissive for relay |
+| 7 | ECH 0xfe0d rejection (incl. GREASE ECH, never strip/rewrite) | `R` `I` | different | different | Alumina: `src/client_hello.rs:24,59,156` (reject on ECH, independent of GREASE skip); HAProxy/Envoy: no ECH-aware elimination mechanism |
+| 8 | CONNECT-hostname allowlist / authorization — 1..32 FQDNs, port 443 only, strict 4 KiB TOML config with no defaults | `R` `I` | partial | different | Alumina: `src/config.rs` (`Config::parse`, 1..32 `FixedHostname` entries, <= 4096 B), `src/connect.rs` (`ConnectParser`, port 443), `src/worker.rs` (`ServeStorage::decide`); HAProxy: `acl`/`use_backend` SNI allowlist in TCP mode (no CONNECT authority check); Envoy: fixed cluster destination in `connect_matcher` |
+| 9 | Two forwarding barriers — (A) client bytes held until validated CH + cumulative upstream-write gate accounting; (B) `observe_upstream_activity` terminates setup on early upstream data/EOF/reset | `R` `I` | partial | different | Alumina: `src/gate.rs:195-258`, `src/serving.rs:2123-2183,2310-2369`; HAProxy: `tcp-request content` buffer-hold approximates (A) but no explicit gate accounting; Envoy: no equivalent two-barrier model |
+| 10 | DNS provenance / cache-life / destination-address eligibility policy (TCP DNS + CSPRNG getrandom TIDs, rooted CNAME <= 8 links, 72 h stale grace, per-attempt revalidation, global-unicast IPv4/IPv6 filter) | `R` `I` | different | different | Alumina: `src/dns.rs`, `src/cache.rs`, `src/eligibility.rs:28-72` (`V4_EXCLUSIONS`, `2000::/3` + `V6_EXCLUSIONS`), `src/worker.rs` (`AttemptCounts` A/AAAA alternation); HAProxy/Envoy: standard upstream DNS without CONNECT-hostname provenance or global-unicast eligibility table |
+| 11 | Original byte preservation — ordered unmodified prefix forwarded to endpoint | `R` `I` | ✓ matched (source) | unverified | Alumina: `src/serving.rs:2221-2369` (`ws.buf[ws.head_len..ws.buf_len]` forwarded unmodified in order); HAProxy: opaque TCP relay forwards inspected bytes verbatim; Envoy: unverified for CONNECT raw upstream |
+| 12 | Partial-I/O, directional FIN half-close (5 s drain), socket backpressure | `R` `I` | unverified | unverified | Alumina: `src/serving.rs` (`drain_to_upstream`, `flush_down`, `observe_up_eof`, `observe_down_eof`; bounded grace then hard close) |
+| 13 | Two-pass per-slot readiness coalescing + bounded per-visit fairness — `VISIT_OPS = 16`, `VISIT_BYTES = 64 KiB`, `TIMER_RECHECK_EVERY = 256`, `POLL_EVENTS_CAP = 512` `CoalescedBatch`, `READ_CHUNK = 32 KiB` direct-into-slab, duplicate-free app reschedule queue | `R` `I` | different | different | Alumina: `src/serving.rs:99-128,402-460,1000-1115,1742-1797,2426-2469`; HAProxy/Envoy: standard epoll/event-loop readiness, no per-slot visit-budget model |
+| 14 | Bounded resources — fixed compile-time limits (128 tunnels, 32 pending setups, 2×512 KiB buffers = 128 MiB slab), 503 reject-on-exhaustion | `R` `I` | unverified | unverified | Alumina: `src/inventory.rs` (`BUFFER_BYTES = 512 KiB`, `TrafficStorage` 128 MiB), `src/worker.rs` (`MAX_TUNNELS = 128`, `MAX_PENDING_SETUPS = 32`), `src/serving.rs:197` (`BODY_503`) |
+| 15 | Zero post-boot heap allocation/deallocation | `R` `I` | unverified | unverified | Alumina: `alloc-witness` instrumentation, two reused slabs per tunnel, `src/inventory.rs`, `tests/mio_matrix.rs`; serving-completeness qualification owner `docs/qa-package/README.md` |
+| 16 | Single worker & shared-readiness cooperative runtime | `R` `I` | ✓ matched (config intent) | ✓ matched (source) | Alumina: `src/runtime.rs`, `src/serving.rs`, `src/worker.rs` (single `Serving` owner, shared `Readiness`/slab); HAProxy: `nbthread 1` (`haproxy.cfg`); Envoy: `--concurrency 1` a single `MainDispatcher`/worker loop `options_impl.cc:82-83` |
+| 17 | Mandatory unprivileged Linux startup preflight — `ruid/euid/suid/fsuid != 0`, `CapEff == CapPrm == CapAmb == 0`, `no_new_privs == 1`, fail-closed `EX_CONFIG` (78) | `R` `I` | unverified | unverified | Alumina: `src/preflight.rs:16-104` (`KernelFacts` from `/proc/self/status`, `check()`, exit 78 per docs/alumina-proxy.md:58,150,235) |
+| 18 | Configurable tripwire enforcement actions — `[any_illegal]` (`connection \| all` first-slot `Block`) + positional per-ordinal `[actions]` (`flare_only \| block on connection \| domain \| all`), synchronous cross-tunnel latching and physical slot closure on `Block Domain` / `Block All`, `Tarpit` deferred (`EX_CONFIG` 78) | `R` `I` | unverified | unverified | Alumina: `src/enforcement/{mod,action,policy,state}.rs`, `src/serving.rs:1853-1952` (`stop_domain_block`, `stop_block_all`), `src/config.rs` (docs/alumina-proxy.md:238-281) |
+| 19 | Bounded implicit stdout monitoring — saturated counters with overflow flags, per-window pacing, `CAPTURE_DETAIL_LEN = 64` first-detection ring with 55-bit `(slot, slot_gen)` correlation | `R` `I` | unverified | unverified | Alumina: `src/enforcement/monitor.rs:6-67` (`Monitor`, `ConsumedCapture`, `SaturatingCounter`), `src/serving.rs:156-157` (`LOCAL_MASK = 0x1ff`, `GEN_SHIFT = 9` -> 55-bit `slot_gen`), `src/log.rs:475-553`, `src/runtime.rs` (docs/alumina-proxy.md:283-300) |
+| 20 | Logging — stdout-only best-effort allocation-free structured records, 256×8 KiB queue, nonblocking drain 64 KiB / 16 ops per turn, whole-record drop+count | `R` `I` | unverified | unverified | Alumina: `src/log.rs` (fixed ring, single formatting entry, drop counter on queue-full) |
+| 21 | Shutdown — SIGTERM-only via self-pipe on shared poll, stops admission, 8 s non-extendable grace period, drains established tunnels, exits 0 (`Drained`) or 70 (`Forced`) without deallocating, no policy reload | `R` `I` | unverified | unverified | Alumina: `src/serving.rs:89-92,145-194` (`SIGNAL_LOCAL`, `SHUTDOWN_GRACE = 8 s`, `ShutdownExit`), `src/runtime.rs:127-141,324-327` (docs/alumina-proxy.md:149-150,181,192,220) |
