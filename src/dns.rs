@@ -495,20 +495,26 @@ impl<'a> Reader<'a> {
 }
 
 /// Decodes a (possibly compressed) name at `at`, returning the decoded bytes
-/// without a trailing root label plus the cursor just past the name. Names
-/// follow only backward compression pointers with a bounded visited set.
+/// without a trailing root label plus the cursor just past the name as it is
+/// encoded at `at`. Names follow only backward compression pointers with a
+/// bounded visited set. The returned cursor measures the encoded field (labels,
+/// root, or 2-byte pointer) as written at `at`, never the end of an expanded
+/// name reached by following a pointer, so callers can resume field parsing at
+/// the correct offset after a compressed owner, CNAME target, or SOA name.
 fn read_name(msg: &[u8], at: usize) -> Result<(DnsName, usize), DnsError> {
     let mut out = DnsName::default();
-    let mut cursor = at;
+    let mut field = at;
+    let mut decode = at;
     let mut total = 0usize;
     let mut pointers = 0usize;
+    let mut closed_by_pointer = false;
     loop {
-        let byte = msg.get(cursor).copied().ok_or(DnsError::MessageTooLong)?;
+        let byte = msg.get(decode).copied().ok_or(DnsError::MessageTooLong)?;
         match byte & 0xc0 {
             0x00 => {
                 let len = usize::from(byte);
                 if len == 0 {
-                    return Ok((out, cursor + 1));
+                    return Ok((out, if closed_by_pointer { field } else { field + 1 }));
                 }
                 if len > 63 {
                     return Err(DnsError::LabelTooLong { len });
@@ -517,7 +523,7 @@ fn read_name(msg: &[u8], at: usize) -> Result<(DnsName, usize), DnsError> {
                 if total > MAX_NAME_BYTES {
                     return Err(DnsError::NameTooLong);
                 }
-                let start = cursor + 1;
+                let start = decode + 1;
                 let end = start + len;
                 if end >= msg.len() {
                     return Err(DnsError::MessageTooLong);
@@ -528,26 +534,33 @@ fn read_name(msg: &[u8], at: usize) -> Result<(DnsName, usize), DnsError> {
                 for &b in &msg[start..end] {
                     out.push(b.to_ascii_lowercase())?;
                 }
-                cursor = end;
+                decode = end;
+                if !closed_by_pointer {
+                    field = end;
+                }
             }
             0xc0 => {
                 let hi = usize::from(byte & 0x3f);
                 let lo = usize::from(
-                    msg.get(cursor + 1)
+                    msg.get(decode + 1)
                         .copied()
                         .ok_or(DnsError::MessageTooLong)?,
                 );
                 let target = (hi << 8) | lo;
-                if target >= cursor {
+                if target >= decode {
                     return Err(DnsError::PointerNotBackward);
                 }
-                cursor = target;
+                if !closed_by_pointer {
+                    field = decode + 2;
+                    closed_by_pointer = true;
+                }
+                decode = target;
                 pointers += 1;
                 if pointers > 8 {
                     return Err(DnsError::PointerCycle);
                 }
             }
-            _ => return Err(DnsError::ReservedLabelType { offset: cursor }),
+            _ => return Err(DnsError::ReservedLabelType { offset: decode }),
         }
     }
 }
@@ -1129,6 +1142,31 @@ mod tests {
                 ttl: 120,
             }
         );
+    }
+
+    #[test]
+    fn parses_direct_a_with_compressed_owner() {
+        let mut msg = header(0x1234, true, 0, 1, 1, 0, 0);
+        msg.extend_from_slice(&qname_bytes("sub.example.org"));
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        msg.extend_from_slice(&[0xc0, 0x0c]);
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        msg.extend_from_slice(&60u32.to_be_bytes());
+        msg.extend_from_slice(&4u16.to_be_bytes());
+        msg.extend_from_slice(&[140, 82, 121, 5]);
+        let out = parse_response_ws("sub.example.org", Family::A, 0x1234, &msg).expect("parse");
+        match out {
+            Outcome::Positive { bindings, ttl, .. } => {
+                assert_eq!(
+                    bindings.as_slice(),
+                    &[NumericAddr::V4(Ipv4Addr::new(140, 82, 121, 5))]
+                );
+                assert_eq!(ttl, 60);
+            }
+            other => panic!("expected positive, got {other:?}"),
+        }
     }
 
     #[test]
