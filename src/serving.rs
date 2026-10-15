@@ -38,7 +38,6 @@ use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token};
 
@@ -110,15 +109,26 @@ const VISIT_BYTES: u32 = 64 * 1024;
 /// over-long batch cannot delay an expired deadline past this bound.
 const TIMER_RECHECK_EVERY: usize = 256;
 
-/// The fixed event-buffer capacity factor: the poll batch is a bounded
-/// snapshot, and per-batch slot dedup (one complete visit per connection per
-/// batch) means the visit budget, not this cap, bounds a slot's turn. This
-/// seed predates complete-visit accounting; scheduling is owned by
-/// [`VISIT_OPS`]/[`VISIT_BYTES`].
-const EVENT_CAP: usize = 16;
+/// The fixed event-buffer capacity: the poll batch is a bounded 512-event
+/// snapshot, preallocated at boot and reused across iterations. Per-batch slot
+/// dedup (one complete visit per connection per batch) means the visit budget,
+/// not this cap, bounds a slot's turn (docs/alumina-proxy.md:146).
+const POLL_EVENTS_CAP: usize = 512;
 
-/// Read chunk size; the relation CHUNK * EVENT_CAP = 64 KiB still bounds one
-/// direction's read shape, and the complete-visit budget bounds the total.
+/// The coarse direct-into-slab read chunk: a single read spans up to 32 KiB
+/// straight into the retained 512 KiB directional slab, amortizing
+/// epoll/read syscall density without a stack bounce buffer. The complete-visit
+/// budget still bounds the total.
+const READ_CHUNK: usize = 32 * 1024;
+
+/// The minimum free slab room below which a slot refuses rather than
+/// attempting another coarse read; equal to the legacy 4 KiB chunk, so the
+/// refusal thresholds keep their exact behaviour.
+const MIN_BUF_ROOM: usize = 4096;
+
+/// Read probe chunk for the pre-open upstream activity classification: only
+/// needs to fetch any byte to tell activity from EOF/reset, and stays small so
+/// no unused slab space is touched on a probe.
 const CHUNK: usize = 4096;
 
 /// Client sockets occupy tokens `1..=MAX_TUNNELS`; each upstream socket uses a
@@ -184,7 +194,7 @@ impl ShutdownExit {
 }
 
 const BODY_200: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
-const BODY_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
+const BODY_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 12\r\n\r\nno capacity\n";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReadOutcome {
@@ -365,13 +375,28 @@ impl DirectionalEof {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Readiness {
     readable: bool,
     writable: bool,
     error: bool,
     read_closed: bool,
     write_closed: bool,
+}
+
+impl Readiness {
+    /// Merges two readiness observations of the same socket in one poll batch:
+    /// the union of the two, so a readable and a writable token for a slot
+    /// coalesce into one contiguous visit arm without losing either interest.
+    fn merge(self, other: Readiness) -> Readiness {
+        Readiness {
+            readable: self.readable || other.readable,
+            writable: self.writable || other.writable,
+            error: self.error || other.error,
+            read_closed: self.read_closed || other.read_closed,
+            write_closed: self.write_closed || other.write_closed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +408,80 @@ impl Readiness {
             error: false,
             read_closed: false,
             write_closed: false,
+        }
+    }
+}
+
+/// One slot's merged readiness inside a poll batch, in first-arrival order.
+#[derive(Clone, Copy)]
+struct SlotCoalesce {
+    /// First-arrival order across slots; `u32::MAX` marks an unseen slot.
+    order: u32,
+    /// The slot generation recorded when the slot was first folded in this
+    /// batch, so a mid-batch reuse (via `accept_all` between two tokens for
+    /// the same index) drops the stale-generation token.
+    slot_gen: u64,
+    /// Whether the first token folded for this slot was the client arm; the
+    /// directions of a single-slot batch dispatch in first-arrival order.
+    client_first: bool,
+    client: Option<Readiness>,
+    upstream: Option<Readiness>,
+}
+
+impl SlotCoalesce {
+    const UNSEEN: u32 = u32::MAX;
+
+    const fn unseen() -> SlotCoalesce {
+        SlotCoalesce {
+            order: Self::UNSEEN,
+            slot_gen: 0,
+            client_first: false,
+            client: None,
+            upstream: None,
+        }
+    }
+
+    fn seen(&self) -> bool {
+        self.order != Self::UNSEEN
+    }
+}
+
+/// The stack-allocated, zero-heap two-pass coalescer: Pass 1 folds every
+/// `(Token, Readiness)` in a poll batch into per-slot merged readiness in
+/// first-arrival order (a slot's client and upstream tokens merge even when
+/// other slots' tokens interleave), and Pass 2 re-dispatches each slot
+/// contiguously within one visit — no false `!live_here` reschedules and no
+/// wasted `epoll_ctl(EPOLL_CTL_MOD)` re-arms.
+#[derive(Clone, Copy)]
+struct CoalescedBatch {
+    slots: [SlotCoalesce; MAX_TUNNELS],
+    seen: usize,
+}
+
+impl CoalescedBatch {
+    fn new() -> CoalescedBatch {
+        CoalescedBatch {
+            slots: [SlotCoalesce::unseen(); MAX_TUNNELS],
+            seen: 0,
+        }
+    }
+
+    /// The index of the next slot to dispatch: the unseen slot with the
+    /// earliest first-arrival order (`None` when every seen slot is consumed).
+    fn next(&mut self) -> Option<usize> {
+        let mut best = None;
+        let mut best_order = u32::MAX;
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.seen() && slot.order < best_order {
+                best_order = slot.order;
+                best = Some(index);
+            }
+        }
+        if let Some(index) = best {
+            self.slots[index].order = SlotCoalesce::UNSEEN;
+            Some(index)
+        } else {
+            None
         }
     }
 }
@@ -619,7 +718,7 @@ impl Serving {
             storage,
             listener: None,
             slots,
-            events: Events::with_capacity(EVENT_CAP * 4),
+            events: Events::with_capacity(POLL_EVENTS_CAP),
             listener_pause_until: None,
             dns_event: false,
             visit: VisitState::idle(),
@@ -808,6 +907,14 @@ impl Serving {
     /// Runs one poll iteration, dispatching every ready event and enforcing
     /// the earliest pending deadline (setup, relay idle, or FIN drain).
     ///
+    /// The batch is folded through a two-pass slot readiness coalescer: Pass 1
+    /// first-handles the SIGTERM self-pipe, accepts listener work, raises the
+    /// DNS freshness flag, and merges every connection token into per-slot
+    /// readiness in first-arrival order; Pass 2 then re-dispatches each slot's
+    /// client and upstream arms contiguously within one visit, so interleaved
+    /// client+upstream tokens for the same slot can never false-`!live_here`
+    /// reschedule or waste an `epoll_ctl(EPOLL_CTL_MOD)` re-arm.
+    ///
     /// # Errors
     ///
     /// Returns a serve error when the poll call itself or a listener re-arm
@@ -837,22 +944,169 @@ impl Serving {
         self.expire_sweep(now);
         self.batch_gen = self.batch_gen.wrapping_add(1);
         self.in_batch = true;
+        let mut items = [(Token(0), Readiness::default()); POLL_EVENTS_CAP];
+        let mut count = 0;
         for event in batch.iter() {
             if event.token().0 & LOCAL_MASK == SIGNAL_LOCAL {
                 continue;
             }
+            items[count] = (
+                event.token(),
+                Readiness {
+                    readable: event.is_readable(),
+                    writable: event.is_writable(),
+                    error: event.is_error(),
+                    read_closed: event.is_read_closed(),
+                    write_closed: event.is_write_closed(),
+                },
+            );
+            count += 1;
+        }
+        self.dispatch_coalesced_batch(&items[..count])?;
+        self.events = batch;
+        Ok(())
+    }
 
+    /// Two-pass slot readiness coalescing for one poll batch (or a direct test
+    /// caller): merges every connection token into per-slot readiness in
+    /// first-arrival order, then dispatches each distinct slot's client and
+    /// upstream arms back-to-back within a single contiguous visit
+    /// (`self.visit = VisitState::live(index)`). `SIGNAL_LOCAL` is assumed
+    /// already pre-handled by the caller ([`Self::run_once`]) and is ignored
+    /// here; listener, DNS, generation, and error readiness handling each keep
+    /// the exact behaviour of [`Self::dispatch_readiness`] (which remains
+    /// unchanged for direct per-token test callers).
+    ///
+    /// Pass 1 folds the batch into per-slot merged readiness in first-arrival
+    /// order (a slot's client and upstream tokens merge even when other slots'
+    /// tokens interleave). The listener is folded as its own dispatch unit so
+    /// the recheck decision precedes the accept batch (MEDIUM-2). Slot tokens
+    /// are skipped when the slot is idle, when their generation does not match
+    /// the live slot generation, or when a mid-batch reuse gives them a
+    /// generation different from the one recorded for the slot in this batch.
+    ///
+    /// Pass 2 dispatches each distinct slot contiguously in arrival order with
+    /// its directions ordered by first arrival (`client_first`), each arm
+    /// guarded so a slot closed (`Stage::Idle`) or re-admitted at a newer
+    /// generation by [`Self::accept_all`], [`Self::recheck_now`], or the slot's
+    /// own first arm is never dispatched onto stale state. The first arm opens
+    /// the slot's single visit and the second merges into it (HIGH-1 dedup),
+    /// so interleaved tokens can never fall into another slot's live visit and
+    /// false-reschedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serve error when a dispatched arm errors.
+    fn dispatch_coalesced_batch(
+        &mut self,
+        tokens: &[(Token, Readiness)],
+    ) -> Result<(), ServeError> {
+        let mut coalesced = CoalescedBatch::new();
+        for (token, ready) in tokens {
+            let raw = token.0;
+            let local = raw & LOCAL_MASK;
+            if raw == 0 {
+                if self.recheck_due() {
+                    self.recheck_now();
+                }
+                self.accept_all()?;
+                continue;
+            }
+            if local == DNS_LOCAL {
+                self.dns_event = true;
+                continue;
+            }
+            if local == SIGNAL_LOCAL {
+                continue;
+            }
+            let event_gen = (raw >> GEN_SHIFT) as u64;
+            let upstream = local >= UPSTREAM_BASE;
+            let index = if upstream {
+                local - UPSTREAM_BASE
+            } else {
+                local - 1
+            };
+            if index >= self.slots.len() {
+                continue;
+            }
+            if self.slots[index].stage == Stage::Idle {
+                continue;
+            }
+            if event_gen != self.slots[index].slot_gen {
+                continue;
+            }
+            let acc = &mut coalesced.slots[index];
+            if acc.seen() && acc.slot_gen != event_gen {
+                continue;
+            }
+            if !acc.seen() {
+                acc.order = coalesced.seen as u32;
+                acc.slot_gen = event_gen;
+                acc.client_first = !upstream;
+                coalesced.seen += 1;
+            }
+            if upstream {
+                acc.upstream = Some(match acc.upstream {
+                    Some(prior) => prior.merge(*ready),
+                    None => *ready,
+                });
+            } else {
+                acc.client = Some(match acc.client {
+                    Some(prior) => prior.merge(*ready),
+                    None => *ready,
+                });
+            }
+        }
+        while let Some(index) = coalesced.next() {
             if self.recheck_due() {
                 self.recheck_now();
             }
-            self.dispatch(event)?;
+            let slot_gen = coalesced.slots[index].slot_gen;
+            let first_client = coalesced.slots[index].client_first;
+            let (client_ready, upstream_ready) = (
+                coalesced.slots[index].client,
+                coalesced.slots[index].upstream,
+            );
+            if self.slots[index].slot_gen == slot_gen
+                && self.slots[index].stage != Stage::Idle
+                && let Some(ready) = if first_client {
+                    client_ready
+                } else {
+                    upstream_ready
+                }
+            {
+                self.dispatch_readiness(
+                    if first_client {
+                        client_token(slot_gen, index)
+                    } else {
+                        upstream_token(slot_gen, index)
+                    },
+                    ready,
+                )?;
+            }
+            if self.slots[index].slot_gen == slot_gen
+                && self.slots[index].stage != Stage::Idle
+                && let Some(ready) = if first_client {
+                    upstream_ready
+                } else {
+                    client_ready
+                }
+            {
+                self.dispatch_readiness(
+                    if first_client {
+                        upstream_token(slot_gen, index)
+                    } else {
+                        client_token(slot_gen, index)
+                    },
+                    ready,
+                )?;
+            }
         }
         if let VisitState::Live { ops, .. } = self.visit {
             self.note_visit(ops);
         }
         self.visit = VisitState::idle();
         self.in_batch = false;
-        self.events = batch;
         Ok(())
     }
 
@@ -867,19 +1121,6 @@ impl Serving {
             self.reregister_listener()?;
         }
         Ok(())
-    }
-
-    fn dispatch(&mut self, event: &Event) -> Result<(), ServeError> {
-        self.dispatch_readiness(
-            event.token(),
-            Readiness {
-                readable: event.is_readable(),
-                writable: event.is_writable(),
-                error: event.is_error(),
-                read_closed: event.is_read_closed(),
-                write_closed: event.is_write_closed(),
-            },
-        )
     }
 
     fn dispatch_readiness(&mut self, token: Token, ready: Readiness) -> Result<(), ServeError> {
@@ -1343,7 +1584,7 @@ impl Serving {
 
     fn buf_room(&mut self, index: usize) -> usize {
         let ws = &mut self.slots[index];
-        if ws.fwd > 0 && HOLD_CAP - ws.buf_len < CHUNK {
+        if ws.fwd > 0 && HOLD_CAP - ws.buf_len < READ_CHUNK {
             ws.compact();
         }
         HOLD_CAP - ws.buf_len
@@ -1381,6 +1622,28 @@ impl Serving {
                 .min(default)
         } else {
             default
+        }
+    }
+
+    /// The bounded byte room for one coarse direct-into-slab read on `index`:
+    /// at most `READ_CHUNK`, capped by the slab's free tail (`slab_room`) and
+    /// the visit's remaining byte budget. A relay read is always paired with
+    /// the flush write that drains it in the same visit, so once the live
+    /// visit has more than `MIN_BUF_ROOM` left the read is bounded to
+    /// `(rem / 2).min(READ_CHUNK)`, leaving at least half the remaining budget
+    /// for the flush. A return of 0 means no read should be attempted now (the
+    /// paired flush owns the remaining budget, so the caller re-arms instead).
+    fn read_room(&self, index: usize, slab_cap: usize, slab_len: usize) -> usize {
+        let slab_room = slab_cap - slab_len;
+        let rem = self.io_room(index, usize::MAX);
+        if self.slots[index].stage == Stage::Relay {
+            if rem <= MIN_BUF_ROOM {
+                0
+            } else {
+                (rem / 2).min(READ_CHUNK).min(slab_room)
+            }
+        } else {
+            rem.min(READ_CHUNK).min(slab_room)
         }
     }
 
@@ -1450,7 +1713,7 @@ impl Serving {
             {
                 return Ok(());
             }
-            if self.buf_room(index) < CHUNK {
+            if self.buf_room(index) < MIN_BUF_ROOM {
                 match self.slots[index].stage {
                     Stage::ReadingConnect => {
                         self.any_illegal(
@@ -1476,39 +1739,44 @@ impl Serving {
                     return Ok(());
                 }
             }
-            let mut scratch = [0u8; CHUNK];
-            let room = self.io_room(index, CHUNK);
-            let n = match self.slots[index].client.as_mut() {
-                None => return Ok(()),
-                Some(client) => match client.read(&mut scratch[..room]) {
-                    Ok(0) => {
-                        self.note_op(index, 0);
-                        if self.slots[index].stage == Stage::Relay {
-                            return self.observe_up_eof(index);
-                        }
-                        self.close_slot(index);
-                        return Ok(());
+            let room = self.read_room(index, HOLD_CAP, self.slots[index].buf_len);
+            if room == 0 {
+                self.reschedule(index);
+                return Ok(());
+            }
+            let result = {
+                let ws = &mut self.slots[index];
+                let Some(client) = ws.client.as_mut() else {
+                    return Ok(());
+                };
+                client.read(&mut ws.buf[ws.buf_len..ws.buf_len + room])
+            };
+            let n = match result {
+                Ok(0) => {
+                    self.note_op(index, 0);
+                    if self.slots[index].stage == Stage::Relay {
+                        return self.observe_up_eof(index);
                     }
-                    Ok(n) => n,
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        self.note_op(index, 0);
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        self.note_op(index, 0);
-                        self.close_slot(index);
-                        return Ok(());
-                    }
-                },
+                    self.close_slot(index);
+                    return Ok(());
+                }
+                Ok(n) => n,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.note_op(index, 0);
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.note_op(index, 0);
+                    self.close_slot(index);
+                    return Ok(());
+                }
             };
             self.note_op(index, n);
+            self.slots[index].buf_len += n;
             match self.slots[index].stage {
-                Stage::ReadingConnect => self.buffer_and_parse(index, &scratch[..n])?,
-                Stage::ValidatingHello => self.buffer_and_validate(index, &scratch[..n])?,
-                Stage::Relay => {
-                    self.append_client_bytes(index, &scratch[..n]);
-                    self.flush_client_upstream(index)?;
-                }
+                Stage::ReadingConnect => self.buffer_and_parse(index, &[])?,
+                Stage::ValidatingHello => self.buffer_and_validate(index, &[])?,
+                Stage::Relay => self.flush_client_upstream(index)?,
                 _ => return Ok(()),
             }
             if self.visit_exhausted(index) {
@@ -1540,7 +1808,9 @@ impl Serving {
     }
 
     fn buffer_and_parse(&mut self, index: usize, bytes: &[u8]) -> Result<(), ServeError> {
-        self.append_client_bytes(index, bytes);
+        if !bytes.is_empty() {
+            self.append_client_bytes(index, bytes);
+        }
         let head = {
             let ws = &mut self.slots[index];
             let start = ws.parse_rel;
@@ -1723,7 +1993,11 @@ impl Serving {
                 self.refuse(index, Refusal::Forbidden);
                 Ok(())
             }
-            Ok(ConnectPhase::NoBinding) | Ok(ConnectPhase::CandidatesExhausted) => {
+            Ok(ConnectPhase::NoBinding) => {
+                self.refuse(index, Refusal::NoResolvedAddresses);
+                Ok(())
+            }
+            Ok(ConnectPhase::CandidatesExhausted) => {
                 self.refuse(index, Refusal::DialFailed);
                 Ok(())
             }
@@ -2155,36 +2429,39 @@ impl Serving {
                 self.reschedule(index);
                 return Ok(());
             }
-            if self.slots[index].down_len + CHUNK > DOWN_CAP {
+            if self.slots[index].down_len + MIN_BUF_ROOM > DOWN_CAP {
                 return Ok(());
             }
-            let mut scratch = [0u8; CHUNK];
-            let room = self.io_room(index, CHUNK);
-            let n = match self.slots[index].upstream.as_mut() {
-                None => return Ok(()),
-                Some(up) => match up.read(&mut scratch[..room]) {
-                    Ok(0) => {
-                        self.note_op(index, 0);
-                        return self.observe_down_eof(index);
-                    }
-                    Ok(n) => n,
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        self.note_op(index, 0);
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        self.note_op(index, 0);
-                        self.close_slot(index);
-                        return Ok(());
-                    }
-                },
+            let room = self.read_room(index, DOWN_CAP, self.slots[index].down_len);
+            if room == 0 {
+                self.reschedule(index);
+                return Ok(());
+            }
+            let result = {
+                let ws = &mut self.slots[index];
+                let Some(up) = ws.upstream.as_mut() else {
+                    return Ok(());
+                };
+                up.read(&mut ws.down[ws.down_len..ws.down_len + room])
+            };
+            let n = match result {
+                Ok(0) => {
+                    self.note_op(index, 0);
+                    return self.observe_down_eof(index);
+                }
+                Ok(n) => n,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.note_op(index, 0);
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.note_op(index, 0);
+                    self.close_slot(index);
+                    return Ok(());
+                }
             };
             self.note_op(index, n);
-            {
-                let ws = &mut self.slots[index];
-                ws.down[ws.down_len..ws.down_len + n].copy_from_slice(&scratch[..n]);
-                ws.down_len += n;
-            }
+            self.slots[index].down_len += n;
             self.flush_down(index);
             if self.visit_exhausted(index) {
                 self.reschedule(index);

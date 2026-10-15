@@ -7,12 +7,15 @@
 //! dormant feature cannot be represented as implemented
 //! (docs/alumina-proxy.md tripwire amendment).
 //!
-//! Runtime enforcement and monitoring projection are owner-local and are
-//! integrated in later increments; the detection sites that will drive this
-//! seam are `serving/reject.rs::reject_hello` (AnyIllegal) and the
-//! early-upstream-data branch of `serving.rs` (EarlyUpstreamData), both of
-//! which retain their mandatory baseline denial independently of any effect
-//! this seam produces.
+//! Runtime enforcement and monitoring projection are wired into the
+//! single-owner serving/runtime turns: serving enforces the latched policy
+//! per admitted connection (`serving.rs`), refusal effects and tripwire
+//! verdicts emit through `serving/reject.rs`, and the runtime loop drives
+//! deadline-based monitoring projection (`runtime.rs`). The detection sites
+//! that feed this seam are `serving/reject.rs::reject_hello` (AnyIllegal)
+//! and the early-upstream-data branch of `serving.rs` (EarlyUpstreamData),
+//! and mandatory baseline denial is retained independently of any
+//! supplementary effect this seam produces.
 
 pub mod action;
 pub mod monitor;

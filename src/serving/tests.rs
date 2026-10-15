@@ -850,7 +850,8 @@ fn upstream_read_interrupted_exhaustion_rewires_and_terminates_on_pending_data()
         serving.register_upstream(index).expect("register upstream");
 
         let mut reads = vec![Ok(1)];
-        reads.extend((0..EVENT_CAP).map(|_| Err(io::Error::from(io::ErrorKind::Interrupted))));
+        reads
+            .extend((0..POLL_EVENTS_CAP).map(|_| Err(io::Error::from(io::ErrorKind::Interrupted))));
         serving.slots[index].test_reads = reads;
 
         let token = upstream_token(serving.slots[index].slot_gen, index);
@@ -5032,6 +5033,545 @@ fn production_detection_close_transfers_typed_capture_with_slot_identity_into_mo
                 scope: Scope::Domain
             },
             "H1': the applied effect travels through detection -> close -> monitor"
+        );
+    });
+}
+
+fn read_all(stream: &mut TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("read timeout");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 128];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    out
+}
+
+fn drain_prefix(stream: &mut TcpStream, want: usize) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("read timeout");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 512];
+    while got.len() < want {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    got
+}
+
+/// Blocks until `stream` (a proxy-side socket) has at least one byte buffered,
+/// so a synthetic readiness dispatch never races loopback delivery.
+fn wait_readable(stream: &mio::net::TcpStream, label: &str) {
+    let mut probe = [0u8; 1];
+    for _ in 0..10_000 {
+        if matches!(stream.peek(&mut probe), Ok(n) if n > 0) {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!("{label} never became readable on the proxy side");
+}
+
+#[test]
+fn refused_wire_bodies_are_pinned_plain_text() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let mut expect = |name: &str, refusal: Refusal, want: &'static [u8]| {
+            let mut client = connect(port);
+            pump(serving, 20);
+            assert_eq!(
+                serving.storage().occupied(),
+                1,
+                "{name}: the refused client must be admitted first"
+            );
+            serving.refuse(0, refusal);
+            let body = read_all(&mut client);
+            assert_eq!(
+                &body[..],
+                want,
+                "{name}: the exact wire body must be pinned plain text"
+            );
+        };
+        expect(
+            "no-resolved-addresses",
+            Refusal::NoResolvedAddresses,
+            b"HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 22\r\n\r\nno resolved addresses\n",
+        );
+        expect(
+            "dial-failed",
+            Refusal::DialFailed,
+            b"HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 27\r\n\r\nupstream connection failed\n",
+        );
+        expect(
+            "setup-timeout",
+            Refusal::SetupTimeout,
+            b"HTTP/1.1 504 Gateway Timeout\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 23\r\n\r\nsetup deadline expired\n",
+        );
+    });
+}
+
+#[test]
+fn capacity_refusal_wire_body_is_pinned_plain_text() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let mut socks = Vec::new();
+        for _ in 0..=MAX_PENDING_SETUPS {
+            socks.push(connect(port));
+        }
+        pump(serving, 80);
+        let mut last = socks[MAX_PENDING_SETUPS].try_clone().expect("clone");
+        let body = read_all(&mut last);
+        assert_eq!(
+            &body[..],
+            b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 12\r\n\r\nno capacity\n",
+            "a capacity refusal must carry the pinned plain-text 503 body"
+        );
+    });
+}
+
+#[test]
+/// A per-token dispatch would split slot 0's client and upstream arms across
+/// two visits and false-`!live_here` reschedule the upstream arm until a
+/// re-poll re-delivers it; the coalescer must keep both arms in one visit.
+fn two_pass_coalescing_dispatches_interleaved_pair_arms_contiguously() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let sink0 = StdListener::bind("127.0.0.1:0").expect("sink0 bind");
+        let up0 = mio::net::TcpStream::connect(sink0.local_addr().expect("sink0 addr"))
+            .expect("up0 connect");
+        let mut sink0_stream = sink0.accept().expect("accept sink0").0;
+        let sink1 = StdListener::bind("127.0.0.1:0").expect("sink1 bind");
+        let up1 = mio::net::TcpStream::connect(sink1.local_addr().expect("sink1 addr"))
+            .expect("up1 connect");
+        let mut sink1_stream = sink1.accept().expect("accept sink1").0;
+
+        let mut client0 = connect(port);
+        let mut client1 = connect(port);
+        pump(serving, 30);
+        assert_eq!(
+            serving.storage().occupied(),
+            2,
+            "both relay clients must be admitted"
+        );
+
+        serving.slots[0].upstream = Some(up0);
+        open_relay(serving, 0);
+        serving.slots[1].upstream = Some(up1);
+        open_relay(serving, 1);
+
+        client0.write_all(b"AB").expect("client0 queue");
+        client1.write_all(b"CD").expect("client1 queue");
+        sink0_stream.write_all(b"XY").expect("sink0 queue");
+        sink1_stream.write_all(b"UV").expect("sink1 queue");
+        wait_readable(
+            serving.slots[0].client.as_ref().expect("client0 socket"),
+            "proxy client0",
+        );
+        wait_readable(
+            serving.slots[1].client.as_ref().expect("client1 socket"),
+            "proxy client1",
+        );
+        wait_readable(
+            serving.slots[0].upstream.as_ref().expect("up0 socket"),
+            "proxy up0",
+        );
+        wait_readable(
+            serving.slots[1].upstream.as_ref().expect("up1 socket"),
+            "proxy up1",
+        );
+
+        let visits_before_0 = serving.slots[0].visits;
+        let visits_before_1 = serving.slots[1].visits;
+        serving.batch_gen = serving.batch_gen.wrapping_add(1);
+        serving.in_batch = true;
+        let g0 = serving.slots[0].slot_gen;
+        let g1 = serving.slots[1].slot_gen;
+        let tokens = [
+            (
+                client_token(g0, 0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+            (
+                client_token(g1, 1),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+            (
+                upstream_token(g0, 0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+            (
+                upstream_token(g1, 1),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+        ];
+        serving
+            .dispatch_coalesced_batch(&tokens)
+            .expect("coalesced batch");
+
+        assert_eq!(
+            drain_prefix(&mut sink0_stream, 2),
+            b"AB".to_vec(),
+            "slot 0 client->upstream made it in the single coalesced batch"
+        );
+        assert_eq!(
+            drain_prefix(&mut sink1_stream, 2),
+            b"CD".to_vec(),
+            "slot 1 client->upstream made it in the single coalesced batch"
+        );
+        assert_eq!(
+            drain_prefix(&mut client0, 2),
+            b"XY".to_vec(),
+            "slot 0 upstream->client arm was not false-rescheduled by the interleave"
+        );
+        assert_eq!(
+            drain_prefix(&mut client1, 2),
+            b"UV".to_vec(),
+            "slot 1 upstream->client arm was not false-rescheduled by the interleave"
+        );
+        assert_eq!(
+            serving.slots[0].visits - visits_before_0,
+            1,
+            "each slot's client+upstream arms folded into one contiguous visit"
+        );
+        assert_eq!(
+            serving.slots[1].visits - visits_before_1,
+            1,
+            "each slot's client+upstream arms folded into one contiguous visit"
+        );
+        assert!(
+            !serving.in_batch,
+            "the coalesced batch must close its batch state"
+        );
+    });
+}
+
+#[test]
+/// A payload far larger than the legacy 4 KiB chunk must land from one coarse
+/// read into the slab and pair-flush in the same visit, never stalling on a
+/// leftover that needs a re-poll.
+fn coarse_relay_read_moves_large_payload_in_one_visit_keeping_flush_balance() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let sink = StdListener::bind("127.0.0.1:0").expect("sink bind");
+        let up = mio::net::TcpStream::connect(sink.local_addr().expect("sink addr"))
+            .expect("up connect");
+        let mut sink_stream = sink.accept().expect("accept sink").0;
+
+        let mut client = connect(port);
+        pump(serving, 30);
+        assert_eq!(serving.storage().occupied(), 1, "relay client admitted");
+        serving.slots[0].upstream = Some(up);
+        open_relay(serving, 0);
+
+        let payload = vec![0x5a_u8; 20 * 1024];
+        client.write_all(&payload).expect("client payload");
+        wait_readable(
+            serving.slots[0].client.as_ref().expect("proxy client"),
+            "coarse proxy client",
+        );
+
+        serving.batch_gen = serving.batch_gen.wrapping_add(1);
+        serving.in_batch = true;
+        let token = client_token(serving.slots[0].slot_gen, 0);
+        serving
+            .dispatch_coalesced_batch(&[(
+                token,
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            )])
+            .expect("coarse client read");
+
+        let mut got = drain_prefix(&mut sink_stream, payload.len());
+        while got.len() < payload.len() {
+            let more = drain_prefix(&mut sink_stream, payload.len() - got.len());
+            if more.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&more);
+        }
+        assert_eq!(
+            got.len(),
+            payload.len(),
+            "a coarse relay read must relay the whole oversized payload without a re-poll"
+        );
+        assert_eq!(
+            got, payload,
+            "the coarse-relayed payload must be byte exact"
+        );
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Relay),
+            "the relay must stay open after the coarse read"
+        );
+        let ws = &serving.slots[0];
+        assert_eq!(
+            ws.fwd, ws.buf_len,
+            "no accepted bytes may be left pending after the pair-flush"
+        );
+    });
+}
+
+#[test]
+/// A single-slot `[client, upstream]` batch must dispatch the client arm
+/// first (`client_first`), never the upstream arm: both directions shared one
+/// `coalesced.seen` order value in the old code, so the upstream of a
+/// client-first pair was wrongly ordered ahead and consumed the visit before
+/// the client arm could refuse its head.
+fn single_slot_client_first_batch_dispatches_client_arm_before_upstream() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let mut client = connect(port);
+        pump(serving, 30);
+        assert_eq!(
+            serving.storage().occupied(),
+            1,
+            "the client must be admitted before the synthetic batch"
+        );
+        client
+            .write_all(b"CONNECT nope.example.net:443 HTTP/1.1\r\n\r\n")
+            .expect("forbidden head queued");
+        wait_readable(
+            serving.slots[0].client.as_ref().expect("proxy client"),
+            "h1 proxy client",
+        );
+
+        let visits_before = serving.slots[0].visits;
+        serving.batch_gen = serving.batch_gen.wrapping_add(1);
+        serving.in_batch = true;
+        let g0 = serving.slots[0].slot_gen;
+        let tokens = [
+            (
+                client_token(g0, 0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+            (
+                upstream_token(g0, 0),
+                Readiness {
+                    error: true,
+                    ..Readiness::none()
+                },
+            ),
+        ];
+        serving
+            .dispatch_coalesced_batch(&tokens)
+            .expect("single-slot client-first batch");
+
+        assert_eq!(
+            read_all(&mut client),
+            b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n".to_vec(),
+            "the client arm must dispatch first and refuse the head; if the \
+             upstream error arm closed the slot first, the 403 never arrives"
+        );
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Idle),
+            "the first arm's refusal close must leave the slot idle"
+        );
+        assert_eq!(
+            serving.slots[0].visits - visits_before,
+            1,
+            "only the client arm may open a visit; the suppressed upstream arm adds none"
+        );
+        assert!(
+            !serving.in_batch,
+            "the coalesced batch must close its batch state"
+        );
+    });
+}
+
+#[test]
+/// When a single-slot `[upstream, client]` batch's first (upstream) arm closes
+/// the slot, the coalescer must suppress the remaining client arm instead of
+/// dispatching it onto the closed slot: no visit may open and no 403 may be
+/// emitted for a head that died with the closed connection.
+fn coalesced_batch_suppresses_second_arm_after_first_arm_closes_slot() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let _client = connect(port);
+        pump(serving, 30);
+        assert_eq!(
+            serving.storage().occupied(),
+            1,
+            "the client must be admitted before the synthetic batch"
+        );
+
+        let visits_before = serving.slots[0].visits;
+        let gen_before = serving.slots[0].slot_gen;
+        serving.batch_gen = serving.batch_gen.wrapping_add(1);
+        serving.in_batch = true;
+        let g0 = serving.slots[0].slot_gen;
+        let tokens = [
+            (
+                upstream_token(g0, 0),
+                Readiness {
+                    error: true,
+                    ..Readiness::none()
+                },
+            ),
+            (
+                client_token(g0, 0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+        ];
+        serving
+            .dispatch_coalesced_batch(&tokens)
+            .expect("single-slot upstream-first batch");
+
+        assert!(
+            serving.slots[0].client.is_none(),
+            "the first arm's error close must drop the client handle"
+        );
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Idle),
+            "the first arm's error close must leave the slot idle"
+        );
+        assert_eq!(
+            serving.slots[0].slot_gen, gen_before,
+            "the suppressed client arm must not touch the slot generation"
+        );
+        assert_eq!(
+            serving.slots[0].visits - visits_before,
+            0,
+            "the error first arm closes before opening a visit and the second \
+             arm must not open one either"
+        );
+        assert!(
+            !serving.in_batch,
+            "the coalesced batch must close its batch state"
+        );
+        assert_eq!(serving.storage().occupied(), 0, "the slot stays released");
+    });
+}
+
+#[test]
+/// Tokens folded for a slot carry the slot's generation at fold time, and the
+/// Pass 2 guard also refuses to dispatch onto `Stage::Idle` state; a stale
+/// token for an already-closed slot (the review's LISTENER-reuse generation
+/// case, reachable here as a closed slot at its old generation) must be dropped
+/// without folding, dispatching, or opening a visit.
+fn coalesced_batch_ignores_stale_tokens_for_closed_slot() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let _client = connect(port);
+        pump(serving, 30);
+        assert_eq!(
+            serving.storage().occupied(),
+            1,
+            "the client must be admitted before the batch"
+        );
+        let gen_before = serving.slots[0].slot_gen;
+
+        let visits_before = serving.slots[0].visits;
+        serving.batch_gen = serving.batch_gen.wrapping_add(1);
+        serving.in_batch = true;
+        let g0 = serving.slots[0].slot_gen;
+        let tokens = [(
+            upstream_token(g0, 0),
+            Readiness {
+                error: true,
+                ..Readiness::none()
+            },
+        )];
+        serving
+            .dispatch_coalesced_batch(&tokens)
+            .expect("error close batch");
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Idle),
+            "the error token must close the admitted slot"
+        );
+        assert_eq!(
+            serving.slots[0].visits - visits_before,
+            0,
+            "an error close opens no visit"
+        );
+
+        let visits_before = serving.slots[0].visits;
+        serving.batch_gen = serving.batch_gen.wrapping_add(1);
+        serving.in_batch = true;
+        let stale = [
+            (
+                client_token(gen_before, 0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+            (
+                upstream_token(gen_before, 0),
+                Readiness {
+                    readable: true,
+                    ..Readiness::none()
+                },
+            ),
+        ];
+        serving
+            .dispatch_coalesced_batch(&stale)
+            .expect("stale token batch");
+        assert!(
+            matches!(serving.slots[0].stage, Stage::Idle),
+            "a stale token for a closed slot must never re-arm it"
+        );
+        assert_eq!(
+            serving.slots[0].visits - visits_before,
+            0,
+            "stale tokens for a closed slot must fold to nothing and open no visit"
+        );
+        assert!(
+            !serving.in_batch,
+            "the coalesced batch must close its batch state"
+        );
+        assert_eq!(serving.storage().occupied(), 0, "the slot stays released");
+    });
+}
+
+#[test]
+/// An allowlisted CONNECT against an unpopulated DNS cache must flow through
+/// the real `run_once`/`run_decision` path to a 502 refusal pinned to the
+/// exact no-resolved-addresses wire body, and release the admitted slot.
+fn allowlisted_unresolved_connect_refusal_is_wire_pinned_through_run_once() {
+    let port = ephemeral_port();
+    with_serving_stack(port, move |serving| {
+        let mut client = connect(port);
+        client
+            .write_all(b"CONNECT sub.example.org:443 HTTP/1.1\r\n\r\n")
+            .expect("allowlisted connect head queued");
+        pump(serving, 60);
+        let body = read_all(&mut client);
+        assert_eq!(
+            &body[..],
+            b"HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 22\r\n\r\nno resolved addresses\n",
+            "allowlisted-but-unresolved CONNECT must refuse with the pinned 502 body"
+        );
+        assert_eq!(
+            serving.storage().occupied(),
+            0,
+            "the refused slot must be released back to the pool"
         );
     });
 }
