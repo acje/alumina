@@ -2,12 +2,14 @@
 
 Allowlist TLS egress in your cloud environments.
 
-Alumina is an **HTTPS-on-TCP/443 explicit HTTP CONNECT forward proxy**: per
-connection it terminates two independent TCP sessions, validates the TLS 1.3
-ClientHello (version offer, SNI against the allowlist, ECH rejection), and
-relays end-to-end TLS upstream **without decryption**. Cloud Run validation
-targets Cloud Run Worker Pools with Direct VPC (`listen = '0.0.0.0:<port>'`) or
-a multi-container sidecar (`listen = '127.0.0.1:<port>'`).
+Alumina is an **HTTPS-on-TCP explicit HTTP CONNECT forward proxy**: each
+allowlist entry declares its destination port (e.g. `api.github.com:443`,
+`example.com:443`). Per connection it terminates two independent TCP sessions,
+validates the TLS 1.3 ClientHello (version offer, SNI against the allowlist,
+ECH rejection), and relays end-to-end TLS upstream **without decryption**.
+Cloud Run validation targets Cloud Run Worker Pools with Direct VPC
+(`listen = '0.0.0.0:<port>'`) or a multi-container sidecar
+(`listen = '127.0.0.1:<port>'`).
 
 Alumina can be deployed as a light weight explicit forward proxy to protect the egress
 for your servers or containers by allowlisting which domains are eligible for
@@ -44,15 +46,16 @@ bounded stdout monitoring (`docs/alumina-proxy.md:238-315`, rp2e amendment).
 - Privilege preflight (non-root, empty caps, `no_new_privs`): unmet → EX_CONFIG
   78; unresolved beyond allowance → EX_TEMPFAIL 75.
 - Example config: `docs/qa-package/config.example.toml` (≤ 4096 B) shows the
-  mandatory `[any_illegal]` + index-aligned `[actions]` tripwire tables with a
-  real-world HTTPS allowlist entry (`api.github.com`) alongside illustrative
-  domains (`example.com`, `www.example.net`); illustrative only, executed by no
-  gate.
+  mandatory `[any_illegal]` + index-aligned `[actions]` tripwire tables with
+  `<fqdn>:<port>` allowlist entries — a real-world HTTPS target
+  (`api.github.com:443`) and illustrative domains (`example.com:443`,
+  `www.example.net:443`); illustrative only, executed by no gate.
 
 ## Workload & protocol compatibility (zero proxy code changes)
 
 Alumina's wire contract (`docs/alumina-proxy.md:17-50,200-202`) is: an explicit
-plaintext `HTTP/1.1`/`HTTP/1.0` `CONNECT <fqdn>:443`; then — after `200
+plaintext `HTTP/1.1`/`HTTP/1.0` `CONNECT <fqdn>:<port>` (the port must exactly
+match the allowlisted entry, e.g. `443`); then — after `200
 Connection established` — the **client speaks first** with a TLS 1.3
 `ClientHello` whose SNI equals `<fqdn>` (Barrier A); and the upstream server
 sends **zero bytes before the validated `ClientHello` is flushed upstream**
@@ -63,16 +66,15 @@ with no ALPN or application-protocol inspection (`docs/alumina-proxy.md:19-21,48
 | Workload | Transport | Compatible? |
 | --- | --- | --- |
 | HTTPS REST/API (`https://api.github.com:443`, e.g. `reqwest` with `HTTPS_PROXY=http://<proxy>:5353`, TLS 1.3) | TLS 1.3 `ClientHello` (SNI) immediately after `200` | **Yes** — works out of the box |
-| NATS Mode 1 — standard NATS (`nats://` / `tls://` on port 4222 or 443) | server-speaks-first plaintext `INFO {...}` before any TLS upgrade | **No** — port ≠ 443 rejected at CONNECT (`400`); on 443 the server-first plaintext trips Barrier B (`EarlyUpstreamData`) and Barrier A (non-TLS client bytes) |
-| NATS Mode 2 — NATS `tls_first` (`handshake_first: true` on port 443; `async_nats::ConnectOptions::tls_first()`) | client TLS 1.3 `ClientHello` (SNI) right after `200`; `INFO` inside the encrypted TLS 1.3 stream | **Yes** — wire-compatible, zero `alumina-proxy` changes |
+| NATS Mode 1 — standard NATS (`nats://` / `tls://` server-first StartTLS) | server-speaks-first plaintext `INFO {...}` before any TLS upgrade | **No** — even when the CONNECT port is authorized, the server-first plaintext `INFO` trips Barrier B (`EarlyUpstreamData`) and Barrier A (non-TLS client bytes) |
+| NATS Mode 2 — NATS `tls_first` (`handshake_first: true`; `async_nats::ConnectOptions::tls_first()`) | client TLS 1.3 `ClientHello` (SNI) right after `200`; `INFO` inside the encrypted TLS 1.3 stream | **Yes** — wire-compatible, zero `alumina-proxy` changes |
 | NATS Mode 3 — NATS over WebSockets (`wss://<nats-fqdn>:443`) | TLS 1.3 `ClientHello` (SNI) right after `200`; HTTP `Upgrade: websocket` + NATS frames inside the encrypted tunnel | **Yes** — wire-compatible, zero `alumina-proxy` changes |
 
-`alumina-proxy` needs **zero code changes** for NATS testbed workloads
-(`gh-report`): the NATS **client/workload** must (a) establish the TCP tunnel
-via `HTTP CONNECT <nats-fqdn>:443` to Alumina (`async-nats` 0.50 dials
-`TcpStream::connect` directly and reads no `HTTPS_PROXY`, so use a custom proxy
-dialer / local CONNECT forwarder or upstream proxy support) and (b) use
-`wss://<nats-fqdn>:443` or `tls_first` on port 443 with TLS 1.3.
+`alumina-proxy` needs **zero code changes** for NATS workloads: the NATS
+**client/workload** must (a) establish the TCP tunnel via
+`HTTP CONNECT <nats-fqdn>:<allowlisted-port>` to Alumina and (b) match the
+allowlisted entry's port and speak a TLS 1.3 `ClientHello` first (`wss://` or
+`tls_first`).
 
 ## Repository layout
 

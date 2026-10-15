@@ -12,9 +12,10 @@ sketches §6), and ends with material questions a later approval step must answe
   document is pinned to this identity (resolved against the actual checkout at assessment).
 - **Canonical spec** `docs/alumina-proxy.md`, sha256
   `322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836` — **historical pre-rp2e
-  spec digest at assessment**; the current post-rp2e canonical spec sha256 is
-  `b5b1c9fae649feff81ad9910ca7af999987c7036ee447d91c1f10c3db700137d` (unchanged by this
-  review). The spec remains the **binding requirement**, never edited; documents only
+  spec digest at assessment**; the current canonical spec sha256 is
+  `18208bb97975da70adc5bdc4dd7a5d3eefbe454d817597fdbed754ee22b81394` (post-`alumina-9t6w`, after
+  the `<fqdn>:<port>` amendment and the `rp2e` amendment). The spec remains the **binding
+  requirement**, never edited except by the two recorded user-authorized amendments; documents only
   restate or cite it (not a claim it is fully implemented as code; see §9).
 - **Working tree at assessment:** only three untracked user bench drafts
   (`scripts/bench_frame_echo.{py,sh}`, `scripts/bench_frame_echo.py.new`); README and canonical
@@ -390,7 +391,7 @@ been falsely opposed to each other (review B3).
 
 | Source | Reference | Status |
 |---|---|---|
-| Canonical spec | `docs/alumina-proxy.md` sha256 `322b68ee…5b836` (full `322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836`) — **historical pre-rp2e spec digest at assessment**; current post-rp2e canonical sha256 `b5b1c9fae649feff81ad9910ca7af999987c7036ee447d91c1f10c3db700137d`), pinned [alumina-proxy.md](https://github.com/acje/alumina-proxy/blob/4c29c2c8da58d5225029cabb9e149408dafd4ab4/docs/alumina-proxy.md) | **binding requirement**, never edited — **not** a blanket "implemented" claim; some spec provisions differ from current source (see note below) |
+| Canonical spec | `docs/alumina-proxy.md` sha256 `322b68ee…5b836` (full `322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836`) — **historical pre-rp2e spec digest at assessment**; current canonical sha256 `18208bb97975da70adc5bdc4dd7a5d3eefbe454d817597fdbed754ee22b81394` (`18208bb…1394`, post-`alumina-9t6w`, after the `<fqdn>:<port>` and `rp2e` amendments), pinned [alumina-proxy.md](https://github.com/acje/alumina-proxy/blob/4c29c2c8da58d5225029cabb9e149408dafd4ab4/docs/alumina-proxy.md) | **binding requirement**, amended only by the two recorded user-authorized changes — **not** a blanket "implemented" claim; some spec provisions differ from current source (see note below) |
 | Design statement | `docs/architecture.md` (D1–D7), pinned [architecture.md](https://github.com/acje/alumina-proxy/blob/4c29c2c8da58d5225029cabb9e149408dafd4ab4/docs/architecture.md) | **historical design statement** pinned at HEAD `8934adb`; design context, **not runtime evidence** |
 | Prior layout review | `docs/repository-layout-review.md` | preserved history; Layout A **landed** (commits `9903db4`, `248f132`, source-present); Layout B not only unimplemented but a proposed future increment (I2) |
 | Current source modules | pinned blob links in §2–§5 (serving/gate/client_hello/startup_dns/log/etc. at 4c29c2c) | resolved against the actual checkout; mechanisms named there are source-present |

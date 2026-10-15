@@ -122,7 +122,7 @@ stage_snippet=$(cat <<'SNIP'
 set -eu
 mkdir -p /work
 printf '%s\n' \
-    'allowlist = ["example.com", "echo.example.org", "down.example.org", "neg.example.org"]' \
+    'allowlist = ["example.com:443", "echo.example.org:443", "down.example.org:443", "neg.example.org:443"]' \
     'listen = "127.0.0.1:8080"' \
     'startup_unresolved_allowance = 0' \
     '[any_illegal]' \

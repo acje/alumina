@@ -81,7 +81,7 @@ stage_snippet=$(cat <<'SNIP'
 set -eu
 mkdir -p /work
 printf '%s\n' \
-    'allowlist = ["drain.example.org", "force.example.org"]' \
+    'allowlist = ["drain.example.org:443", "force.example.org:443"]' \
     'listen = "127.0.0.1:8080"' \
     'startup_unresolved_allowance = 0' \
     '[any_illegal]' \
