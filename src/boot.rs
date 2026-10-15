@@ -113,7 +113,7 @@ mod tests {
         }
     }
 
-    const VALID_CONFIG: &str = "allowlist = [\"example.com\", \"sub.example.org.\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
+    const VALID_CONFIG: &str = "allowlist = [\"example.com:443\", \"sub.example.org.:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
 
     #[test]
     fn boot_with_good_facts_reports_and_stops_at_phase1_boundary() {

@@ -7,7 +7,9 @@ use crate::config::{Allowlist, FixedHostname};
 /// that may arrive in the same read as the delimiter.
 pub const CONNECT_LIMIT: usize = 8 * 1024;
 
-/// The only accepted destination port.
+/// The reserved default destination port, retained as the canonical HTTPS
+/// port; per-entry allowlist ports (1..=65535) now flow from config and the
+/// CONNECT line rather than this constant.
 pub const DEST_PORT: u16 = 443;
 
 const END_OF_HEAD: &[u8] = b"\r\n\r\n";
@@ -17,12 +19,18 @@ const HTTP_10: &[u8] = b"HTTP/1.0";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectRequest {
     hostname: FixedHostname,
+    port: u16,
 }
 
 impl ConnectRequest {
     /// The normalized lowercase hostname (no trailing dot, no port).
     pub fn hostname(&self) -> &str {
         self.hostname.as_str()
+    }
+
+    /// The validated destination port (1..=65535) from the CONNECT line.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// The fixed-capacity validated hostname type, for gate validation that
@@ -61,7 +69,7 @@ impl fmt::Display for ConnectError {
                 write!(f, "CONNECT hostname invalid: {detail}")
             }
             ConnectError::WrongPort { got } => {
-                write!(f, "CONNECT port {got} denied; only 443 allowed")
+                write!(f, "CONNECT port {got} denied; port must be 1..=65535")
             }
             ConnectError::TransferEncoding => write!(
                 f,
@@ -370,14 +378,19 @@ fn parse_target(target: &[u8]) -> Result<ConnectRequest, ConnectError> {
             detail: "port is not numeric",
         });
     }
+    if port.len() > 1 && port[0] == b'0' {
+        return Err(ConnectError::MalformedRequestLine {
+            detail: "port has a leading zero",
+        });
+    }
     let parsed_port: u16 = std::str::from_utf8(port)
         .ok()
         .and_then(|p| p.parse().ok())
         .ok_or(ConnectError::MalformedRequestLine {
             detail: "port is not numeric",
         })?;
-    if parsed_port != DEST_PORT {
-        return Err(ConnectError::WrongPort { got: parsed_port });
+    if parsed_port == 0 {
+        return Err(ConnectError::WrongPort { got: 0 });
     }
     if host.contains(&b':') && !host.starts_with(b"[") {
         return Err(ConnectError::InvalidHostname {
@@ -394,6 +407,7 @@ fn parse_target(target: &[u8]) -> Result<ConnectRequest, ConnectError> {
     })?;
     Ok(ConnectRequest {
         hostname: normalized,
+        port: parsed_port,
     })
 }
 
@@ -407,11 +421,14 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
     value
 }
 
-/// Whether the request hostname is a member of the configured allowlist.
+/// Whether the request hostname and port exactly match one allowlist entry.
+/// The normalized `<fqdn>` must equal the entry's bare name and the CONNECT
+/// port must equal the entry's port, so a same-name different-port request is
+/// denied (403) even when the hostname is allowlisted.
 pub fn is_allowlisted(request: &ConnectRequest, allowlist: &Allowlist) -> bool {
-    allowlist
-        .iter()
-        .any(|entry| entry.as_str().as_bytes() == request.hostname.as_bytes())
+    allowlist.iter().any(|entry| {
+        entry.as_str().as_bytes() == request.hostname().as_bytes() && entry.port() == request.port()
+    })
 }
 
 #[cfg(test)]
@@ -423,7 +440,7 @@ mod tests {
 
     fn config() -> Config {
         parse_config_document(
-            "allowlist = [\"sub.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
+            "allowlist = [\"sub.example.org:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
         )
         .expect("valid config")
     }
@@ -486,12 +503,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_port() {
-        let head = "CONNECT sub.example.org:8443 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    fn rejects_zero_port() {
+        let head = "CONNECT sub.example.org:0 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         assert_eq!(
             parse_full(head.as_bytes()),
-            Err(ConnectError::WrongPort { got: 8443 })
+            Err(ConnectError::WrongPort { got: 0 })
         );
+    }
+
+    #[test]
+    fn accepts_non_443_port_and_reports_it() {
+        let head = "CONNECT sub.example.org:8443 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let req = parse_full(head.as_bytes()).expect("any 1..=65535 port parses");
+        assert_eq!(req.hostname(), "sub.example.org");
+        assert_eq!(req.port(), 8443);
+    }
+
+    #[test]
+    fn rejects_leading_zero_port() {
+        let head = "CONNECT sub.example.org:0443 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        assert!(matches!(
+            parse_full(head.as_bytes()),
+            Err(ConnectError::MalformedRequestLine { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_port_out_of_range() {
+        let head = "CONNECT sub.example.org:65536 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        assert!(matches!(
+            parse_full(head.as_bytes()),
+            Err(ConnectError::MalformedRequestLine { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_allowlist_port_mismatch() {
+        let head = "CONNECT sub.example.org:8443 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let req = parse_full(head.as_bytes()).expect("parses");
+        assert!(!is_allowlisted(&req, config().allowlist()));
     }
 
     #[test]

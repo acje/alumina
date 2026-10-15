@@ -244,6 +244,19 @@ impl ServeStorage {
         self.enforcement.control().ordinal(index)
     }
 
+    /// The ordinal of a CONNECT that matches an allowlist entry **exactly**,
+    /// entry hostname and entry port together. A same-hostname different-port
+    /// request is such a miss (no ordinal), so it is authoritatively denied by
+    /// `decide` as `HostNotAllowlisted` rather than routed by bare hostname
+    /// (alumina-9t6w B1).
+    pub(crate) fn ordinal_for_request(&self, request: &ConnectRequest) -> Option<DomainOrdinal> {
+        let index = self.config.allowlist().iter().position(|entry| {
+            entry.as_str().as_bytes() == request.hostname().as_bytes()
+                && entry.port() == request.port()
+        })?;
+        self.enforcement.control().ordinal(index)
+    }
+
     #[cfg(test)]
     pub(crate) fn publish_test_a(&mut self, ordinal: usize) {
         use crate::cache::{Generation, StagedPositive};
@@ -679,9 +692,9 @@ mod tests {
 
     fn config_with_allowance(count: usize, allowance: u8) -> Config {
         let names = match count {
-            1 => "\"alpha.example.org\"",
-            2 => "\"alpha.example.org\", \"beta.example.org\"",
-            3 => "\"alpha.example.org\", \"beta.example.org\", \"gamma.example.org\"",
+            1 => "\"alpha.example.org:443\"",
+            2 => "\"alpha.example.org:443\", \"beta.example.org:443\"",
+            3 => "\"alpha.example.org:443\", \"beta.example.org:443\", \"gamma.example.org:443\"",
             _ => panic!("test allowlist helper supports 1..=3 names"),
         };
         let doc = format!(
@@ -1249,7 +1262,11 @@ mod startup_integration {
     fn full_serve_opens_listener_early_before_the_window_elapses() {
         let window = Duration::from_secs(2);
         let port = ephemeral_port();
-        let config = config_with("\"alpha.example.org\", \"beta.example.org\"", 0, port);
+        let config = config_with(
+            "\"alpha.example.org:443\", \"beta.example.org:443\"",
+            0,
+            port,
+        );
         let responder = DnsResponder::spawn(|q| build_positive(&q));
         let mut storage = ServeStorage::boot(&config).expect("boot serving storage");
         let start = Instant::now();
@@ -1276,7 +1293,11 @@ mod startup_integration {
     fn exit75_is_decided_only_at_the_actual_window_deadline() {
         let window = Duration::from_millis(300);
         let port = ephemeral_port();
-        let config = config_with("\"alpha.example.org\", \"beta.example.org\"", 0, port);
+        let config = config_with(
+            "\"alpha.example.org:443\", \"beta.example.org:443\"",
+            0,
+            port,
+        );
         let responder = DnsResponder::spawn(|query| {
             if qname_contains(&query, b"\x04beta") {
                 None
@@ -1310,7 +1331,11 @@ mod startup_integration {
     fn degraded_is_decided_only_at_the_actual_window_deadline() {
         let window = Duration::from_millis(300);
         let port = ephemeral_port();
-        let config = config_with("\"alpha.example.org\", \"beta.example.org\"", 1, port);
+        let config = config_with(
+            "\"alpha.example.org:443\", \"beta.example.org:443\"",
+            1,
+            port,
+        );
         let responder = DnsResponder::spawn(|query| {
             if qname_contains(&query, b"\x04beta") {
                 None
@@ -1342,7 +1367,7 @@ mod startup_integration {
     fn failed_lookup_retries_within_the_window_and_recovers_to_full() {
         let window = Duration::from_secs(2);
         let port = ephemeral_port();
-        let config = config_with("\"alpha.example.org\"", 0, port);
+        let config = config_with("\"alpha.example.org:443\"", 0, port);
         let mut queries = 0u32;
         let responder = DnsResponder::spawn(move |query| {
             queries += 1;
@@ -1376,7 +1401,11 @@ mod startup_integration {
     fn retried_failures_and_never_attempted_sibling_report_truthful_not_attempted() {
         let window = Duration::from_millis(1600);
         let port = ephemeral_port();
-        let config = config_with("\"alpha.example.org\", \"beta.example.org\"", 1, port);
+        let config = config_with(
+            "\"alpha.example.org:443\", \"beta.example.org:443\"",
+            1,
+            port,
+        );
         let responder = DnsResponder::spawn(|query| {
             if qname_contains(&query, b"\x04beta") {
                 None
@@ -1406,7 +1435,11 @@ mod startup_integration {
     fn resolved_names_family_schedule_survives_for_serving_refresh() {
         let window = Duration::from_millis(1600);
         let port = ephemeral_port();
-        let config = config_with("\"alpha.example.org\", \"beta.example.org\"", 1, port);
+        let config = config_with(
+            "\"alpha.example.org:443\", \"beta.example.org:443\"",
+            1,
+            port,
+        );
         let responder = DnsResponder::spawn(|query| {
             if qname_contains(&query, b"\x04beta") {
                 None
@@ -1431,7 +1464,11 @@ mod startup_integration {
     fn resolved_name_sibling_stays_selectable_after_startup_for_serving() {
         let window = Duration::from_millis(1600);
         let port = ephemeral_port();
-        let config = config_with("\"alpha.example.org\", \"beta.example.org\"", 1, port);
+        let config = config_with(
+            "\"alpha.example.org:443\", \"beta.example.org:443\"",
+            1,
+            port,
+        );
         let responder = DnsResponder::spawn(|query| {
             if qname_contains(&query, b"\x04beta") {
                 None

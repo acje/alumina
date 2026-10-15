@@ -504,6 +504,7 @@ struct SlotWorkspace {
     inspector: ChInspector,
     gate: TunnelGate,
     approved: Option<FixedHostname>,
+    approved_port: u16,
     first_slot: FirstSlot,
     capture: SlotCapture,
     stage: Stage,
@@ -541,6 +542,7 @@ impl SlotWorkspace {
             inspector: ChInspector::new(),
             gate: TunnelGate::new(),
             approved: None,
+            approved_port: 443,
             first_slot: FirstSlot::new(),
             capture: SlotCapture::fresh(0, 0),
             stage: Stage::Idle,
@@ -586,6 +588,7 @@ impl SlotWorkspace {
         self.inspector = ChInspector::new();
         self.gate = TunnelGate::new();
         self.approved = None;
+        self.approved_port = 443;
         self.first_slot = FirstSlot::new();
         self.capture = SlotCapture::default();
         self.stage = Stage::Idle;
@@ -1972,7 +1975,7 @@ impl Serving {
             }
         };
         let approved = *request.fixed_hostname();
-        if let Some(ordinal) = self.storage.ordinal_for(&approved)
+        if let Some(ordinal) = self.storage.ordinal_for_request(&request)
             && self.storage.enforcement().is_blocked(ordinal)
         {
             self.storage.enforcement_mut().note_domain_block(ordinal);
@@ -2008,6 +2011,7 @@ impl Serving {
             Ok(ConnectPhase::Peer { addr, .. }) => {
                 let slot = &mut self.slots[index];
                 slot.approved = Some(approved);
+                slot.approved_port = request.port();
                 slot.gate.on_authorized();
                 slot.stage = Stage::Dialing;
                 self.dial(index, addr)
@@ -2020,7 +2024,7 @@ impl Serving {
             NumericAddr::V4(a) => IpAddr::V4(a),
             NumericAddr::V6(a) => IpAddr::V6(a),
         };
-        let sock = SocketAddr::new(ip, crate::connect::DEST_PORT);
+        let sock = SocketAddr::new(ip, self.slots[index].approved_port);
         match TcpStream::connect(sock) {
             Ok(stream) => {
                 self.slots[index].upstream = Some(stream);

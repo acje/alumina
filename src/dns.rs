@@ -1010,7 +1010,7 @@ mod tests {
 
     fn config() -> Config {
         parse_config_document(
-            "allowlist = [\"sub.example.org\", \"other.test\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n",
+            "allowlist = [\"sub.example.org:443\", \"other.test:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n",
         )
         .expect("valid config")
     }

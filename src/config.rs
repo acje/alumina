@@ -12,11 +12,17 @@ pub const ALLOWLIST_MAX: usize = 32;
 pub const FQDN_MAX_LEN: usize = 253;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fqdn(String);
+pub struct Fqdn {
+    name: String,
+    port: u16,
+}
 
 impl Fqdn {
     fn parse(input: &str) -> Result<Fqdn, String> {
-        let name = normalize_trailing_dot(input)?;
+        let (host, port) = input
+            .rsplit_once(':')
+            .ok_or_else(|| "allowlist entry lacks a <fqdn>:<port> port".to_string())?;
+        let name = normalize_trailing_dot(host)?;
         if name.is_empty() {
             return Err("empty hostname".into());
         }
@@ -40,12 +46,41 @@ impl Fqdn {
                 return Err(format!("label {:?} not lowercase ASCII [a-z0-9-]", label));
             }
         }
-        Ok(Fqdn(name.to_owned()))
+        let port = parse_config_port(port)?;
+        Ok(Fqdn {
+            name: name.to_owned(),
+            port,
+        })
     }
 
+    /// The normalized bare `<fqdn>` (no port, no trailing dot): the key used
+    /// for DNS cache entries, queries, and logs, so `NameIndex(u8)` stays
+    /// keyed by the bare name.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.name
     }
+
+    /// The validated upstream dial port for this allowlist entry (1..=65535).
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+fn parse_config_port(port: &str) -> Result<u16, String> {
+    if port.is_empty() {
+        return Err("port is empty".into());
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("port is not canonical decimal".into());
+    }
+    if port.len() > 1 && port.starts_with('0') {
+        return Err("port has a leading zero".into());
+    }
+    let port: u16 = port.parse().map_err(|_| "port exceeds 65535".to_string())?;
+    if port == 0 {
+        return Err("port 0 is invalid".into());
+    }
+    Ok(port)
 }
 
 fn normalize_trailing_dot(name: &str) -> Result<&str, String> {
@@ -719,8 +754,8 @@ mod enforcement_config_tests {
 
     #[test]
     fn missing_enforcement_group_fails() {
-        let err =
-            parse_config_document(&base("\"sub.example.org\"")).expect_err("group is mandatory");
+        let err = parse_config_document(&base("\"sub.example.org:443\""))
+            .expect_err("group is mandatory");
         assert!(
             matches!(&err, ConfigError::MissingField(f) if f == "any_illegal"),
             "expected MissingField(any_illegal), got {err:?}"
@@ -730,7 +765,7 @@ mod enforcement_config_tests {
     #[test]
     fn parses_full_enforcement_group() {
         let doc = group(
-            "\"sub.example.org\", \"other.example.org\"",
+            "\"sub.example.org:443\", \"other.example.org:443\"",
             "all",
             "[\"block\", \"flare_only\"]",
             "[\"domain\", \"connection\"]",
@@ -753,14 +788,19 @@ mod enforcement_config_tests {
 
     #[test]
     fn accepts_any_illegal_connection_scope() {
-        let doc = group("\"a.example\"", "connection", "[\"block\"]", "[\"domain\"]");
+        let doc = group(
+            "\"a.example:443\"",
+            "connection",
+            "[\"block\"]",
+            "[\"domain\"]",
+        );
         let cfg = parse_config_document(&doc).expect("connection scope valid");
         assert_eq!(cfg.control().any_illegal(), AnyIllegalScope::Connection);
     }
 
     #[test]
     fn rejects_any_illegal_domain_scope() {
-        let doc = group("\"a.example\"", "domain", "[\"block\"]", "[\"domain\"]");
+        let doc = group("\"a.example:443\"", "domain", "[\"block\"]", "[\"domain\"]");
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
             matches!(err, ConfigError::AnyIllegalScopeDomain),
@@ -770,7 +810,12 @@ mod enforcement_config_tests {
 
     #[test]
     fn rejects_any_illegal_unknown_scope() {
-        let doc = group("\"a.example\"", "wired", "[\"block\"]", "[\"connection\"]");
+        let doc = group(
+            "\"a.example:443\"",
+            "wired",
+            "[\"block\"]",
+            "[\"connection\"]",
+        );
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidScope { .. }),
@@ -782,7 +827,7 @@ mod enforcement_config_tests {
     fn rejects_missing_actions_when_any_illegal_present() {
         let doc = format!(
             "{}\n[any_illegal]\nscope = \"all\"\n",
-            base("\"a.example\"")
+            base("\"a.example:443\"")
         );
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
@@ -795,7 +840,7 @@ mod enforcement_config_tests {
     fn rejects_missing_any_illegal_when_actions_present() {
         let doc = format!(
             "{}\n[actions]\nkind = [\"block\"]\nscope = [\"domain\"]\n",
-            base("\"a.example\"")
+            base("\"a.example:443\"")
         );
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
@@ -806,7 +851,12 @@ mod enforcement_config_tests {
 
     #[test]
     fn rejects_tarpit_kind_with_deferred_diagnostic() {
-        let doc = group("\"a.example\"", "all", "[\"tarpit\"]", "[\"connection\"]");
+        let doc = group(
+            "\"a.example:443\"",
+            "all",
+            "[\"tarpit\"]",
+            "[\"connection\"]",
+        );
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
             matches!(err, ConfigError::ActionTarpitDeferred { index: 0 }),
@@ -816,7 +866,7 @@ mod enforcement_config_tests {
 
     #[test]
     fn rejects_unknown_action_kind() {
-        let doc = group("\"a.example\"", "all", "[\"peek\"]", "[\"connection\"]");
+        let doc = group("\"a.example:443\"", "all", "[\"peek\"]", "[\"connection\"]");
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
             matches!(err, ConfigError::UnknownAction { index: 0, .. }),
@@ -826,7 +876,7 @@ mod enforcement_config_tests {
 
     #[test]
     fn rejects_unknown_per_domain_scope() {
-        let doc = group("\"a.example\"", "all", "[\"block\"]", "[\"wire\"]");
+        let doc = group("\"a.example:443\"", "all", "[\"block\"]", "[\"wire\"]");
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidScope { .. }),
@@ -837,7 +887,7 @@ mod enforcement_config_tests {
     #[test]
     fn rejects_actions_length_mismatch() {
         let doc = group(
-            "\"a.example\"",
+            "\"a.example:443\"",
             "all",
             "[\"block\", \"block\"]",
             "[\"domain\", \"domain\"]",
@@ -851,7 +901,7 @@ mod enforcement_config_tests {
 
     #[test]
     fn rejects_unknown_top_level_key_unchanged() {
-        let doc = format!("{}bogus = 1\n", base("\"a.example\""));
+        let doc = format!("{}bogus = 1\n", base("\"a.example:443\""));
         let err = parse_config_document(&doc).unwrap_err();
         assert!(
             matches!(err, ConfigError::UnknownKey(_)),
@@ -862,7 +912,7 @@ mod enforcement_config_tests {
     #[test]
     fn compact_32_names_with_group_fit_4kib() {
         let names: Vec<String> = (0..32)
-            .map(|i| format!("n{i:02}.{}.{}", "a".repeat(48), "b".repeat(47)))
+            .map(|i| format!("n{i:02}.{}.{}:443", "a".repeat(48), "b".repeat(43)))
             .collect();
         let list = names
             .iter()
@@ -886,7 +936,7 @@ mod enforcement_config_tests {
 
     fn hundred_byte_names(count: usize) -> String {
         (0..count)
-            .map(|i| format!("\"n{i:02}.{}.{}\"", "a".repeat(48), "b".repeat(47)))
+            .map(|i| format!("\"n{i:02}.{}.{}:443\"", "a".repeat(48), "b".repeat(43)))
             .collect::<Vec<_>>()
             .join(", ")
     }

@@ -9,7 +9,7 @@ const RETAINED_OFFSET: usize = 137;
 
 fn config(port: u16) -> crate::config::Config {
     let doc = format!(
-        "allowlist = [\"sub.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n"
+        "allowlist = [\"sub.example.org:443\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n"
     );
     crate::config::parse_config_document(&doc).expect("valid test config")
 }
@@ -3744,7 +3744,7 @@ fn serve_on_cfg(port: u16, cfg: crate::config::Config) -> Serving {
 
 fn cfg_doc1(port: u16, any_scope: &str, kind: &str, action_scope: &str) -> crate::config::Config {
     let doc = format!(
-        "allowlist = [\"sub.example.org\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"{any_scope}\"\n[actions]\nkind = [\"{kind}\"]\nscope = [\"{action_scope}\"]\n"
+        "allowlist = [\"sub.example.org:443\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"{any_scope}\"\n[actions]\nkind = [\"{kind}\"]\nscope = [\"{action_scope}\"]\n"
     );
     crate::config::parse_config_document(&doc).expect("valid enforcement test config")
 }
@@ -4161,6 +4161,173 @@ fn domain_block_refuses_future_flow_of_the_ordinal_until_restart() {
 }
 
 #[test]
+/// A same-hostname different-port CONNECT on an allowlisted-but-domain-blocked
+/// ordinal must flow through `decide` to `HostNotAllowlisted`; it must never
+/// take the bare-hostname early domain-block return (alumina-9t6w review B1).
+fn port_mismatch_on_domain_blocked_ordinal_is_host_not_allowlisted() {
+    let port = ephemeral_port();
+    let cfg = cfg_doc1(port, "connection", "block", "domain");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ordinal = serving.storage().ordinal_for(&approved).expect("ordinal");
+        let mut latch = crate::enforcement::action::FirstSlot::new();
+        serving.storage_mut().enforcement_mut().decide(
+            &mut latch,
+            crate::enforcement::policy::Violation::EarlyUpstreamData { ordinal },
+        );
+        assert!(
+            serving.storage().enforcement().is_blocked(ordinal),
+            "precondition: the configured-domain ordinal is domain-blocked"
+        );
+
+        let mut client = connect(port);
+        client
+            .write_all(b"CONNECT sub.example.org:8443 HTTP/1.1\r\n\r\n")
+            .expect("different-port connect head");
+        pump(serving, 40);
+        let body = read_until(&mut client, b"\r\n\r\n");
+        assert!(
+            body.starts_with(b"HTTP/1.1 403"),
+            "a port-mismatch CONNECT must be refused 403, got {:?}",
+            body
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .facts_any_illegal(AnyIllegalCause::HostNotAllowlisted),
+            1,
+            "port mismatch must reach decide -> HostNotAllowlisted, not the early domain-block return"
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .actions_domain_block(ordinal),
+            1,
+            "the port-mismatch refusal must not re-record the domain-block action"
+        );
+        assert!(
+            serving.storage().enforcement().is_blocked(ordinal),
+            "the pre-existing domain block itself is unchanged"
+        );
+    });
+}
+
+#[test]
+/// A non-443 CONNECT on an allowlisted `<fqdn>:<port>` entry must be
+/// authorized and dial the entry's own port — never the 443 default — and
+/// Pair-authorization is exact `(hostname, port)`: against an unpopulated
+/// cache a mismatched `:443` CONNECT is 403 (HostNotAllowlisted) while the
+/// entry's own `{dial_port}` passes pair-authorization and reaches the
+/// NoBinding 502. The pair-authorized slot then dials its entry port directly
+/// into a deterministic in-process loopback listener, and `close_slot`
+/// resets `approved_port` back to the 443 default (alumina-9t6w B2).
+/// `Serving::dial` itself does not re-check `V4_EXCLUSIONS` (only the DNS
+/// cache does), so the loopback dial is a legitimate seam; a hardcoded-443
+/// bug would instead dial the loopback's 443 and trip the capture assertions.
+fn non443_connect_dials_the_entry_port_then_resets_approved_port_on_close_slot() {
+    let port = ephemeral_port();
+    let origin = StdListener::bind("127.0.0.1:0").expect("origin bind");
+    let dial_port = origin.local_addr().expect("origin addr").port();
+    assert_ne!(
+        dial_port, 443,
+        "the loopback listener port must be non-443 for this regression"
+    );
+    let cfg_doc = format!(
+        "allowlist = [\"sub.example.org:{dial_port}\"]\nlisten = \"127.0.0.1:{port}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n"
+    );
+    let cfg = crate::config::parse_config_document(&cfg_doc).expect("valid non-443 config");
+    with_serving_stack_cfg(port, cfg, move |serving| {
+        let mut mismatch = connect(port);
+        mismatch
+            .write_all(b"CONNECT sub.example.org:443 HTTP/1.1\r\n\r\n")
+            .expect("443 head");
+        pump(serving, 20);
+        let mb = read_until(&mut mismatch, b"\r\n\r\n");
+        assert!(
+            mb.starts_with(b"HTTP/1.1 403"),
+            "the :443 CONNECT must be rejected by pair-authorization, got {:?}",
+            mb
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .facts_any_illegal(AnyIllegalCause::HostNotAllowlisted),
+            1,
+            "the port-mismatched CONNECT counts one HostNotAllowlisted fact"
+        );
+
+        let mut entry = connect(port);
+        entry
+            .write_all(format!("CONNECT sub.example.org:{dial_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .expect("entry head");
+        pump(serving, 20);
+        let eb = read_until(&mut entry, b"\r\n\r\n");
+        assert!(
+            eb.starts_with(b"HTTP/1.1 502 Bad Gateway"),
+            "the pair-authorized CONNECT against an unpopulated cache must 502, got {:?}",
+            eb
+        );
+        assert!(
+            eb.windows(b"no resolved addresses".len())
+                .any(|w| w == b"no resolved addresses"),
+            "the 502 must be NoResolvedAddresses, not a refusal of the pair, got {:?}",
+            eb
+        );
+        assert_eq!(
+            serving
+                .storage()
+                .enforcement()
+                .counters()
+                .facts_any_illegal(AnyIllegalCause::HostNotAllowlisted),
+            1,
+            "the entry-port CONNECT passes pair-authorization and must not add a fact"
+        );
+
+        let approved = FixedHostname::normalize(b"sub.example.org").expect("normalize");
+        let ws = &mut serving.slots[0];
+        ws.approved = Some(approved);
+        ws.approved_port = dial_port;
+        ws.stage = Stage::Dialing;
+        serving
+            .dial(
+                0,
+                crate::eligibility::NumericAddr::V4([127, 0, 0, 1].into()),
+            )
+            .expect("loopback dial");
+        let _origin_stream = origin.accept().expect("accept origin side").0;
+        let ws = &serving.slots[0];
+        assert_eq!(
+            ws.approved_port, dial_port,
+            "the dial must target the entry port, not the 443 default"
+        );
+        assert!(
+            ws.stage == Stage::Dialing,
+            "the dialed slot must still hold Dialing"
+        );
+        serving.close_slot(0);
+        let ws = &serving.slots[0];
+        assert!(
+            ws.stage == Stage::Idle,
+            "close_slot must idle the workspace"
+        );
+        assert_eq!(
+            ws.approved_port, 443,
+            "close_slot must reset approved_port to the 443 default"
+        );
+        assert!(
+            ws.approved.is_none(),
+            "close_slot must clear the approved hostname"
+        );
+    });
+}
+
+#[test]
 fn block_domain_closes_current_flow_with_matching_ordinal() {
     let port = ephemeral_port();
     let cfg = cfg_doc1(port, "connection", "block", "domain");
@@ -4222,7 +4389,7 @@ fn block_domain_closes_current_flow_with_matching_ordinal() {
 fn block_domain_does_not_touch_unrelated_current_flow() {
     let port = ephemeral_port();
     let doc = format!(
-        "allowlist = [\"sub.example.org\", \"trusted-other.example.net\"]\n\
+        "allowlist = [\"sub.example.org:443\", \"trusted-other.example.net:443\"]\n\
          listen = \"127.0.0.1:{port}\"\n\
          startup_unresolved_allowance = 0\n\
          [any_illegal]\n\

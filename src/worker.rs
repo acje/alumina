@@ -523,19 +523,21 @@ impl<'a> WorkerView<'a> {
 }
 
 /// The ordinal of `request` in `view.config.allowlist()`, or `None` when the
-/// CONNECT hostname is not allowlisted.
+/// CONNECT (hostname, port) pair is not allowlisted. Authorization requires
+/// the exact configured `<fqdn>:<port>` pair: a same-name different-port
+/// request is denied.
 fn allowlist_ordinal(request: &ConnectRequest, config: &Config) -> Option<usize> {
-    config
-        .allowlist()
-        .iter()
-        .position(|entry| entry.as_str().as_bytes() == request.hostname().as_bytes())
+    config.allowlist().iter().position(|entry| {
+        entry.as_str().as_bytes() == request.hostname().as_bytes() && entry.port() == request.port()
+    })
 }
 
 /// Decides the next CONNECT-phase action for a tunnel from the current cache.
 ///
 /// Authorization is allowlist membership of the already-validated CONNECT
-/// hostname (port 443 and non-literal forms are enforced upstream in the
-/// parser). After authorization, the fixed setup deadline and the attempt
+/// (hostname, port) pair, requiring the exact configured `<fqdn>:<port>`; the
+/// 1..=65535 port range and non-literal hostname forms are enforced upstream
+/// in the parser. After authorization, the fixed setup deadline and the attempt
 /// budget are checked before any address is selected, so a refusal never
 /// reaches the peer-selection step and no upstream socket is opened. The
 /// per-attempt connect deadline is freshly clipped inside the returned
@@ -661,7 +663,7 @@ mod tests {
     use crate::connect::ConnectParser;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    const CONFIG: &str = "allowlist = [\"sub.example.org\", \"second.example.org\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
+    const CONFIG: &str = "allowlist = [\"sub.example.org:443\", \"second.example.org:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
 
     fn config() -> Config {
         parse_config_document(CONFIG).expect("valid config")
@@ -779,6 +781,34 @@ mod tests {
         )
         .expect("decision");
         assert_eq!(phase, ConnectPhase::Forbidden);
+    }
+
+    #[test]
+    /// Authorization requires the exact configured `<fqdn>:<port>` pair: the
+    /// same allowlisted hostname at a different CONNECT port is a pair miss
+    /// (HostNotAllowlisted forbid), even with a usable cache binding.
+    fn same_host_different_port_is_forbidden_even_with_usable_cache() {
+        let mut cache = cache_with(2);
+        let n = name(&cache, 0);
+        publish(&mut cache, n, Family::A, &[pub_v4()], 100, 3600);
+        let cfg = config();
+        let view = view_of(&cfg, &cache);
+        let req = parse_head(b"CONNECT sub.example.org:8443 HTTP/1.1\r\n\r\n");
+        let t0 = anchor();
+        let phase = next_phase(
+            &req,
+            &view,
+            later(t0, 1),
+            AttemptCounts::new(),
+            None,
+            setup_at(t0),
+        )
+        .expect("decision");
+        assert_eq!(
+            phase,
+            ConnectPhase::Forbidden,
+            "a same-host different-port pair must be denied even when the hostname is allowlisted"
+        );
     }
 
     #[test]

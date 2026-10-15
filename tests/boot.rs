@@ -37,7 +37,7 @@ impl Drop for TempDir {
 }
 
 const VALID_CONFIG: &str = r#"
-allowlist = ["example.com", "sub.example.org."]
+allowlist = ["example.com:443", "sub.example.org.:443"]
 listen = "0.0.0.0:8080"
 startup_unresolved_allowance = 1
 [any_illegal]
@@ -100,11 +100,11 @@ fn config_all_mandatory_fields_fail_when_missing() {
         ),
         (
             "listen",
-            "allowlist = [\"a.example\"]\nstartup_unresolved_allowance = 0\n",
+            "allowlist = [\"a.example:443\"]\nstartup_unresolved_allowance = 0\n",
         ),
         (
             "startup_unresolved_allowance",
-            "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\n",
+            "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\n",
         ),
     ] {
         assert!(
@@ -123,13 +123,13 @@ fn config_all_mandatory_fields_fail_when_missing() {
 fn config_unknown_key_and_unknown_table_fail() {
     assert!(matches!(
         config::parse_config_document(
-            "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\nbogus = 1\n"
+            "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\nbogus = 1\n"
         ),
         Err(ConfigError::UnknownKey(_))
     ));
     assert!(matches!(
         config::parse_config_document(
-            "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[bogus]\nx = 1\n"
+            "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[bogus]\nx = 1\n"
         ),
         Err(ConfigError::UnknownTable(_))
     ));
@@ -137,7 +137,7 @@ fn config_unknown_key_and_unknown_table_fail() {
 
 #[test]
 fn config_duplicate_key_and_duplicate_table_fail() {
-    let dup_key = "allowlist = [\"a.example\"]\nallowlist = [\"b.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n";
+    let dup_key = "allowlist = [\"a.example:443\"]\nallowlist = [\"b.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n";
     assert!(matches!(
         config::parse_config_document(dup_key),
         Err(ConfigError::ParseToml {
@@ -146,7 +146,7 @@ fn config_duplicate_key_and_duplicate_table_fail() {
         }) if !message.is_empty()
     ));
 
-    let dup_table = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[one]\n[one]\n";
+    let dup_table = "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[one]\n[one]\n";
     assert!(matches!(
         config::parse_config_document(dup_table),
         Err(ConfigError::ParseToml {
@@ -161,7 +161,7 @@ fn config_wrong_types_fail_without_coercion() {
     for (name, doc) in [
         (
             "allowance-string",
-            "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = \"1\"\n",
+            "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = \"1\"\n",
         ),
         (
             "allowlist-string",
@@ -173,7 +173,7 @@ fn config_wrong_types_fail_without_coercion() {
         ),
         (
             "listen-integer",
-            "allowlist = [\"a.example\"]\nlisten = 8080\nstartup_unresolved_allowance = 0\n",
+            "allowlist = [\"a.example:443\"]\nlisten = 8080\nstartup_unresolved_allowance = 0\n",
         ),
         (
             "allowlist-boolean-entry",
@@ -215,28 +215,36 @@ fn config_allowlist_empty_and_over_32_fail() {
 
 #[test]
 fn config_duplicate_allowlist_names_rejected_after_normalization() {
-    let dup_exact = "allowlist = [\"a.example\", \"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
+    let dup_exact = "allowlist = [\"a.example:443\", \"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(dup_exact),
         Err(ConfigError::DuplicateAllowlistName(_))
     ));
-    let dup_normalized = "allowlist = [\"a.example\", \"a.example.\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
+    let dup_normalized = "allowlist = [\"a.example:443\", \"a.example.:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(dup_normalized),
         Err(ConfigError::DuplicateAllowlistName(_))
     ));
+    let dup_same_host_different_port = "allowlist = [\"a.example:443\", \"a.example:8443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
+    assert!(
+        matches!(
+            config::parse_config_document(dup_same_host_different_port),
+            Err(ConfigError::DuplicateAllowlistName(_))
+        ),
+        "dedup is by normalized hostname, so the same FQDN at a second port is a duplicate"
+    );
 }
 
 #[test]
 fn config_invalid_fqdn_rejected() {
     for (name, fqdn) in [
-        ("uppercase", "Example.COM"),
-        ("underscore", "bad_name.example"),
-        ("empty-label", ".example.com"),
-        ("trailing-hyphen", "bad-.example.com"),
+        ("uppercase", "Example.COM:443"),
+        ("underscore", "bad_name.example:443"),
+        ("empty-label", ".example.com:443"),
+        ("trailing-hyphen", "bad-.example.com:443"),
         (
             "long-label",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com:443",
         ),
     ] {
         let doc = format!(
@@ -252,18 +260,47 @@ fn config_invalid_fqdn_rejected() {
 }
 
 #[test]
+fn config_allowlist_requires_fqdn_port_else_invalid_fqdn_exit78() {
+    for (name, entry) in [
+        ("bare-no-port", "a.example"),
+        ("port-zero", "a.example:0"),
+        ("port-overflow", "a.example:65536"),
+        ("port-leading-zero", "a.example:0443"),
+        ("port-non-numeric", "a.example:abc"),
+        ("port-empty", "a.example:"),
+    ] {
+        let doc = format!(
+            "allowlist = [\"{}\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
+            entry
+        );
+        let doc_name = format!("allowlist entry {name:?} must be rejected");
+        let err = config::parse_config_document(&doc).expect_err(&doc_name);
+        assert!(
+            matches!(&err, ConfigError::InvalidFqdn { .. }),
+            "allowlist entry {name:?} must be InvalidFqdn, got {err:?}"
+        );
+        assert_eq!(err.exit_status(), 78, "InvalidFqdn must exit 78");
+    }
+    let ok_doc = "allowlist = [\"a.example:1\", \"b.example:65535\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\", \"flare_only\"]\nscope = [\"connection\", \"connection\"]\n";
+    let cfg = config::parse_config_document(ok_doc).expect("ports 1 and 65535 are valid");
+    assert_eq!(cfg.allowlist().len(), 2);
+    assert_eq!(cfg.allowlist().get(0).unwrap().port(), 1);
+    assert_eq!(cfg.allowlist().get(1).unwrap().port(), 65535);
+}
+
+#[test]
 fn config_allowance_out_of_range_fails() {
-    let eq_len = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
+    let eq_len = "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(eq_len),
         Err(ConfigError::AllowanceOutOfRange { .. })
     ));
-    let negative = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = -1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
+    let negative = "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = -1\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     assert!(matches!(
         config::parse_config_document(negative),
         Err(ConfigError::AllowanceOutOfRange { .. })
     ));
-    let zero_ok = "allowlist = [\"a.example\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
+    let zero_ok = "allowlist = [\"a.example:443\"]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     assert!(config::parse_config_document(zero_ok).is_ok());
 }
 
@@ -280,7 +317,7 @@ fn config_listen_variants() {
         ("empty", ""),
     ] {
         let doc = format!(
-            "allowlist = [\"a.example\"]\nlisten = \"{}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
+            "allowlist = [\"a.example:443\"]\nlisten = \"{}\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n",
             listen
         );
         assert!(
@@ -289,7 +326,7 @@ fn config_listen_variants() {
             name
         );
     }
-    let ipv6_ok = "allowlist = [\"a.example\"]\nlisten = \"[2001:db8::1]:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
+    let ipv6_ok = "allowlist = [\"a.example:443\"]\nlisten = \"[2001:db8::1]:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [\"flare_only\"]\nscope = [\"connection\"]\n";
     let cfg = config::parse_config_document(ipv6_ok).expect("bracketed IPv6 listen");
     assert_eq!(cfg.listen().port(), 8080);
     assert_eq!(cfg.listen().ip().to_string(), "2001:db8::1");
@@ -299,7 +336,7 @@ fn config_listen_variants() {
 fn config_allowlist_32_max_fits_document_bound() {
     let mut names = Vec::with_capacity(32);
     for i in 0..32usize {
-        names.push(format!("\"{}.example.com\"", i));
+        names.push(format!("\"{}.example.com:443\"", i));
     }
     let doc = format!(
         "allowlist = [{}]\n# trailing comment padding\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n[any_illegal]\nscope = \"connection\"\n[actions]\nkind = [{kinds}]\nscope = [{scopes}]\n",

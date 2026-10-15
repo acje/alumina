@@ -1403,14 +1403,14 @@ mod tests {
         use crate::startup_dns::FailureReason;
         let first = b"abcdefghijklmnopqrstuvwxyz0123456789-";
         let d = "b".repeat(62);
-        let e = "c".repeat(35);
+        let e = "c".repeat(31);
         let mut doc = String::new();
         doc.push_str("allowlist = [\n");
         let mut names: Vec<String> = Vec::new();
         for &c in first.iter().take(ALLOWLIST_MAX) {
             let c = c as char;
             let name = format!("{c}.{d}.{e}");
-            doc.push_str(&format!("  \"{name}\",\n"));
+            doc.push_str(&format!("  \"{name}:443\",\n"));
             names.push(name);
         }
         doc.push_str("]\nlisten = \"0.0.0.0:8080\"\nstartup_unresolved_allowance = 0\n");
