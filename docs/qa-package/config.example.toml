@@ -1,6 +1,11 @@
 allowlist = ["example.com", "www.example.net"]
+# 127.0.0.1:<port> for local testQA / multi-container sidecar;
+# 0.0.0.0:<port> for a Cloud Run Worker Pool with Direct VPC.
 listen = "127.0.0.1:5353"
 startup_unresolved_allowance = 0
+# Mandatory index-aligned tripwire action tables (docs/alumina-proxy.md:265-281):
+# [any_illegal] scope is the AnyIllegal first-slot Block scope ("connection"|"all");
+# [actions] kind/scope are one literal per allowlist entry, in allowlist order.
 [any_illegal]
 scope = "connection"
 [actions]

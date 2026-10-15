@@ -11,9 +11,11 @@ sketches §6), and ends with material questions a later approval step must answe
   `4c29c2c8da58d5225029cabb9e149408dafd4ab4` (short `4c29c2c`); every source link in this
   document is pinned to this identity (resolved against the actual checkout at assessment).
 - **Canonical spec** `docs/alumina-proxy.md`, sha256
-  `322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836` — the **binding
-  requirement**, never edited; documents only restate or cite it (not a claim it is fully
-  implemented as code; see §9).
+  `322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836` — **historical pre-rp2e
+  spec digest at assessment**; the current post-rp2e canonical spec sha256 is
+  `b5b1c9fae649feff81ad9910ca7af999987c7036ee447d91c1f10c3db700137d` (unchanged by this
+  review). The spec remains the **binding requirement**, never edited; documents only
+  restate or cite it (not a claim it is fully implemented as code; see §9).
 - **Working tree at assessment:** only three untracked user bench drafts
   (`scripts/bench_frame_echo.{py,sh}`, `scripts/bench_frame_echo.py.new`); README and canonical
   spec untouched.
@@ -388,7 +390,7 @@ been falsely opposed to each other (review B3).
 
 | Source | Reference | Status |
 |---|---|---|
-| Canonical spec | `docs/alumina-proxy.md` sha256 `322b68ee…5b836` (full `322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836`), pinned [alumina-proxy.md](https://github.com/acje/alumina-proxy/blob/4c29c2c8da58d5225029cabb9e149408dafd4ab4/docs/alumina-proxy.md) | **binding requirement**, never edited — **not** a blanket "implemented" claim; some spec provisions differ from current source (see note below) |
+| Canonical spec | `docs/alumina-proxy.md` sha256 `322b68ee…5b836` (full `322b68eeb112f95960a67843ebafcd65b92da90ca0024f3422fdb95a5395b836`) — **historical pre-rp2e spec digest at assessment**; current post-rp2e canonical sha256 `b5b1c9fae649feff81ad9910ca7af999987c7036ee447d91c1f10c3db700137d`), pinned [alumina-proxy.md](https://github.com/acje/alumina-proxy/blob/4c29c2c8da58d5225029cabb9e149408dafd4ab4/docs/alumina-proxy.md) | **binding requirement**, never edited — **not** a blanket "implemented" claim; some spec provisions differ from current source (see note below) |
 | Design statement | `docs/architecture.md` (D1–D7), pinned [architecture.md](https://github.com/acje/alumina-proxy/blob/4c29c2c8da58d5225029cabb9e149408dafd4ab4/docs/architecture.md) | **historical design statement** pinned at HEAD `8934adb`; design context, **not runtime evidence** |
 | Prior layout review | `docs/repository-layout-review.md` | preserved history; Layout A **landed** (commits `9903db4`, `248f132`, source-present); Layout B not only unimplemented but a proposed future increment (I2) |
 | Current source modules | pinned blob links in §2–§5 (serving/gate/client_hello/startup_dns/log/etc. at 4c29c2c) | resolved against the actual checkout; mechanisms named there are source-present |
@@ -399,11 +401,16 @@ been falsely opposed to each other (review B3).
 scoped local testQA candidate with open serving-qualification gates (`docs/build-plan.md`); the
 canonical spec as a whole is therefore never marked "implemented." A concrete example within
 the reviewed path: spec `:43` requires runtime-condition failures (`502/503/504`) to send a
-**fixed plain-text body stating the reason**, while the current source defines
+**fixed plain-text body stating the reason**, while the source at assessment (`4c29c2c`) defined
 zero-content-length bodies for those statuses
 ([serving.rs:193-197](https://github.com/acje/alumina-proxy/blob/4c29c2c8da58d5225029cabb9e149408dafd4ab4/src/serving.rs#L193-L197)).
-That difference is cited only to falsify a blanket implementation claim, not assigned as
-remediation in this doc-only mission.
+That historical empty-body discrepancy observed at `4c29c2c` was **subsequently rectified**
+(rp2e.1 / alumina-n314.1): `BODY_502`, `BODY_503`, `BODY_504` in `src/serving/policy.rs` and
+`src/serving.rs` now send the fixed plain-text reason bodies with
+`content-type: text/plain; charset=utf-8` and `content-length` required by
+`docs/alumina-proxy.md:43` (400/403 remain empty-body with `content-length: 0`). The
+earlier difference is cited only to falsify a blanket implementation claim at the older
+identity, not assigned as remediation in this doc-only mission.
 
 ## 10. Method disclosures and coverage limits
 

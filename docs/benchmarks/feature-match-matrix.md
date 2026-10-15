@@ -1,36 +1,23 @@
-# Alumina baseline — selected-benchmark feature match matrix
-
-Source-grounded, **selected-benchmark-config** comparison: Alumina (current as-is restore and the historical implemented-measured-reverted to-be `54a34ce`) versus HAProxy and Envoy under the accepted 60 s / 100 Mbps TLS workload. This is **not** a product-capability matrix, a security-equivalence claim, or a runtime result. Every candidate cell is **source/manual/config-level positive evidence only**. HAProxy and Envoy configurations were **not executed within this matrix's original source-intake review scope**; the later historical native timed pairs of the reviewed HAProxy and Envoy setups were run and are recorded in [`100mbps-comparison.md`](100mbps-comparison.md) (valid instruments with `workload_fulfilled=false`, no production qualification). The to-be Alumina column is the historical `54a34ce` variant (implemented, measured, then reverted) at source level. No production-qualifying timed measurement is claimed: the earlier Alumina smoke receipts are **rejected** per `alumina-dr8n`; the scoped 100 Mbps trust-pair A/B for the reverted variant **was measured** and is recorded in [`100mbps-comparison.md`](100mbps-comparison.md) with raw JSON under `results/` (`workload_fulfilled=false`) — a historical experimental observation with no observed lower proxy CPU in that single pair, not a qualification receipt. Policy parity is explicitly **not** claimed (`alumina-et74` T1: wire parity ≠ policy parity; no generic HAProxy/Envoy config establishes Alumina's authorization gates). TLS client-certificate validation between client and endpoint is an endpoint application feature, not a proxy feature, and is not a row.
-
-## Accepted workload boundary
-
-Selected-parameters contract (details preserved in continuation bead `alumina-gjq4`; accepted from the harness contract record `alumina-ojxl` — cited here as a workload contract, not a tool safety or quality endorsement; the harness itself was unreviewed work-in-progress **at original matrix review scope** and was not published by this activity — the later historical timed runs used the separately reviewed execution/report tools recorded in [`100mbps-comparison.md`](100mbps-comparison.md), supervisor exit 0 with version/config validation):
-
-- 4096 B payload frames / 12 B header; 8 persistent connections; aggregate open-loop pacing 100 Mbps **decimal** client payload (12,500,000 B/s) plus echo; 5 s warmup; 60 s measurement window; setup outside the window; intended 750,000,000 B client payload with disclosed fixed-frame rounding.
-- **Monotonic open-loop schedule** (offered rate independent of echo completion); distinct intended / offered / sent / echoed denominators plus `sched_to_echo`, `actual_send_to_echo`, `send_lag`; bounded retention/drain; **operational errors are never "clean"**; no invented 1.31 ms cutoff.
-- One worker per proxy; total CPU and thread counts disclosed (auxiliary threads counted); common client/backend placement. Neither HAProxy nor Envoy had been run **within this matrix's original source-intake scope**; the later historical AB and native timed pairs are recorded in [`100mbps-comparison.md`](100mbps-comparison.md). Historical Alumina smoke runs were executed but typed INVALID and are not receipts (`alumina-dr8n`).
+# Alumina 8dbbec8 vs HAProxy 3.2.25 vs Envoy v1.39.4 — feature match matrix
 
 ## Candidates
 
 | Candidate | Evidence identity |
 | --- | --- |
-| **Alumina as-is** | Canonical spec [docs/alumina-proxy.md](../../docs/alumina-proxy.md) (sha256 `322b68eeb1…`); implementation `src/serving.rs`, `src/client_hello.rs`, `src/gate.rs`, `src/log.rs`, `src/worker.rs`; qualification owner `docs/qa-package/README.md` + `scripts/verify.sh` |
-| **Alumina to-be** | [reduced-copy-relay-plan.md](../../docs/reduced-copy-relay-plan.md) — §4 direct initialized-tail reads: **historical** implemented (`54a34ce`), measured (scoped 100 Mbps trust-pair), then **reverted**; preserves gates/limits (W2/W5/W6/W7); cells are historical variant source evidence, not current-checkout claims |
+| **Alumina 8dbbec8** | Canonical spec [docs/alumina-proxy.md](../../docs/alumina-proxy.md) (sha256 `322b68eeb1…` — **historical pre-rp2e spec digest**; current post-rp2e canonical sha256 `b5b1c9f…137d`); implementation `src/serving.rs`, `src/client_hello.rs`, `src/gate.rs`, `src/log.rs`, `src/worker.rs`; qualification owner `docs/qa-package/README.md` + `scripts/verify.sh`; 100 Mbps timed result in [`100mbps-comparison.md`](100mbps-comparison.md) |
 | **HAProxy** | Pinned **3.2.25** (LTS); haproxy.org 3.2 manual + sha256-verified tarball `d59a68d0…` (`alumina-722v`, `alumina-elyw`). Chosen comparable setup: TCP-mode near-direct TLS opaque relay — SNI allowlist, fixed backend, one configured thread, CONNECT stage skipped |
-| **Envoy** | Selected **envoyproxy/envoy:v1.39.4** (arm64 digest `ce82b213…`); official `terminate_http1_connect.yaml` CONNECT-terminate, raw TCP upstream, `--concurrency 1` (`alumina-elyw`). Image/config unexecuted in original intake scope (the later historical native Envoy timed run is recorded in [`100mbps-comparison.md`](100mbps-comparison.md), valid instrument, `workload_fulfilled=false`, no production qualification) |
+| **Envoy** | Selected **envoyproxy/envoy:v1.39.4** (arm64 digest `ce82b213…`); official `terminate_http1_connect.yaml` CONNECT-terminate, raw TCP upstream, `--concurrency 1` (`alumina-elyw`). 100 Mbps timed result in [`100mbps-comparison.md`](100mbps-comparison.md) |
 
 ## Legend
 
-Alumina as-is column tags:
+Alumina 8dbbec8 column tags:
 
 | Tag | Meaning |
 | --- | --- |
 | `R` | Required by canonical spec (`docs/alumina-proxy.md:LINE`) |
 | `I` | Implemented and enforced, cited to `src/` (`path:LINE`) or evidence bead |
 
-**No executed-receipt grade is used.** The `Q` grade from the previous revision is **withdrawn** (`alumina-dr8n`). Two distinct failures: (a) the earlier smoke receipts the `Q` grade cited were **false-clean** — runs asserted as clean reported `valid` 6,104 frames vs the planned 6,103, appended data post-end (8,192 B), and a wrong CPU/test roster; (b) the latest authoritative re-runs were typed exit 3 **INVALID** — proxyless planned 6,103 = 6,093 offered + 10 missed; as-is = 6,028 offered, 75 missed — with no clean workload proof. Historical Alumina smoke execution is acknowledged **only as rejected evidence**, never as qualification; serving-phase/boundary/fuzz/F1–F3 and the 60 s timed benchmark remain open (`build-plan.md:19-30`; `docs/qa-package/README.md` scoped-testQA status).
-
-Candidate columns (and to-be) use exactly one grade:
+Candidate columns use exactly one grade:
 
 | Grade | Meaning |
 | --- | --- |
@@ -38,57 +25,24 @@ Candidate columns (and to-be) use exactly one grade:
 | `partial` | A related but altered/weaker form exists in the selected config, with the proven subset named |
 | `different` | A materially different mechanism or policy is evidenced for the selected config |
 | `unverified` | No positive evidence obtained in this pass; no capability-absence or runtime claim is made (absence ≠ negative) |
-| `preserved (source)` | To-be (historical, reverted): the `54a34ce` implemented candidate preserved the as-is source/config path for this feature (same gates/limits as the as-is column), at source level; cells describe that historical variant and are **not** a claim about the current checkout (which is restored AS-IS), and no enforcement or runtime claim is made above the as-is column. Pre-implementation proposal-only cells used the withdrawn `planned` grade |
 
 ## Matrix
 
-| # | Feature (selected benchmark config) | Alumina as-is | Alumina to-be (hist., reverted) | HAProxy 3.2.25 | Envoy v1.39.4 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | CONNECT wire entry (selected happy-path): completed 200 before ClientHello | `R` `I` | preserved (source) | different | ✓ matched (source) |
-| 2 | Endpoint TLS 1.3 pass-through — non-terminating, proxy holds no keys | `R` `I` | preserved (source) | ✓ matched (source) | ✓ matched (source) |
-| 3 | Proxy-side TLS 1.3-only ClientHello profile | `R` `I` | preserved (source) | different | different |
-| 4 | Initial SNI inspection / matching CONNECT SNI | `R` `I` | preserved (source) | partial | different |
-| 5 | Full ClientHello validation (framing, versions, exactly-one SNI, duplicates) | `R` `I` | preserved (source) | different | different |
-| 6 | ECH rejection (incl. GREASE) | `R` `I` | preserved (source) | different | different |
-| 7 | CONNECT-hostname allowlist / authorization | `R` `I` | preserved (source) | partial | different |
-| 8 | Two forwarding barriers (client-before-validation, upstream-before-gate, early data/EOF/reset closed) | `R` `I` | preserved (source) | partial | different |
-| 9 | DNS provenance / cache-life / destination-address policy | `R` `I` | preserved (source) | different | different |
-| 10 | Original byte preservation (ordered unmodified prefix) | `R` `I` | preserved (source) | ✓ matched (source) | unverified |
-| 11 | Partial-I/O, FIN, backpressure | `R` `I` | preserved (source) | unverified | unverified |
-| 12 | Bounded resources (fixed limits, reject-on-exhaustion) | `R` | preserved (source) | unverified | unverified |
-| 13 | No heap alloc/dealloc while serving | `R` | preserved (source) | unverified | unverified |
-| 14 | Single worker | `R` `I` | preserved (source) | ✓ matched (config intent) | ✓ matched (source) |
-| 15 | Logging (stdout-only best-effort allocation-free) | `R` `I` | preserved (source) | unverified | unverified |
-| 16 | Shutdown (SIGTERM-only, bounded grace, no policy reload) | `R` | preserved (source) | unverified | unverified |
-
-## By-row source notes
-
-1. **CONNECT wire entry.** Wire-sequence row only; authority validation is row 7. Alumina: completed-200-before-CH required (`docs/alumina-proxy.md:19,32`), implemented (`client_writable` `src/serving.rs:2286-2303` `SendingConnected`: flushes the 200 down, `gate.on_response_ok()` → `Stage::ValidatingHello` → `enter_validating_hello`); no executed receipt is claimed — the historical smoke run was typed INVALID (`alumina-dr8n`). HAProxy: native HTTP CONNECT is a relay that enters tunnel only on a 2xx/101 parsed from the backend (`alumina-elyw`: `http_ana.c:2138,2195`; `mux_h1.c:1812-1815`), so no native 200-before-CH against a fixed TLS-only backend; chosen comparable setup skips the CONNECT stage. No broad impossibility claim — evidenced native-path consequence only. Envoy: early-200 synthesized on TCP-pool-ready, before upstream bytes (`upstream_request.cc:73-78`) — **wire-sequence** positive; no authority validation implied.
-2. **Endpoint TLS pass-through.** Alumina non-decrypting, never holds keys (`docs/alumina-proxy.md:219`); no executed receipt of endpoint negotiation is claimed (historical smoke run typed INVALID, `alumina-dr8n`). HAProxy opaque byte relay, no TLS termination, negotiated TLS identical end-to-end is an intent of the direct-TLS topology, not a measured outcome (`alumina-722v`). Envoy raw TCP upstream with no cluster `tls_context` (`alumina-elyw`). All candidates use an **intended common TLS 1.3 client/backend setup**; the actually negotiated endpoint parameters are **unverified** here (no valid run within this matrix's original scope — the later historical comparison records actual TLS 1.3 echo/endpoint validation, `100mbps-comparison.md:49-50`, still `workload_fulfilled=false`; the cell is a source-coverage `unverified`, absence ≠ negative) and Alumina's CH check does not itself verify endpoint negotiation (`docs/alumina-proxy.md:50`).
-3. **TLS 1.3-only profile.** Alumina requires a TLS 1.3-only ClientHello (`docs/alumina-proxy.md:47`; `src/client_hello.rs:26-27,435,552`). HAProxy `req.ssl_*` fetches parse a complete "SSL v3 or superior" hello with no TLS 1.3-only profile (`alumina-722v`). Envoy performs no CH inspection on the CONNECT path (`alumina-et74`, `alumina-w7y3`).
-4. **Initial SNI inspection / matching CONNECT SNI.** Alumina requires exactly one `server_name` equal to the approved CONNECT hostname (`docs/alumina-proxy.md:47-48`; `src/client_hello.rs:498,552`). HAProxy `req.ssl_sni` is an initial SNI filter in TCP mode — matches Alumina's initial-SNI filter only, plaintext parse of unverified client data, first-CH-only, ECH-unreliable (`alumina-722v`) → `partial`. Envoy has no CONNECT-SNI matching in the selected CONNECT-terminate path; `tls_inspector` SNI extraction is a separate listener filter disjoint from CONNECT parsing and is not claimed to enforce matching (`alumina-et74`, `alumina-w7y3`) → `different`.
-5. **Full ClientHello validation.** Alumina validates framing and record bounds, TLS 1.3-only profile, exactly-one `server_name`, duplicate/ambiguous extension rejection, GREASE skip by length (`docs/alumina-proxy.md:47-48`; `src/client_hello.rs` parsing/validation predicates `:345,435,476,498,552`, record limit `:9`). HAProxy: `req.ssl_sni` is a plaintext SNI parse, not full CH validation, with a reliability caveat (`alumina-722v`) → `different`. Envoy: no CH validation on the CONNECT path (`alumina-et74`, `alumina-w7y3`) → `different`.
-6. **ECH rejection.** Alumina rejects `encrypted_client_hello` incl. GREASE (`docs/alumina-proxy.md:49`; `src/client_hello.rs:59,156`). HAProxy: with ECH only the outer decoy CH is visible and must not be relied on for routing/access decisions (`alumina-722v`) — no ECH rejection. Envoy: no CH inspection, no ECH-reject claim.
-7. **CONNECT-hostname allowlist.** Alumina authorizes by approved CONNECT hostname + DNS-bound destination, enforced before forwarding (`docs/alumina-proxy.md:40-43,200-202`). HAProxy: TCP-mode SNI allowlist with deny-by-default exists (`alumina-722v` official example) but is not CONNECT-hostname authorization; HTTP-mode CONNECT performs no authority check (`alumina-elyw`, manual §H1) → `partial`. Envoy: CONNECT-terminate dials a configured fixed cluster — benchmark fixture destination, not per-request hostname authorization (`alumina-et74`, `alumina-w7y3`) → `different`.
-8. **Two forwarding barriers.** Alumina: no client bytes (incl. CH) before validation and no upstream bytes before the gate opens (`docs/alumina-proxy.md:32,201`; `:226` deterministic verification requirement); both barriers gated in `src/gate.rs` (barrier A = validated-hello release + `upstream_write` cumulative accounting, D3, `:195-236`; barrier B = `observe_upstream_activity` terminates on early data/EOF/reset, D4, `:245-252`; `is_open` only after both, `:256-258`) and serving closures (`src/serving.rs:1906-1991` pre-open `observe_upstream_read` termination incl. `gate.observe_upstream_activity`; `:2018-2045` `hello_complete` validated upstream release; `:2106-2156` `flush_client_upstream` upstream-write gate accounting). HAProxy: `tcp-request content inspect-delay` withholds client bytes pending a content verdict (`alumina-722v`) — a one-direction inspection hold only; no write-accounting gate and no upstream-before-gate barrier evidenced → `partial`. Envoy: CONNECT 200 synthesized on pool-ready with no validation barrier; raw configured destination → `different`. No barrier/cell implies policy equivalence.
-9. **DNS provenance / address policy.** Alumina binds each upstream address to a positive, current, pre-retirement cache entry satisfying address policy (`docs/alumina-proxy.md:200`; DNS publication `:145`; eligibility `:52-82`). HAProxy/Envoy resolve upstreams standardly (server line / cluster DNS) with no CONNECT-hostname-bound provenance or address-policy mechanism evidenced → `different` for both.
-10. **Byte preservation.** Alumina: ordered unmodified prefix, no dup/replay, failures terminate the stream (`docs/alumina-proxy.md:220`); no executed byte-exact receipt is claimed (historical smoke run typed INVALID, `alumina-dr8n`). HAProxy: opaque TCP relay, inspected bytes forwarded verbatim (`alumina-722v`) → `✓ matched (source)`. Envoy: selected-config source for byte conservation was not inspected sufficiently in this pass; no positive claim → `unverified` (no runtime claim intended — this cell is a source-coverage gap, not a runtime requirement).
-11. **Partial-I/O, FIN, backpressure.** Alumina preserves pending work across partial reads/writes and backpressure (`docs/alumina-proxy.md:190`; partial-write drains `src/serving.rs:2054-2105` `drain_to_upstream`, `:2157-2209` `flush_down`; directional FIN/half-close `observe_up_eof`/`observe_down_eof`/`finish_drain` `:2332-2391`). HAProxy: inspect-delay describes inspection hold/release and the partial-verdict race only; it supplies no FIN drain/half-close or partial-successful-write/backpressure witness → `unverified` (not a runtime denial). Envoy: no source evidence inspected → `unverified`.
-12. **Bounded resources.** Alumina: fixed build-time limits, exhaustion rejects, never grows (`docs/alumina-proxy.md:154-166`; `:207` invariant). HAProxy/Envoy: no selected-config limit/exhaustion behavior inspected in this pass → `unverified` for both (absence ≠ negative; `--concurrency 1` is a worker count, not a resource-bound profile).
-13. **Zero-alloc invariant.** Alumina requires no heap alloc/dealloc while serving incl. dependencies (`docs/alumina-proxy.md:206`); `alloc-witness` is an opt-in separate build and serving-phase allocation-freedom remains an open gate (`alumina-et74` §4; `build-plan.md`); row therefore `R` only. HAProxy/Envoy: no allocation-path evidence inspected → `unverified`.
-14. **Single worker.** Alumina fixes worker threads = 1 (`docs/alumina-proxy.md:159`; `src/worker.rs` single loop). HAProxy `nbthread 1` one configured thread (`alumina-722v`) → `✓ matched (config intent)`; Envoy `--concurrency 1` forces one worker thread (`options_impl.cc:82-83`, `alumina-elyw`) → `✓ matched (source)`. Total CPU/thread disclosure is a benchmark condition for all candidates.
-15. **Logging.** Alumina: stdout-only, best-effort allocation-free structured records, nonblocking drain (`docs/alumina-proxy.md:192-194`; candidate model per `src/log.rs` implementation present). HAProxy/Envoy: no selected-config log-sink/allocation evidence inspected → `unverified` (product characterizations are not cited).
-16. **Shutdown.** Alumina: SIGTERM-only, bounded grace never extended, no policy reload (`docs/alumina-proxy.md:192`; runtime-surface verification `:235`); implementation and tests exist but no executed receipt is cited here → `R` only. HAProxy/Envoy: shutdown semantics not sourced or runtime-proven in this pass → `unverified` (absence ≠ negative).
-
-## Key differences
-
-- **HAProxy (closest approved native):** TCP/SNI-filtered direct-TLS opaque relay — pinned 3.2.25, fixed backend, one configured thread, CONNECT stage skipped. `req.ssl_sni` matches Alumina's initial-SNI filter only; no CH-profile validation, no ECH rejection (unreliable under ECH), no CONNECT-hostname authorization, no write-accounting barrier. Native HTTP CONNECT is a relay needing a backend 2xx, so it cannot produce the accepted 200-before-CH sequence against a fixed TLS-only backend.
-- **Envoy:** native CONNECT-terminate with source-verified early-200 and raw TCP (no TLS termination) matches the accepted **wire sequence** at source level; it does not provide inner CH/SNI validation, ECH rejection, CONNECT-hostname authorization, or a validation barrier — the configured fixed destination is a benchmark fixture, not policy parity. Image/config/runtime unexecuted **within original matrix scope** (`unverified` cells are source-coverage grades, absence ≠ negative); the later historical native Envoy timed run is recorded in [`100mbps-comparison.md`](100mbps-comparison.md) (valid instrument, `workload_fulfilled=false`, no production qualification).
-- **No policy parity claimed:** none of the candidate configurations establishes Alumina's authorization gates (`docs/alumina-proxy.md:200-202`). Positive cells are `✓ matched (source)` / `✓ matched (config intent)` — source/match-at-config-level only, never runtime.
-
-## References
-
-- `docs/alumina-proxy.md` (canonical spec, sha256 `322b68eeb1…`); `docs/architecture.md`; `docs/build-plan.md`; `docs/reduced-copy-relay-plan.md` (to-be §4 direct initialized-tail reads: **historical** implemented `54a34ce`, measured (scoped 100 Mbps trust-pair), reverted; measurement plan §7.3 full attribution not executed). Benchmark record of the reverted variant: `docs/benchmarks/100mbps-comparison.md` + raw JSON under `docs/benchmarks/results/`.
-- Implementation: `src/serving.rs`, `src/client_hello.rs`, `src/gate.rs`, `src/log.rs`, `src/worker.rs`; qualification owner `docs/qa-package/README.md`, `scripts/verify.sh`, `scripts/docs_check/check.mjs`.
-- Evidence beads: `alumina-et74` (oracle, binding W1–W10), `alumina-722v` (HAProxy 3.2.25 manual/source + SNI-filter witness), `alumina-elyw` (HAProxy native-CONNECT path + Envoy v1.39.4 intake), `alumina-w7y3` (orientation), `alumina-ojxl` (harness contract/acceptance — workload contract only), `alumina-gjq4` (continuation: accepted workload boundary, Python/publication detail, verification evidence; authoritative rejection/supersession appended), `alumina-dr8n` (authoritative correction: earlier smoke receipts rejected, typed exit 3 INVALID).
-- External primary (stable): haproxy.org 3.2 Configuration Manual (`req.ssl_sni`, `tcp-request inspect-delay`, tunnel/timeout sections); `haproxy-3.2.25.tar.gz` sha256 `d59a68d0…`; envoyproxy/envoy v1.39.4 `terminate_http1_connect.yaml`, `source/extensions/upstreams/http/tcp/upstream_request.cc`, `source/server/options_impl.cc`.
+| # | Feature (selected benchmark config) | Alumina 8dbbec8 | HAProxy 3.2.25 | Envoy v1.39.4 |
+| --- | --- | --- | --- | --- |
+| 1 | CONNECT wire entry (selected happy-path): completed 200 before ClientHello | `R` `I` | different | ✓ matched (source) |
+| 2 | Endpoint TLS 1.3 pass-through — non-terminating, proxy holds no keys | `R` `I` | ✓ matched (source) | ✓ matched (source) |
+| 3 | Proxy-side TLS 1.3-only ClientHello profile | `R` `I` | different | different |
+| 4 | Initial SNI inspection / matching CONNECT SNI | `R` `I` | partial | different |
+| 5 | Full ClientHello validation (framing, versions, exactly-one SNI, duplicates) | `R` `I` | different | different |
+| 6 | ECH rejection (incl. GREASE) | `R` `I` | different | different |
+| 7 | CONNECT-hostname allowlist / authorization | `R` `I` | partial | different |
+| 8 | Two forwarding barriers (client-before-validation, upstream-before-gate, early data/EOF/reset closed) | `R` `I` | partial | different |
+| 9 | DNS provenance / cache-life / destination-address policy | `R` `I` | different | different |
+| 10 | Original byte preservation (ordered unmodified prefix) | `R` `I` | ✓ matched (source) | unverified |
+| 11 | Partial-I/O, FIN, backpressure | `R` `I` | unverified | unverified |
+| 12 | Bounded resources (fixed limits, reject-on-exhaustion) | `R` | unverified | unverified |
+| 13 | No heap alloc/dealloc while serving | `R` | unverified | unverified |
+| 14 | Single worker | `R` `I` | ✓ matched (config intent) | ✓ matched (source) |
+| 15 | Logging (stdout-only best-effort allocation-free) | `R` `I` | unverified | unverified |
+| 16 | Shutdown (SIGTERM-only, bounded grace, no policy reload) | `R` | unverified | unverified |

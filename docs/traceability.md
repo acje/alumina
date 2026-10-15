@@ -4,7 +4,7 @@
 section, invariant, resource row, and verification requirement to its design
 home ([architecture.md](architecture.md)), execution plan
 ([build-plan.md](build-plan.md)), and proof status. Canonical source:
-`docs/alumina-proxy.md` (lines 1–236). The repository is a **scoped testQA-ready
+`docs/alumina-proxy.md` (lines 1–315). The repository is a **scoped testQA-ready
 candidate** at HEAD `8934adb` (scoped status owner AGENTS.md): an implemented and
 correctness-tested subset carries local runtime evidence, while external
 deployment validation and full production qualification remain open.
@@ -46,6 +46,10 @@ claim); **external** (deployment/operator obligation); **out-of-scope**
 | L187–194 | Lifecycle: setup/connect/idle deadlines, closure drain, shutdown, capacity/logging | arch §4/§7 | designed → gate; L192 verified-local (e2e shutdown; ucxi) |
 | L196–221 | Invariants I–IV (13) | arch §1 | designed → gate (§2) |
 | L223–236 | Verification requirements (12 categories) | build-plan Slices 1–7 | gate (§4); measured in docs/harness-evaluation.md |
+| L238–263 | rp2e tripwire/action/monitoring/pacing amendment: trigger/action catalog & attribution (AnyIllegal/early-upstream/EOF-reset), Block/Flare semantics, Tarpit **deferred** | arch §2 (`enforcement`) | designed → gate; Tarpit deferred |
+| L265–281 | Mandatory `[any_illegal]`/`[actions]` config schema: index-aligned arrays, force-mandatory group, Tarpit-deferred rejection, 4 KiB capacity | arch §2 (`enforcement`); `src/config.rs` | verified-local (rp2e config surface) |
+| L283–303 | Bounded stdout monitoring (per-ordinal/global correlated aggregates, drop+count/saturate, no new sink) & planned fixed control-storage bounds (~3–4 KiB) | arch §2 (`enforcement`)/§6 | designed → artifact → gate |
+| L305–315 | Honest implementation status table: amendment/config/enforcement/monitoring implemented; Tarpit deferred; no pacing storage reserved | arch §2 (`enforcement`) | verified-local (rp2e) |
 
 ## 2. Invariant matrix (all 13)
 

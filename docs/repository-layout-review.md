@@ -3,7 +3,10 @@
 **Status:** advisory document. No restructuring is implemented or authorized by
 this review. Assessed at repository `acje/alumina-proxy`, branch `main`, HEAD
 `59ad25508e0a1ed468423b2fa10b1d10a2809763`. Canonical spec
-`docs/alumina-proxy.md` (sha256 `322b68ee…5b836`) is unchanged by this review.
+`docs/alumina-proxy.md` (sha256 `322b68ee…5b836`) — **historical pre-rp2e spec
+digest at assessment**; the current post-rp2e canonical spec sha256 is
+`b5b1c9f…137d` (full `b5b1c9fae649feff81ad9910ca7af999987c7036ee447d91c1f10c3db700137d`).
+The canonical spec itself is unchanged by this review.
 
 **Recommendation in one line:** adopt **Layout A** — extract the two largest
 inline `cfg(test)` tails (`src/serving.rs`, `src/runtime.rs`) into sibling
