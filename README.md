@@ -43,6 +43,36 @@ bounded stdout monitoring (`docs/alumina-proxy.md:238-315`, rp2e amendment).
   (`docs/alumina-proxy.md:149`).
 - Privilege preflight (non-root, empty caps, `no_new_privs`): unmet → EX_CONFIG
   78; unresolved beyond allowance → EX_TEMPFAIL 75.
+- Example config: `docs/qa-package/config.example.toml` (≤ 4096 B) shows the
+  mandatory `[any_illegal]` + index-aligned `[actions]` tripwire tables with a
+  real-world HTTPS allowlist entry (`api.github.com`) alongside illustrative
+  domains (`example.com`, `www.example.net`); illustrative only, executed by no
+  gate.
+
+## Workload & protocol compatibility (zero proxy code changes)
+
+Alumina's wire contract (`docs/alumina-proxy.md:17-50,200-202`) is: an explicit
+plaintext `HTTP/1.1`/`HTTP/1.0` `CONNECT <fqdn>:443`; then — after `200
+Connection established` — the **client speaks first** with a TLS 1.3
+`ClientHello` whose SNI equals `<fqdn>` (Barrier A); and the upstream server
+sends **zero bytes before the validated `ClientHello` is flushed upstream**
+(Barrier B — `EarlyUpstreamData` closes the tunnel if the server speaks
+first). Once the gate opens, encrypted application bytes are relayed opaquely,
+with no ALPN or application-protocol inspection (`docs/alumina-proxy.md:19-21,48-50`).
+
+| Workload | Transport | Compatible? |
+| --- | --- | --- |
+| HTTPS REST/API (`https://api.github.com:443`, e.g. `reqwest` with `HTTPS_PROXY=http://<proxy>:5353`, TLS 1.3) | TLS 1.3 `ClientHello` (SNI) immediately after `200` | **Yes** — works out of the box |
+| NATS Mode 1 — standard NATS (`nats://` / `tls://` on port 4222 or 443) | server-speaks-first plaintext `INFO {...}` before any TLS upgrade | **No** — port ≠ 443 rejected at CONNECT (`400`); on 443 the server-first plaintext trips Barrier B (`EarlyUpstreamData`) and Barrier A (non-TLS client bytes) |
+| NATS Mode 2 — NATS `tls_first` (`handshake_first: true` on port 443; `async_nats::ConnectOptions::tls_first()`) | client TLS 1.3 `ClientHello` (SNI) right after `200`; `INFO` inside the encrypted TLS 1.3 stream | **Yes** — wire-compatible, zero `alumina-proxy` changes |
+| NATS Mode 3 — NATS over WebSockets (`wss://<nats-fqdn>:443`) | TLS 1.3 `ClientHello` (SNI) right after `200`; HTTP `Upgrade: websocket` + NATS frames inside the encrypted tunnel | **Yes** — wire-compatible, zero `alumina-proxy` changes |
+
+`alumina-proxy` needs **zero code changes** for NATS testbed workloads
+(`gh-report`): the NATS **client/workload** must (a) establish the TCP tunnel
+via `HTTP CONNECT <nats-fqdn>:443` to Alumina (`async-nats` 0.50 dials
+`TcpStream::connect` directly and reads no `HTTPS_PROXY`, so use a custom proxy
+dialer / local CONNECT forwarder or upstream proxy support) and (b) use
+`wss://<nats-fqdn>:443` or `tls_first` on port 443 with TLS 1.3.
 
 ## Repository layout
 
