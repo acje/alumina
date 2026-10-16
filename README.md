@@ -147,31 +147,61 @@ ENTRYPOINT ["/alumina"]
 
 ### 3. Appliance runtime invocation and TCP DNS requirement
 
-- **Container-Optimized OS host invocation (`--network host`):**
-  ```sh
-  iptables -C INPUT -p tcp -s <vpc-subnet-cidr> --dport 5353 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp -s <vpc-subnet-cidr> --dport 5353 -j ACCEPT
+- **Container-Optimized OS host invocation (`--network host`):** use the
+  idiomatic `#cloud-config` (`metadata.user-data`) with a declarative systemd
+  unit (`alumina-proxy.service`) instead of imperative shell. The unit writes a
+  TCP-capable resolver file, configures the registry credential helper, opens
+  the narrow VPC ingress rule, pins the image by digest, and runs the container
+  with the hardened profile:
+  ```yaml
+  #cloud-config
+  write_files:
+    - path: /var/lib/docker/alumina-resolv.conf
+      permissions: "0644"
+      owner: root
+      content: |
+        nameserver <tcp-dns-resolver-ip>
+    - path: /etc/systemd/system/alumina-proxy.service
+      permissions: "0644"
+      owner: root
+      content: |
+        [Unit]
+        Description=Alumina CONNECT Egress Proxy
+        Wants=gcr-online.target docker.service
+        After=gcr-online.target docker.service
 
-  docker run -d \
-    --name alumina-proxy \
-    --restart always \
-    --network host \
-    --workdir / \
-    --read-only \
-    --user 65534:65534 \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    <registry>/alumina-proxy@sha256:<digest>
+        [Service]
+        Environment="HOME=/var/lib/docker"
+        Environment="DOCKER_CONFIG=/var/lib/docker/.docker"
+        ExecStartPre=/usr/bin/docker-credential-gcr configure-docker --registries=<registry-host>
+        ExecStartPre=/sbin/iptables -w -I INPUT -p tcp -s <vpc-subnet-cidr> --dport 5353 -j ACCEPT
+        ExecStartPre=-/usr/bin/docker rm -f alumina-proxy
+        ExecStartPre=/usr/bin/docker pull <registry-host>/<project>/<repo>/alumina-proxy@sha256:<digest>
+        ExecStart=/usr/bin/docker run --rm --name alumina-proxy --network host --log-driver=gcplogs --workdir / --read-only -v /var/lib/docker/alumina-resolv.conf:/resolv.conf:ro --tmpfs /tmp:size=64m --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges <registry-host>/<project>/<repo>/alumina-proxy@sha256:<digest>
+        ExecStop=-/usr/bin/docker stop -t 8 alumina-proxy
+        Restart=always
+        RestartSec=2s
+        TimeoutStopSec=10s
+
+        [Install]
+        WantedBy=multi-user.target
+  runcmd:
+    - systemctl daemon-reload
+    - systemctl enable --now alumina-proxy.service
   ```
   `--user 65534:65534`, `--cap-drop ALL`, and `--security-opt no-new-privileges`
   satisfy `src/preflight.rs` (`UID != 0`, `CapEff == CapPrm == CapAmb == 0`,
   `no_new_privs == 1`); `--network host` binds `0.0.0.0:5353` directly on the
-  internal VPC interface without bridge NAT overhead.
-- **TCP-capable DNS resolver (`./resolv.conf`):** Alumina performs DNS over TCP
-  exclusively (`docs/alumina-proxy.md:68`). Where a cloud provider's link-local
-  metadata DNS (`169.254.169.254:53`) answers UDP only for external records,
-  configure `./resolv.conf` with a TCP-capable recursive resolver reachable over
-  a narrow `tcp:53` firewall rule.
+  internal VPC interface without bridge NAT overhead; `--read-only` plus the
+  `--tmpfs /tmp:size=64m` scratch mount and the `:ro` resolver bind keep the
+  root filesystem immutable at runtime.
+- **TCP-capable DNS resolver (`alumina-resolv.conf` → `/resolv.conf`):** Alumina
+  performs DNS over TCP exclusively (`docs/alumina-proxy.md:68`). Where a cloud
+  provider's link-local metadata DNS (`169.254.169.254:53`) answers UDP only for
+  external records, `write_files` provisions the resolver file with a
+  TCP-capable recursive resolver reachable over a narrow `tcp:53` firewall rule,
+  and the unit mounts it read-only into the container
+  (`-v /var/lib/docker/alumina-resolv.conf:/resolv.conf:ro`).
 - **Client TLS 1.3 requirement:** Client HTTPS stacks using `HTTPS_PROXY` must
   offer TLS 1.3 (`0x0304`) as their minimum protocol version so `ClientHello`
   `supported_versions` does not advertise TLS 1.2 (`0x0303`), which Alumina
