@@ -7,9 +7,10 @@ allowlist entry declares its destination port (e.g. `api.github.com:443`,
 `example.com:443`). Per connection it terminates two independent TCP sessions,
 validates the TLS 1.3 ClientHello (version offer, SNI against the allowlist,
 ECH rejection), and relays end-to-end TLS upstream **without decryption**.
-Cloud Run validation targets Cloud Run Worker Pools with Direct VPC
-(`listen = '0.0.0.0:<port>'`) or a multi-container sidecar
-(`listen = '127.0.0.1:<port>'`).
+For hard network-level isolation under workload RCE, deploy Alumina on a
+separate VPC appliance identity (`listen = '0.0.0.0:<port>'`); a same-pod
+multi-container sidecar (`listen = '127.0.0.1:<port>'`) is cooperative only
+(see [Reference VPC appliance deployment pattern](#reference-vpc-appliance-deployment-pattern)).
 
 Alumina can be deployed as a light weight explicit forward proxy to protect the egress
 for your servers or containers by allowlisting which domains are eligible for
@@ -75,6 +76,106 @@ with no ALPN or application-protocol inspection (`docs/alumina-proxy.md:19-21,48
 `HTTP CONNECT <nats-fqdn>:<allowlisted-port>` to Alumina and (b) match the
 allowlisted entry's port and speak a TLS 1.3 `ClientHello` first (`wss://` or
 `tls_first`).
+
+## Reference VPC appliance deployment pattern
+
+To enforce positive locking (`docs/alumina-proxy.md:7,103-122`), the protected
+workload and Alumina must run under **separate network-policy and runtime
+identities** so a compromised workload (RCE) cannot bypass `HTTPS_PROXY` via
+direct `connect(2)` syscalls or reset latched `Block Domain` / `Block All`
+tripwire state by crashing its own container.
+
+### 1. Topology and VPC firewall confinement
+
+```text
+[Protected Serverless / Container Workload (tag: app-workload)]
+   │  Direct VPC egress: all-traffic
+   │  HTTPS_PROXY = http://<alumina-internal-ip>:5353
+   ▼
+[VPC Egress Firewall on app-workload]
+   ├── ALLOW tcp:5353 -> <alumina-internal-ip>/32 (Alumina listener)
+   ├── ALLOW link-local platform metadata if required by platform runtime
+   └── DENY  all      -> 0.0.0.0/0 (blocks direct TCP/443, UDP/QUIC, and Private Google Access VIPs)
+   │
+   ▼
+[Dedicated Alumina Appliance VM (tag: alumina-proxy, static internal IP, no public IP)]
+   ├── INGRESS: ALLOW tcp:5353 from VPC subnet CIDR only (+ host iptables INPUT rule)
+   ├── EGRESS:  ALLOW tcp:53   -> TCP-capable recursive resolver (via Cloud NAT or VPC resolver)
+   ├── EGRESS:  ALLOW tcp:443  -> 0.0.0.0/0 via Cloud NAT (approved allowlist destinations)
+   └── EGRESS:  DENY  all      -> 0.0.0.0/0 (all other ports and protocols denied)
+```
+
+- **Why a separate VPC appliance beats a same-pod sidecar under RCE:**
+  - In serverless multi-container sidecar platforms (such as Cloud Run
+    multi-container services), all containers in a revision share one network
+    namespace (`CLONE_NEWNET`), one VPC IP/tag, and one pod lifecycle, and do
+    not grant `CAP_NET_ADMIN` for per-UID `iptables` owner matching. Any
+    firewall rule permitting the sidecar to reach `0.0.0.0/0:443` also permits
+    an RCE payload in the application container to dial `:443` directly, and
+    crashing the application container respawns the pod and clears in-memory
+    tripwire latches.
+  - Standard serverless HTTP ingress proxies (such as GFE / Cloud Run Services)
+    terminate HTTP and reject raw `HTTP CONNECT` tunneling, and serverless
+    Worker Pools do not accept unsolicited inbound TCP `SYN` connections on
+    Direct VPC IPs. Hosting Alumina on a dedicated minimal VM appliance (e.g.
+    Container-Optimized OS `e2-micro` with a static internal VPC IP) provides
+    raw TCP `CONNECT` ingress and hard VPC firewall separation.
+
+### 2. Minimal `FROM scratch` container image
+
+Matches `docs/alumina-proxy.md:118` — three files in the root filesystem
+(`/alumina`, `/config.toml`, `/resolv.conf`), zero shell or OS utilities:
+
+```dockerfile
+FROM --platform=linux/amd64 rust:1.99.0-alpine AS builder
+WORKDIR /build
+RUN apk add --no-cache musl-dev && rustup target add x86_64-unknown-linux-musl
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin alumina
+
+FROM scratch
+WORKDIR /
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/alumina /alumina
+COPY config.toml /config.toml
+COPY resolv.conf /resolv.conf
+USER 65534:65534
+EXPOSE 5353
+ENTRYPOINT ["/alumina"]
+```
+
+### 3. Appliance runtime invocation and TCP DNS requirement
+
+- **Container-Optimized OS host invocation (`--network host`):**
+  ```sh
+  iptables -C INPUT -p tcp -s <vpc-subnet-cidr> --dport 5353 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp -s <vpc-subnet-cidr> --dport 5353 -j ACCEPT
+
+  docker run -d \
+    --name alumina-proxy \
+    --restart always \
+    --network host \
+    --workdir / \
+    --read-only \
+    --user 65534:65534 \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    <registry>/alumina-proxy@sha256:<digest>
+  ```
+  `--user 65534:65534`, `--cap-drop ALL`, and `--security-opt no-new-privileges`
+  satisfy `src/preflight.rs` (`UID != 0`, `CapEff == CapPrm == CapAmb == 0`,
+  `no_new_privs == 1`); `--network host` binds `0.0.0.0:5353` directly on the
+  internal VPC interface without bridge NAT overhead.
+- **TCP-capable DNS resolver (`./resolv.conf`):** Alumina performs DNS over TCP
+  exclusively (`docs/alumina-proxy.md:68`). Where a cloud provider's link-local
+  metadata DNS (`169.254.169.254:53`) answers UDP only for external records,
+  configure `./resolv.conf` with a TCP-capable recursive resolver reachable over
+  a narrow `tcp:53` firewall rule.
+- **Client TLS 1.3 requirement:** Client HTTPS stacks using `HTTPS_PROXY` must
+  offer TLS 1.3 (`0x0304`) as their minimum protocol version so `ClientHello`
+  `supported_versions` does not advertise TLS 1.2 (`0x0303`), which Alumina
+  rejects by design (`docs/alumina-proxy.md:47`).
 
 ## Repository layout
 

@@ -158,13 +158,29 @@ stop accepting, 8 s grace, drain, exit without deallocating; `panic="abort"`;
 ## 8. Deployment and trust boundary
 
 Alumina is responsible for the egress it provides (`:99-101`); VPC isolation is
-deployment-scoped. Runtime prerequisites (`:118,150`): minimal container with
-only the static binary + config + resolver config; non-root, empty caps,
-`no_new_privs`, read-only rootfs, no writable/secret volumes, no cloud
-permissions, no credentials. Confinement default-denies egress except Alumina +
-required platform deps across all routes/families (`:116`); exactly one
-listening socket; config read once; raw TCP + platform resolver supplied;
+deployment-scoped. Runtime prerequisites (`:118,150`): minimal `FROM scratch`
+container holding only `/alumina` (statically linked musl binary),
+`/config.toml`, and `/resolv.conf`; non-root (`65534:65534`), empty caps
+(`--cap-drop ALL`), `no_new_privs` (`--security-opt no-new-privileges`),
+read-only rootfs (`--read-only`), no writable/secret volumes, and a dedicated
+appliance identity holding no application secrets or credentials. Confinement
+default-denies workload egress except to Alumina's private VPC endpoint
+(`tcp:5353`) + explicitly required non-HTTPS platform dependencies across all
+routes/families (`:116`), including removing default Private Google Access
+(`199.36.153.8/30:443`) bypasses when unused; exactly one listening socket;
+config read once; raw TCP + a TCP-capable recursive resolver supplied (`:68`);
 no NAT64/DNS64 in the egress path (`:101,116`).
+
+- **Separate VPC appliance vs same-pod sidecar:** Because serverless
+  multi-container sidecar sandboxes share a single network namespace
+  (`CLONE_NEWNET`), VPC firewall identity, and pod restart lifecycle without
+  per-UID `CAP_NET_ADMIN` packet filtering, a same-pod sidecar cannot prevent an
+  RCE-compromised workload container from bypassing `HTTPS_PROXY` via direct
+  `connect(2)` syscalls or resetting in-memory `Block Domain` / `Block All`
+  latches by crashing the pod. Positive locking under RCE requires hosting
+  Alumina on a separate network-tagged VPC appliance (e.g. a locked-down
+  Container-Optimized OS instance with `--network host` at a static internal
+  VPC IP; see [README.md](../README.md#reference-vpc-appliance-deployment-pattern)).
 
 ## 9. Explicit non-goals
 

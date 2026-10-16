@@ -1,6 +1,6 @@
 allowlist = ["api.github.com:443", "example.com:443", "www.example.net:443"]
-# 127.0.0.1:<port> for local testQA / multi-container sidecar;
-# 0.0.0.0:<port> for a Cloud Run Worker Pool with Direct VPC.
+# 127.0.0.1:<port> for local testQA / cooperative sidecar testing;
+# 0.0.0.0:<port> for a dedicated VPC appliance (hard RCE egress confinement).
 listen = "127.0.0.1:5353"
 startup_unresolved_allowance = 0
 # Mandatory index-aligned tripwire action tables (docs/alumina-proxy.md:265-281):
