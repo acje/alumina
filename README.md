@@ -96,3 +96,8 @@ and sibling test modules; `src/{alloc,fault,fuzz}.rs` F1/F2/F4 scaffolds;
   candidates above are proven for relay/shutdown, never a blanket claim.
 - `getrandom` intake complete; `cargo deny`/`cargo audit` clean; no
   product-wide zero-alloc claim is made.
+
+## License
+
+Dual-licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT License](LICENSE-MIT) at your option.
