@@ -5,9 +5,11 @@ this review. Assessed at repository `acje/alumina-proxy`, branch `main`, HEAD
 `59ad25508e0a1ed468423b2fa10b1d10a2809763`. Canonical spec
 `docs/alumina-proxy.md` (sha256 `322b68ee…5b836`) — **historical pre-rp2e spec
 digest at assessment**; the current canonical spec sha256 (post-`alumina-9t6w`,
-after the `rp2e` and `<fqdn>:<port>` amendments) is
-`18208bb…1394` (full `18208bb97975da70adc5bdc4dd7a5d3eefbe454d817597fdbed754ee22b81394`).
-The canonical spec is unchanged except for the two recorded user-authorized amendments.
+after the `rp2e` and `<fqdn>:<port>` amendments and the `alumina-tm6m`
+`512 / 128` tunnels/pending setups + `2 × 128 KiB` per-slot slab scale
+amendment) is
+`2fc63e8c…13c0` (full `2fc63e8c74671c687effcf1006a1174ab8b50b949a7fe9a5d25d0a74218413c0`).
+The canonical spec is unchanged except for the three recorded user-authorized amendments.
 
 **Recommendation in one line:** adopt **Layout A** — extract the two largest
 inline `cfg(test)` tails (`src/serving.rs`, `src/runtime.rs`) into sibling

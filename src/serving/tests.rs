@@ -110,7 +110,7 @@ fn transfer_body() {
     assert_eq!(
         serving.slots[MAX_TUNNELS - 1].down.as_ptr(),
         last_down,
-        "slot 127 down buffer must transfer by value without a second allocation"
+        "slot 511 down buffer must transfer by value without a second allocation"
     );
 }
 
@@ -596,21 +596,24 @@ fn pending_capacity_refuses_with_503() {
     let port = ephemeral_port();
     with_serving_stack(port, move |serving| {
         let mut socks = Vec::new();
-        for _ in 0..=MAX_PENDING_SETUPS {
+        for i in 0..=MAX_PENDING_SETUPS {
             socks.push(connect(port));
+            if i % 16 == 15 {
+                pump(serving, 4);
+            }
         }
         pump(serving, 80);
         let mut last = socks[MAX_PENDING_SETUPS].try_clone().expect("clone");
         let body = read_until(&mut last, b"\r\n\r\n");
         assert!(
             body.starts_with(b"HTTP/1.1 503"),
-            "33rd silent connect must receive 503, got {:?}",
+            "129th silent connect must receive 503, got {:?}",
             body
         );
         assert_eq!(
             serving.storage().occupied(),
             MAX_PENDING_SETUPS,
-            "the first 32 silent setups occupy their seats"
+            "the first 128 silent setups occupy their seats"
         );
     });
 }
@@ -620,8 +623,11 @@ fn setup_deadline_frees_silent_seats_with_504() {
     let port = ephemeral_port();
     with_serving_stack(port, move |serving| {
         let mut socks = Vec::new();
-        for _ in 0..=MAX_PENDING_SETUPS {
+        for i in 0..=MAX_PENDING_SETUPS {
             socks.push(connect(port));
+            if i % 16 == 15 {
+                pump(serving, 4);
+            }
         }
         pump(serving, 40);
         let mut probe = socks[MAX_PENDING_SETUPS].try_clone().expect("clone");
@@ -1474,34 +1480,7 @@ fn up_socket_receive_appends_once_at_nonzero_retained_tail() {
 
         serving.client_readable(index).expect("up read visit");
 
-        let n = {
-            let ws = &serving.slots[index];
-            let n = ws.buf_len - RETAINED_OFFSET;
-            assert!(
-                (1..=payload.len()).contains(&n),
-                "the retained up tail must advance by exactly the returned read count, got {n}"
-            );
-            assert_eq!(
-                &ws.buf[..RETAINED_OFFSET],
-                prefix.as_slice(),
-                "the retained prefix must be untouched beneath the newly received bytes"
-            );
-            assert_eq!(
-                &ws.buf[RETAINED_OFFSET..RETAINED_OFFSET + n],
-                &payload[..n],
-                "received bytes must be appended at the nonzero retained tail offset, once, \
-                 unduplicated"
-            );
-            assert_eq!(
-                ws.buf[RETAINED_OFFSET + n],
-                0xA5,
-                "the byte immediately after the committed read count must be untouched: \
-                 a second commit would overwrite it"
-            );
-            n
-        };
-
-        let expected = prefix.len() + n;
+        let expected = RETAINED_OFFSET + payload.len();
         let mut got = Vec::new();
         let mut tmp = [0u8; 64];
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1515,12 +1494,42 @@ fn up_socket_receive_appends_once_at_nonzero_retained_tail() {
                 Err(_) => break,
             }
         }
+        assert_eq!(
+            got.len(),
+            expected,
+            "the upstream sink must receive the retained prefix plus relay bytes, got {}",
+            got.len()
+        );
+        let n = got.len() - RETAINED_OFFSET;
+        assert!(
+            (1..=payload.len()).contains(&n),
+            "the retained up tail must advance by exactly the returned read count, got {n}"
+        );
         let mut forwarded = prefix;
         forwarded.extend_from_slice(&payload[..n]);
         assert_eq!(
             got, forwarded,
             "the retained prefix then the freshly appended tail bytes must reach the \
              upstream sink in order, byte-exact, once"
+        );
+
+        let ws = &serving.slots[index];
+        assert_eq!(
+            ws.buf_base,
+            RETAINED_OFFSET + n,
+            "the relay cursor reset must fold the forwarded prefix and tail into buf_base"
+        );
+        assert_eq!(ws.buf_len, 0, "a fully-drained relay slab must be empty");
+        assert_eq!(ws.fwd, 0, "a fully-drained relay slab must reset fwd to 0");
+        assert_eq!(
+            &ws.buf[..n],
+            &payload[..n],
+            "the freshly appended relay bytes must be re-based at buf[..n]"
+        );
+        assert_eq!(
+            ws.buf[n.max(RETAINED_OFFSET)],
+            0xA5,
+            "the byte beyond the re-based read region must stay untouched"
         );
     });
 }
@@ -1756,7 +1765,7 @@ fn one_batch_two_tokens_one_slot_share_a_single_complete_visit() {
 
         let client_token = client_token(serving.slots[index].slot_gen, index);
         let up_token = upstream_token(serving.slots[index].slot_gen, index);
-        let before = serving.slots[index].fwd;
+        let before = serving.slots[index].buf_base + serving.slots[index].fwd;
         serving.in_batch = true;
         serving
             .dispatch_readiness(
@@ -1778,7 +1787,7 @@ fn one_batch_two_tokens_one_slot_share_a_single_complete_visit() {
             .expect("batch upstream-writable token");
         serving.in_batch = false;
 
-        let after = serving.slots[index].fwd;
+        let after = serving.slots[index].buf_base + serving.slots[index].fwd;
         let sink_total = *got.lock().unwrap();
         assert!(
             after - before <= 64 * 1024,
@@ -2042,7 +2051,7 @@ fn interleaved_a_b_a_mixed_readwrite_timer_preserves_shared_budgets() {
         let a_token = client_token(gen_a, 0);
         let b_token = client_token(gen_b, 1);
         let a_up_token = upstream_token(gen_a, 0);
-        let a0 = serving.slots[0].fwd;
+        let a0 = serving.slots[0].buf_base + serving.slots[0].fwd;
         serving
             .dispatch_readiness(
                 a_token,
@@ -2052,7 +2061,7 @@ fn interleaved_a_b_a_mixed_readwrite_timer_preserves_shared_budgets() {
                 },
             )
             .expect("A client-readable batch token");
-        let a1 = serving.slots[0].fwd;
+        let a1 = serving.slots[0].buf_base + serving.slots[0].fwd;
         serving
             .dispatch_readiness(
                 b_token,
@@ -2075,7 +2084,7 @@ fn interleaved_a_b_a_mixed_readwrite_timer_preserves_shared_budgets() {
                 },
             )
             .expect("A upstream-writable batch token");
-        let a2 = serving.slots[0].fwd;
+        let a2 = serving.slots[0].buf_base + serving.slots[0].fwd;
         serving.in_batch = false;
 
         assert!(
@@ -2260,19 +2269,19 @@ fn one_relay_visit_never_exceeds_the_combined_io_budget() {
             )
             .expect("one writable relay visit");
 
-        let moved = serving.slots[index].fwd;
+        let moved = serving.slots[index].buf_base + serving.slots[index].fwd;
         assert!(
             moved <= 64 * 1024,
             "one connection visit must forward at most 64 KiB combined, forwarded {moved}"
         );
         assert!(
-            moved > 0 && serving.slots[index].fwd < serving.slots[index].buf_len,
+            moved > 0 && serving.slots[index].buf_base + serving.slots[index].fwd < 128 * 1024,
             "128 KiB pending must span more than one visit"
         );
 
         let mut total = moved;
         let drain_start = Instant::now();
-        while serving.slots[index].fwd < serving.slots[index].buf_len {
+        while serving.slots[index].buf_base + serving.slots[index].fwd < 128 * 1024 {
             assert!(
                 drain_start.elapsed() < Duration::from_secs(3),
                 "the rescheduled relay visit never resumed the pending upload"
@@ -2286,7 +2295,7 @@ fn one_relay_visit_never_exceeds_the_combined_io_budget() {
                     },
                 )
                 .expect("resumed writable visit");
-            total = serving.slots[index].fwd;
+            total = serving.slots[index].buf_base + serving.slots[index].fwd;
         }
 
         let mut got = 0usize;
@@ -2343,20 +2352,20 @@ fn preloaded_hold_drains_across_budget_splits_with_quiescent_sink_relying_on_rea
         let mut progress_polls = 0usize;
         let mut last_fwd = 0usize;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while serving.slots[index].fwd < hold {
+        while serving.slots[index].buf_base + serving.slots[index].fwd < hold {
             assert!(
                 Instant::now() < deadline,
                 "the quiescent-sink drain must cross the 64 KiB budget split across real \
                  polls with no peer consumption to re-trigger it: fwd {} of {}",
-                serving.slots[index].fwd,
+                serving.slots[index].buf_base + serving.slots[index].fwd,
                 hold
             );
             serving
                 .run_once(Some(Duration::from_millis(5)))
                 .expect("real poll drives the re-armed drain");
-            if serving.slots[index].fwd > last_fwd {
+            if serving.slots[index].buf_base + serving.slots[index].fwd > last_fwd {
                 progress_polls += 1;
-                last_fwd = serving.slots[index].fwd;
+                last_fwd = serving.slots[index].buf_base + serving.slots[index].fwd;
             }
         }
         assert!(
@@ -2369,7 +2378,8 @@ fn preloaded_hold_drains_across_budget_splits_with_quiescent_sink_relying_on_rea
             "a budget-split drain must not advance or close the tunnel"
         );
         assert_eq!(
-            serving.slots[index].fwd, hold,
+            serving.slots[index].buf_base + serving.slots[index].fwd,
+            hold,
             "the quiescent sink must have absorbed the full preloaded hold"
         );
         let _ = sink_stream;
@@ -2428,12 +2438,14 @@ fn preloaded_hold_drains_across_budget_splits_byte_exact_with_consuming_sink() {
         let mut progress_polls = 0usize;
         let mut last_fwd = 0usize;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while serving.slots[index].fwd < hold || sink_got.lock().unwrap().len() < hold {
+        while serving.slots[index].buf_base + serving.slots[index].fwd < hold
+            || sink_got.lock().unwrap().len() < hold
+        {
             assert!(
                 Instant::now() < deadline,
                 "preloaded hold stalled mid-drain with the sink peer consuming: fwd {} / \
                  {}, sink got {} / {}",
-                serving.slots[index].fwd,
+                serving.slots[index].buf_base + serving.slots[index].fwd,
                 hold,
                 sink_got.lock().unwrap().len(),
                 hold
@@ -2441,9 +2453,9 @@ fn preloaded_hold_drains_across_budget_splits_byte_exact_with_consuming_sink() {
             serving
                 .run_once(Some(Duration::from_millis(5)))
                 .expect("real poll drives the drained hold");
-            if serving.slots[index].fwd > last_fwd {
+            if serving.slots[index].buf_base + serving.slots[index].fwd > last_fwd {
                 progress_polls += 1;
-                last_fwd = serving.slots[index].fwd;
+                last_fwd = serving.slots[index].buf_base + serving.slots[index].fwd;
             }
         }
         assert!(
@@ -2554,20 +2566,20 @@ fn read_direction_held_peer_drains_across_budget_splits_without_new_edges() {
         let mut progress_polls = 0usize;
         let mut last_fwd = 0usize;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while serving.slots[index].fwd < hold {
+        while serving.slots[index].buf_base + serving.slots[index].fwd < hold {
             assert!(
                 Instant::now() < deadline,
                 "the held-peer read-direction drain stalled without a re-armed client \
                  READABLE edge: fwd {} of {}",
-                serving.slots[index].fwd,
+                serving.slots[index].buf_base + serving.slots[index].fwd,
                 hold
             );
             serving
                 .run_once(Some(Duration::from_millis(5)))
                 .expect("real poll drives the read-direction relay");
-            if serving.slots[index].fwd > last_fwd {
+            if serving.slots[index].buf_base + serving.slots[index].fwd > last_fwd {
                 progress_polls += 1;
-                last_fwd = serving.slots[index].fwd;
+                last_fwd = serving.slots[index].buf_base + serving.slots[index].fwd;
             }
         }
         let flush_deadline = Instant::now() + Duration::from_secs(5);
@@ -3717,20 +3729,20 @@ fn shutdown_alloc_witness_body() {
 fn directional_buffer_profile_matches_the_128_mib_mandate() {
     assert_eq!(
         HOLD_CAP,
-        512 * 1024,
-        "client->upstream buffer must be 512 KiB"
+        128 * 1024,
+        "client->upstream buffer must be 128 KiB"
     );
     assert_eq!(
         DOWN_CAP,
-        512 * 1024,
-        "upstream->client buffer must be 512 KiB"
+        128 * 1024,
+        "upstream->client buffer must be 128 KiB"
     );
-    assert_eq!(MAX_TUNNELS, 128, "the fixed tunnel budget is 128 slots");
-    assert!(MAX_PENDING_SETUPS <= 32, "at most 32 pending setups");
+    assert_eq!(MAX_TUNNELS, 512, "the fixed tunnel budget is 512 slots");
+    assert!(MAX_PENDING_SETUPS <= 128, "at most 128 pending setups");
     assert_eq!(
         (HOLD_CAP + DOWN_CAP) * MAX_TUNNELS,
         128 * 1024 * 1024,
-        "two 512 KiB buffers per tunnel across 128 slots is the 128 MiB traffic profile"
+        "two 128 KiB buffers per tunnel across 512 slots is the 128 MiB traffic profile"
     );
 }
 
@@ -5290,8 +5302,11 @@ fn capacity_refusal_wire_body_is_pinned_plain_text() {
     let port = ephemeral_port();
     with_serving_stack(port, move |serving| {
         let mut socks = Vec::new();
-        for _ in 0..=MAX_PENDING_SETUPS {
+        for i in 0..=MAX_PENDING_SETUPS {
             socks.push(connect(port));
+            if i % 16 == 15 {
+                pump(serving, 4);
+            }
         }
         pump(serving, 80);
         let mut last = socks[MAX_PENDING_SETUPS].try_clone().expect("clone");

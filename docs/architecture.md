@@ -26,7 +26,7 @@ post-boot state is preallocated** (§6).
 | `resolver` | Resolver-config read (first NS, port 53); DNS TCP transport (1 conn/1 query, getrandom TIDs) | `:62,68` |
 | `dns_parse` | Wire parsing + staging classification (bounded CNAME, negatives, eligibility) | `:69,71,73,86-97` |
 | `cache` | Per-name×type entries, generations, staging, refresh due table, retry/incident, reporting; **tunnels never hold cache refs** | `:74-82,145` |
-| `tunnel` | 128 slots; per-slot state machine; two 512 KiB buffers; per-family counts | `:82,145,160,183` |
+| `tunnel` | 512 slots; per-slot state machine; two 128 KiB buffers; per-family counts | `:82,145,160,183` |
 | `parse` (CONNECT/CH) | Incremental CONNECT (8 KiB) + ClientHello (≤64 KiB) parsers, residual state, original bytes | `:34,41,47-50,163-164` |
 | `worker` / `Runtime` | The single owner loop: readiness demux, scheduling, timers, gate transitions — realized as the shared-readiness `Runtime` | `:138,144,146,147,149` |
 | `log` | 256×8 KiB preallocated queue; allocation-free encode; nonblocking sink; drop+count | `:149,178-179,193-194` |
@@ -90,7 +90,7 @@ Named decisions:
 - **D5 accounting.** Forwarded bytes advance only on successful writes; partial
   writes preserve order (`:32,80,146-147,220`). **D5a** exactly two per-family
   counters (A/AAAA) per connecting tunnel, never addresses/refs (`:82`).
-  **D5b** two 512 KiB buffers reused across CONNECT/ClientHello/relay without
+  **D5b** two 128 KiB buffers reused across CONNECT/ClientHello/relay without
   discarding coalesced bytes; relay buffers never enlarge setup limits.
 
 Lifetimes (`:189-192`): setup deadline starts at accept, never reset; connect
@@ -124,12 +124,12 @@ with construction-and-reuse proof as a future gate.
 
 | Allocation | Size | Citations |
 |---|---|---|
-| Tunnel traffic buffers | 128 × 2 × 512 KiB = 128 MiB | `:160-162,183` |
+| Tunnel traffic buffers | 512 × 2 × 128 KiB = 128 MiB | `:160-162,183` |
 | Config document buffer | 4096 B (reject oversized) | `:54,158` |
 | CONNECT / TLS pre-auth | ≤8 KiB / ≤64 KiB | `:163-164` |
 | DNS message/records staging | 16 KiB / 128 RRs | `:165` |
 | Cache entries | ≤32 names × 2 types, 16 A + 16 AAAA per name | `:74,166` |
-| Reporting storage | 32/64/128 markers | `:177` |
+| Reporting storage | 32/64/512 markers | `:177` |
 | Log queue | 256 × 8 KiB | `:178` |
 | Ready/timer tables | Fixed slot counts (dup-free) | `:146` |
 | Stacks | Bounded worst-case (no recursion); numeric a **design artifact** | `:143,165,183` |

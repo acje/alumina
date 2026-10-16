@@ -1581,24 +1581,24 @@ mod tests {
     #[test]
     fn logging_threshold_high_then_low_edges() {
         let (mut store, mut file) = file_logstore();
-        for used in 0..=103usize {
+        for used in 0..=410usize {
             store.note_capacity(1, used, 0);
         }
         flush_all(&mut store);
         let text = String::from_utf8(read_all(&mut file)).unwrap();
         assert!(
-            text.contains("kind=capacity_high secs=1 dimension=\"slots\" used=103 cap=128"),
+            text.contains("kind=capacity_high secs=1 dimension=\"slots\" used=410 cap=512"),
             "high edge at first exceed of 80%: {text}"
         );
         assert!(
             !text.contains("kind=capacity_low"),
             "no low edge before any high edge"
         );
-        store.note_capacity(2, 89, 0);
+        store.note_capacity(2, 358, 0);
         flush_all(&mut store);
         let text = String::from_utf8(read_all(&mut file)).unwrap();
         assert!(
-            text.contains("kind=capacity_low secs=2 dimension=\"slots\" used=89 cap=128"),
+            text.contains("kind=capacity_low secs=2 dimension=\"slots\" used=358 cap=512"),
             "low edge after crossing below 70%: {text}"
         );
     }
@@ -1733,7 +1733,7 @@ mod tests {
             "the correlated-detail section is emitted once captures exist: {text}"
         );
         assert!(
-            text.contains("x0s=127"),
+            text.contains("x0s=511"),
             "the all-saturated capture ring carries its worst legal slot identity: {text}"
         );
     }
@@ -1894,8 +1894,8 @@ mod tests {
                 Some("sub.example.org"),
             );
             store.reject(6, RejectReason::TlsValidation, None, None);
-            store.note_capacity(7, 103, 0);
-            store.note_capacity(8, 103, 20);
+            store.note_capacity(7, 410, 0);
+            store.note_capacity(8, 410, 103);
             for _ in 0..20 {
                 store.startup_warning(9, &long, Family::A);
             }

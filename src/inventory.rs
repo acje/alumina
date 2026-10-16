@@ -6,9 +6,9 @@ use crate::connect::CONNECT_LIMIT;
 use crate::dns::ResponseWorkspace;
 use crate::startup_dns::{QUERY_BUF_LEN, RECV_BUF_LEN};
 
-pub const TUNNEL_SLOTS: usize = 128;
+pub const TUNNEL_SLOTS: usize = 512;
 pub const BUFFERS_PER_SLOT: usize = 2;
-pub const BUFFER_BYTES: usize = 512 * 1024;
+pub const BUFFER_BYTES: usize = 128 * 1024;
 pub const TRAFFIC_STORAGE_BYTES: usize = TUNNEL_SLOTS * BUFFERS_PER_SLOT * BUFFER_BYTES;
 pub const CONFIG_DOC_BUFFER_BYTES: usize = 4096;
 
@@ -17,7 +17,7 @@ pub const CONFIG_DOC_BUFFER_BYTES: usize = 4096;
 /// slot for the process lifetime and reused across connections.
 pub const SLOT_WORKSPACE_BYTES: usize = CONNECT_LIMIT + (MAX_CLIENT_HELLO * 2);
 
-/// The total retained serving-workspace bytes across all 128 slots.
+/// The total retained serving-workspace bytes across all 512 slots.
 pub const SERVING_WORKSPACE_BYTES: usize = TUNNEL_SLOTS * SLOT_WORKSPACE_BYTES;
 
 /// The retained DNS transport named buffers (lower bound): the fixed 512-byte
@@ -98,7 +98,7 @@ impl TrafficStorage {
         })
     }
 
-    /// The exact initialized traffic bytes: 128 slots x 2 directions x 512 KiB.
+    /// The exact initialized traffic bytes: 512 slots x 2 directions x 128 KiB.
     pub fn len(&self) -> usize {
         self.slots.len() * BUFFERS_PER_SLOT * BUFFER_BYTES
     }

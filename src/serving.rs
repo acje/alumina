@@ -68,13 +68,13 @@ const LISTENER: Token = Token(0);
 /// Boot-fixed per-slot client->upstream byte store: the CONNECT head plus any
 /// coalesced tunnel bytes up to the ClientHello inspection cap, reused as a
 /// recycling relay pending buffer. Allocated once before the postboot phase and
-/// reused across connections. The mandated directional profile is two 512 KiB
-/// buffers per tunnel (docs/alumina-proxy.md:161-164,:183; RF-008): 128 slots x 1 MiB =
+/// reused across connections. The mandated directional profile is two 128 KiB
+/// buffers per tunnel (docs/alumina-proxy.md:161-164,:183; RF-008): 512 slots x 256 KiB =
 /// 128 MiB traffic storage, not total RSS.
 const HOLD_CAP: usize = crate::inventory::BUFFER_BYTES;
 
 /// Boot-fixed per-slot upstream->client pending store (relay bytes and
-/// canonical response/refusal bodies), bounded at the 512 KiB direction cap.
+/// canonical response/refusal bodies), bounded at the 128 KiB direction cap.
 const DOWN_CAP: usize = crate::inventory::BUFFER_BYTES;
 
 /// Idle deadline for an established tunnel once the gate has opened, reset on
@@ -109,14 +109,14 @@ const VISIT_BYTES: u32 = 64 * 1024;
 /// over-long batch cannot delay an expired deadline past this bound.
 const TIMER_RECHECK_EVERY: usize = 256;
 
-/// The fixed event-buffer capacity: the poll batch is a bounded 512-event
+/// The fixed event-buffer capacity: the poll batch is a bounded 1024-event
 /// snapshot, preallocated at boot and reused across iterations. Per-batch slot
 /// dedup (one complete visit per connection per batch) means the visit budget,
 /// not this cap, bounds a slot's turn (docs/alumina-proxy.md:146).
-const POLL_EVENTS_CAP: usize = 512;
+const POLL_EVENTS_CAP: usize = 1024;
 
 /// The coarse direct-into-slab read chunk: a single read spans up to 32 KiB
-/// straight into the retained 512 KiB directional slab, amortizing
+/// straight into the retained 128 KiB directional slab, amortizing
 /// epoll/read syscall density without a stack bounce buffer. The complete-visit
 /// budget still bounds the total.
 const READ_CHUNK: usize = 32 * 1024;
@@ -148,13 +148,14 @@ const DNS_LOCAL: usize = UPSTREAM_BASE + MAX_TUNNELS;
 /// loop (oracle b3nx B18).
 const SIGNAL_LOCAL: usize = DNS_LOCAL + 1;
 
-/// Token layout: low 9 bits = local id (1..=MAX_TUNNELS client,
+/// Token layout: low 11 bits = local id (1..=MAX_TUNNELS client,
 /// `UPSTREAM_BASE..` upstream, 0 = listener), high bits = slot generation so a
 /// stale event for a reused slot index is dropped before touching a socket.
 /// The local id space also carries the reserved readiness sources `DNS_LOCAL`
 /// and `SIGNAL_LOCAL`, both below `LOCAL_MASK`.
-const LOCAL_MASK: usize = 0x1ff;
-const GEN_SHIFT: usize = 9;
+const LOCAL_MASK: usize = 0x7ff;
+const GEN_SHIFT: usize = 11;
+const _: () = assert!(SIGNAL_LOCAL <= LOCAL_MASK);
 
 /// The owner's shutdown phase. `Serving` is ordinary operation; once the
 /// first SIGTERM is observed the owner stops admission, closes pending
@@ -583,6 +584,20 @@ impl SlotWorkspace {
         self.fwd = 0;
     }
 
+    /// Eagerly reclaims fully-forwarded relay bytes upstream: once the gate is
+    /// open and every buffered byte has been written, fold `fwd` into
+    /// `buf_base` and clear the cursor (the relay-phase mirror of `flush_down`'s
+    /// down-direction reset). Keeps `buf_base + fwd` as the monotonic cumulative
+    /// forwarded byte count. The `gate.is_open()` guard keeps pre-open
+    /// head/hello bytes preserved for the gate handoff.
+    fn relay_cursor_reset(&mut self) {
+        if self.gate.is_open() && self.fwd >= self.buf_len {
+            self.buf_base += self.fwd;
+            self.buf_len = 0;
+            self.fwd = 0;
+        }
+    }
+
     fn reset(&mut self) {
         self.parser = ConnectParser::new();
         self.inspector = ChInspector::new();
@@ -685,7 +700,7 @@ impl Serving {
     /// buffer pairs into the fixed slot workspaces without a second traffic
     /// allocation and without registering the startup listener yet.
     ///
-    /// This is the storage-init phase: the poll, the 128 slot workspaces
+    /// This is the storage-init phase: the poll, the 512 slot workspaces
     /// (CONNECT parser, ClientHello inspector, gate, cursors) and the event
     /// buffer all exist here, so main can call it before the startup DNS
     /// window opens ([`Self::attach_listener`] registers the listener that
@@ -2330,6 +2345,7 @@ impl Serving {
         }
         let was_open = self.slots[index].gate.is_open();
         if !wrote_any || was_open {
+            self.slots[index].relay_cursor_reset();
             if self.visit_exhausted(index) {
                 self.reschedule(index);
             }
@@ -2367,6 +2383,7 @@ impl Serving {
                 self.slots[index].gate.upstream_write(committed2);
             }
         }
+        self.slots[index].relay_cursor_reset();
         if self.visit_exhausted(index) {
             self.reschedule(index);
         }

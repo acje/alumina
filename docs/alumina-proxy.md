@@ -157,8 +157,8 @@ These are fixed build-time limits, not optional TOML settings or measured capaci
 | --- | --- |
 | Configuration document / allowlist entries | 4 KiB / 1 through 32 |
 | Worker threads | 1 |
-| Concurrent tunnels, including setup / pending setups | 128 / 32 |
-| Traffic buffers per tunnel slot | Two 512 KiB buffers, one per direction |
+| Concurrent tunnels, including setup / pending setups | 512 / 128 |
+| Traffic buffers per tunnel slot | Two 128 KiB buffers, one per direction |
 | Total preallocated tunnel traffic storage | 128 MiB |
 | CONNECT headers | 8 KiB |
 | Buffered TLS bytes before authorization, including record framing | 64 KiB |
@@ -174,15 +174,15 @@ These are fixed build-time limits, not optional TOML settings or measured capaci
 | DNS failure retry backoff | 1, 2, 4, 8, 16, then 30 seconds capped |
 | Stale DNS authorization grace after TTL expiry | 259200 seconds (72 hours) |
 | DNS incident summary interval | 3600 seconds per affected hostname |
-| DNS reporting storage | 32 name/window states, 64 record-type incident states, 128 tunnel window markers |
+| DNS reporting storage | 32 name/window states, 64 record-type incident states, 512 tunnel window markers |
 | Preallocated log queue / maximum encoded entry | 256 entries / 8 KiB, including framing |
 | Log sink work per scheduling turn | 64 KiB or 16 I/O operations, whichever comes first |
 | Startup resolution window | 90 seconds, absolute; includes DNS TCP establishment |
 | Relay idle deadline / EOF drain deadline / shutdown grace period | 300 seconds / 5 seconds / 8 seconds |
 
-Preallocate 128 tunnel slots with two 512 KiB directional buffers each: `128 * 2 * 512 KiB = 128 MiB`. Reuse these buffers across CONNECT parsing, ClientHello inspection, and relay without discarding coalesced tunnel bytes. The separate CONNECT and ClientHello limits still apply; larger relay buffers do not permit larger setup messages. DNS storage, connection metadata, stacks, executable memory, and kernel socket buffers are outside this traffic-storage budget and must be accounted for separately when sizing the container.
+Preallocate 512 tunnel slots with two 128 KiB directional buffers each: `512 * 2 * 128 KiB = 128 MiB`. Reuse these buffers across CONNECT parsing, ClientHello inspection, and relay without discarding coalesced tunnel bytes. The separate CONNECT and ClientHello limits still apply; larger relay buffers do not permit larger setup messages. DNS storage, connection metadata, stacks, executable memory, and kernel socket buffers are outside this traffic-storage budget and must be accounted for separately when sizing the container.
 
-The first-iteration target is 1-10 Gbps aggregate relayed payload throughput across both directions, subject to CPU speed, workload, and network limits. At these rates, 128 MiB represents approximately 1.07 seconds to 107 milliseconds of aggregate payload, not a throughput guarantee. Storage is partitioned by tunnel and direction and cannot all absorb a burst on one connection; a 512 KiB directional buffer represents approximately 4.19 milliseconds at 1 Gbps or 0.42 milliseconds at 10 Gbps. Use socket backpressure rather than buffer growth. Benchmark sustained relay and bursts separately; application buffer capacity is not a substitute for TCP window sizing or a measured CPU budget.
+The first-iteration target is 1-10 Gbps aggregate relayed payload throughput across both directions, subject to CPU speed, workload, and network limits. At these rates, 128 MiB represents approximately 1.07 seconds to 107 milliseconds of aggregate payload, not a throughput guarantee. Storage is partitioned by tunnel and direction and cannot all absorb a burst on one connection; a 128 KiB directional buffer represents approximately 1.05 milliseconds at 1 Gbps or 0.10 milliseconds at 10 Gbps. Use socket backpressure rather than buffer growth. Benchmark sustained relay and bursts separately; application buffer capacity is not a substitute for TCP window sizing or a measured CPU budget.
 
 ## Lifecycle
 
@@ -255,7 +255,7 @@ Attribution and precedence rules:
 
 - **Block Connection:** terminates the offender connection only; no scope history.
 - **Block Domain:** a fixed ordinal table (at most 32 entries) marks the configured domain blocked; it affects current and future flows matching that ordinal until restart.
-- **Block All:** synchronously prevents all subsequent application I/O, including pending writes and new admission, before any further I/O, then performs bounded physical closure of at most 128 slots. It persists until restart; there is no runtime unblock interface.
+- **Block All:** synchronously prevents all subsequent application I/O, including pending writes and new admission, before any further I/O, then performs bounded physical closure of at most 512 slots. It persists until restart; there is no runtime unblock interface.
 - **FlareOnly:** a notification and aggregation context only. It never authorizes forwarding, never delays baseline denial, and never widens scope. Implicit Flare for an applied Block inherits that Block's scope (reporting scope equals enforcement scope).
 
 ### Tarpit (deferred)
@@ -286,21 +286,21 @@ Additional LOG KIND(s) on the existing stdout sink — and only that sink — re
 
 ### Planned fixed control storage (design estimate, not measured)
 
-All added enforcement and monitoring storage is boot-time allocated from the existing fixed inventory and performs zero heap allocation or deallocation after boot. The bounding design estimate below is derived from the fixed counts (128 tunnel slots, at most 32 ordinals) and a concrete type/sizeof plan to be verified at implementation; it is not a measured or runtime figure.
+All added enforcement and monitoring storage is boot-time allocated from the existing fixed inventory and performs zero heap allocation or deallocation after boot. The bounding design estimate below is derived from the fixed counts (512 tunnel slots, at most 32 ordinals) and a concrete type/sizeof plan to be verified at implementation; it is not a measured or runtime figure.
 
 | Planned structure | Count | Unit size (bound) | Bound total |
 | --- | --- | --- | --- |
 | Per-ordinal DomainAction table (`FlareOnly`/`Block` + scope) | 32 | 2 B | 64 B |
 | Domain-blocked ordinal bitset + All latch | 32 bits + flag | — | 5 B |
-| Per-slot latched tripwire fact (phase, class, validated ordinal, generation) | 128 | 8 B | 1024 B |
+| Per-slot latched tripwire fact (phase, class, validated ordinal, generation) | 512 | 8 B | 4096 B |
 | Per-ordinal saturated aggregate counters + overflow + window state | 32 | 32 B | 1024 B |
-| Per-slot last-counted window marker | 128 | 8 B | 1024 B |
+| Per-slot last-counted window marker | 512 | 8 B | 4096 B |
 
-The planned additional control storage totals approximately 3–4 KiB against the existing 128 MiB traffic storage and 2 MiB log queue. Exact sizes are fixed at implementation with `sizeof`-verified types. No pacing credit/burst storage is reserved or preallocated while Tarpit is deferred (no speculative reserved pacing allocation); it is added to this table only if a genuine trigger-catalog decision authorizes Tarpit. Per-turn enforcement work composes with the existing 16-op/64 KiB per-visit budget and at-most-256-visit timer recheck; the per-turn control-step count is a fixed value derived from that native per-visit I/O budget at implementation, not an invented range. Block All's bounded physical closure is the only path that walks the slot table.
+The planned additional control storage totals approximately 9–10 KiB against the existing 128 MiB traffic storage and 2 MiB log queue. Exact sizes are fixed at implementation with `sizeof`-verified types. No pacing credit/burst storage is reserved or preallocated while Tarpit is deferred (no speculative reserved pacing allocation); it is added to this table only if a genuine trigger-catalog decision authorizes Tarpit. Per-turn enforcement work composes with the existing 16-op/64 KiB per-visit budget and at-most-256-visit timer recheck; the per-turn control-step count is a fixed value derived from that native per-visit I/O budget at implementation, not an invented range. Block All's bounded physical closure is the only path that walks the slot table.
 
 ### Explicitly unchanged (non-negotiable)
 
-The fixed resource profile (128 tunnels, 32 pending setups, two 512 KiB per-slot buffers, 128 MiB traffic storage, the 256 x 8 KiB log queue, 16-op/64 KiB visits, at-most-256-visit recheck, DNS response/candidate/incident caps, the 90-second startup window, and all deadlines — 10/2/300/5/8 seconds); empty capability sets and `no_new_privs`; byte conservation; non-decrypting; single owner; generation isolation; bounded work; no runtime metrics, control, debug, or endpoint interface; logs to stdout only; core TLS 1.3 + SNI + ECH-reject; packet dropping is never implemented; no new dependency unless its intake precedes execution; no kernel pacing knob.
+The fixed resource profile (512 tunnels, 128 pending setups, two 128 KiB per-slot buffers, 128 MiB traffic storage, the 256 x 8 KiB log queue, 16-op/64 KiB visits, at-most-256-visit recheck, DNS response/candidate/incident caps, the 90-second startup window, and all deadlines — 10/2/300/5/8 seconds); empty capability sets and `no_new_privs`; byte conservation; non-decrypting; single owner; generation isolation; bounded work; no runtime metrics, control, debug, or endpoint interface; logs to stdout only; core TLS 1.3 + SNI + ECH-reject; packet dropping is never implemented; no new dependency unless its intake precedes execution; no kernel pacing knob.
 
 ### Status
 

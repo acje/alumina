@@ -650,13 +650,13 @@ fn preflight_malformed_proc_status_is_error_not_verdict() {
 fn inventory_traffic_storage_is_exactly_128_mib() {
     assert_eq!(
         inventory::TRAFFIC_STORAGE_BYTES,
-        128 * 2 * 512 * 1024,
-        "128 slots x 2 directional buffers x 512 KiB"
+        512 * 2 * 128 * 1024,
+        "512 slots x 2 directional buffers x 128 KiB"
     );
     assert_eq!(inventory::TRAFFIC_STORAGE_BYTES, 134_217_728);
-    assert_eq!(inventory::TUNNEL_SLOTS, 128);
+    assert_eq!(inventory::TUNNEL_SLOTS, 512);
     assert_eq!(inventory::BUFFERS_PER_SLOT, 2);
-    assert_eq!(inventory::BUFFER_BYTES, 512 * 1024);
+    assert_eq!(inventory::BUFFER_BYTES, 128 * 1024);
 }
 
 #[test]

@@ -41,8 +41,8 @@ use crate::inventory::{BUFFER_BYTES, TUNNEL_SLOTS};
 /// Maximum concurrent tunnels, including pending setups (docs/alumina-proxy.md:160).
 pub const MAX_TUNNELS: usize = TUNNEL_SLOTS;
 
-/// Maximum concurrent pending (in-setup) tunnels; never 160 (docs/alumina-proxy.md:160).
-pub const MAX_PENDING_SETUPS: usize = 32;
+/// Maximum concurrent pending (in-setup) tunnels; never 640 (docs/alumina-proxy.md:160).
+pub const MAX_PENDING_SETUPS: usize = 128;
 
 /// Sequential upstream connection attempts per tunnel (docs/alumina-proxy.md:82).
 pub const MAX_UPSTREAM_ATTEMPTS: usize = 4;
@@ -257,7 +257,7 @@ impl ConnectPhase {
 /// admit reused for another owner (9pac H1; 1cws H1r). The table, not a permit
 /// object, owns the accounting.
 #[derive(Debug, PartialEq, Eq)]
-pub struct SlotIndex(u8);
+pub struct SlotIndex(u16);
 
 impl SlotIndex {
     pub(crate) const fn index(&self) -> usize {
@@ -271,7 +271,7 @@ impl SlotIndex {
 /// established handle can never corrupt pending accounting (9mq9 H1r, typed
 /// transition).
 #[derive(Debug, PartialEq, Eq)]
-pub struct TunnelIndex(u8);
+pub struct TunnelIndex(u16);
 
 impl TunnelIndex {
     #[allow(dead_code)]
@@ -378,7 +378,7 @@ impl Worker {
         else {
             return Err(AdmissionError::SlotCapacity);
         };
-        let Ok(index) = u8::try_from(index) else {
+        let Ok(index) = u16::try_from(index) else {
             return Err(AdmissionError::SlotCapacity);
         };
         *free_slot = SlotState::InSetup {
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_admits_up_to_32_pending_setups_and_rejects_the_33rd() {
+    fn worker_admits_up_to_128_pending_setups_and_rejects_the_129th() {
         let t0 = anchor();
         let mut worker = Worker::boot(clock(t0));
         for _ in 0..MAX_PENDING_SETUPS {
@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_binds_slot_capacity_at_128_occupied_tunnels() {
+    fn worker_binds_slot_capacity_at_512_occupied_tunnels() {
         let t0 = anchor();
         let mut worker = Worker::boot(clock(t0));
         let mut tunnels = Vec::new();

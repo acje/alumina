@@ -48,7 +48,7 @@ claim); **external** (deployment/operator obligation); **out-of-scope**
 | L223–236 | Verification requirements (12 categories) | build-plan Slices 1–7 | gate (§4); measured in docs/harness-evaluation.md |
 | L238–263 | rp2e tripwire/action/monitoring/pacing amendment: trigger/action catalog & attribution (AnyIllegal/early-upstream/EOF-reset), Block/Flare semantics, Tarpit **deferred** | arch §2 (`enforcement`) | designed → gate; Tarpit deferred |
 | L265–281 | Mandatory `[any_illegal]`/`[actions]` config schema: index-aligned arrays, force-mandatory group, Tarpit-deferred rejection, 4 KiB capacity | arch §2 (`enforcement`); `src/config.rs` | verified-local (rp2e config surface) |
-| L283–303 | Bounded stdout monitoring (per-ordinal/global correlated aggregates, drop+count/saturate, no new sink) & planned fixed control-storage bounds (~3–4 KiB) | arch §2 (`enforcement`)/§6 | designed → artifact → gate |
+| L283–303 | Bounded stdout monitoring (per-ordinal/global correlated aggregates, drop+count/saturate, no new sink) & planned fixed control-storage bounds (~9–10 KiB) | arch §2 (`enforcement`)/§6 | designed → artifact → gate |
 | L305–315 | Honest implementation status table: amendment/config/enforcement/monitoring implemented; Tarpit deferred; no pacing storage reserved | arch §2 (`enforcement`) | verified-local (rp2e) |
 
 ## 2. Invariant matrix (all 13)
@@ -75,9 +75,9 @@ claim); **external** (deployment/operator obligation); **out-of-scope**
 |---|---|---|---|
 | Config / allowlist | 4 KiB / 1–32 | Slice 1 | artifact |
 | Worker threads | 1 | §2 III-1 | designed |
-| Concurrent tunnels (incl. setup) / pending | 128 / 32 | Slice 3 | artifact (not 160) |
-| Traffic buffers per tunnel | 2 × 512 KiB | Slice 3/5 | artifact |
-| Total traffic storage | 128 MiB (128×2×512 KiB) | §6 | artifact |
+| Concurrent tunnels (incl. setup) / pending | 512 / 128 | Slice 3 | artifact (not 640) |
+| Traffic buffers per tunnel | 2 × 128 KiB | Slice 3/5 | artifact |
+| Total traffic storage | 128 MiB (512×2×128 KiB) | §6 | artifact |
 | CONNECT headers | 8 KiB | Slice 3 | artifact |
 | Buffered TLS pre-auth | ≤64 KiB | Slice 4 | artifact |
 | DNS message / total RRs | 16 KiB / 128 | Slice 2 | artifact |
@@ -91,7 +91,7 @@ claim); **external** (deployment/operator obligation); **out-of-scope**
 | DNS retry backoff | 1,2,4,8,16,30 s | Slice 2 | artifact |
 | Stale grace | 259200 s (72 h) | Slice 2 | artifact |
 | Incident summary interval | 3600 s | Slice 6 | artifact |
-| DNS reporting storage | 32/64/128 markers | Slice 6 | artifact |
+| DNS reporting storage | 32/64/512 markers | Slice 6 | artifact |
 | Log queue / entry | 256 / 8 KiB | Slice 6 | artifact |
 | Log sink work per turn | 64 KiB or 16 ops | Slice 6 | artifact |
 | Startup window | 90 s absolute | Slices 1/2 | artifact |
